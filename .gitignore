@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.vs/
+.vscode/
+*.suo
+*.user
+*.userossc
+*.sln.docstates
+.DS_Store
