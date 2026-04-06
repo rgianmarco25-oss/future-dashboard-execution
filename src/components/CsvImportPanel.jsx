@@ -8,6 +8,7 @@ import {
     importAndStoreCsvFiles,
 } from "../utils/csvImportUtils"
 import { formatDateTime } from "../utils/dateFormat"
+import { saveAccountBalanceHistory } from "../utils/storage"
 
 const COLORS = {
     border: "rgba(125, 211, 252, 0.18)",
@@ -183,6 +184,22 @@ function getImportedTypeLabel(type) {
     return match ? match.title : type
 }
 
+function syncImportedAccountsToStorage(importData) {
+    const balanceImport = importData?.accountBalanceHistory
+
+    if (!balanceImport?.byAccount) {
+        return
+    }
+
+    Object.entries(balanceImport.byAccount).forEach(([accountKey, rows]) => {
+        if (!Array.isArray(rows) || rows.length === 0) {
+            return
+        }
+
+        saveAccountBalanceHistory(accountKey, rows)
+    })
+}
+
 function dispatchImportEvents(importData) {
     window.dispatchEvent(
         new CustomEvent("tradovate-csv-imports-updated", {
@@ -244,6 +261,8 @@ export default function CsvImportPanel({ accountId, account, onAccountUpdated })
 
         try {
             const result = await importAndStoreCsvFiles(files)
+
+            syncImportedAccountsToStorage(result.mergedImports)
             dispatchImportEvents(result.mergedImports)
 
             if (typeof onAccountUpdated === "function") {
