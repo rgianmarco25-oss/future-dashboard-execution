@@ -5,6 +5,7 @@ import {
     deleteAccount,
     getAccounts,
     upsertDetectedAccount,
+    subscribeStorage,
 } from "./utils/storage";
 
 const COLORS = {
@@ -513,6 +514,10 @@ export default function App() {
     );
 
     useEffect(() => {
+        const unsubscribe = subscribeStorage(() => {
+            refreshAccounts();
+        });
+
         const handleStorageSync = () => {
             refreshAccounts();
         };
@@ -526,6 +531,7 @@ export default function App() {
         window.addEventListener("tradovate-account-detected", handleDetectedAccountEvent);
 
         return () => {
+            unsubscribe();
             window.removeEventListener("storage", handleStorageSync);
             window.removeEventListener("focus", handleStorageSync);
             window.removeEventListener("tradovate-account-detected", handleDetectedAccountEvent);
@@ -658,10 +664,11 @@ export default function App() {
                                                         color: isActive
                                                             ? COLORS.accentStrong
                                                             : COLORS.muted,
-                                                        border: `1px solid ${isActive
+                                                        border: `1px solid ${
+                                                            isActive
                                                                 ? "rgba(34, 211, 238, 0.26)"
                                                                 : COLORS.border
-                                                            }`,
+                                                        }`,
                                                     }}
                                                 >
                                                     {isActive ? "Aktiv" : "Bereit"}
