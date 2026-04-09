@@ -1,34 +1,8 @@
-const DEFAULT_FALLBACK = "-";
-const DEFAULT_TIMEZONE = "Europe/Zurich";
-
-const DATE_FORMATTER = new Intl.DateTimeFormat("de-DE", {
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    timeZone: DEFAULT_TIMEZONE,
-});
-
-const DATE_TIME_FORMATTER = new Intl.DateTimeFormat("de-DE", {
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-    timeZone: DEFAULT_TIMEZONE,
-});
-
-function hasValue(value) {
-    if (value === null || value === undefined) {
-        return false;
-    }
-
-    if (typeof value === "string" && value.trim() === "") {
-        return false;
-    }
-
-    return true;
-}
+const DATE_ONLY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+const DATE_TIME_LOCAL_PATTERN =
+    /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?$/;
+const DMY_DOTS_PATTERN = /^(\d{2})\.(\d{2})\.(\d{4})$/;
+const DMY_SLASH_PATTERN = /^(\d{2})\/(\d{2})\/(\d{4})$/;
 
 function isValidDate(date) {
     return date instanceof Date && !Number.isNaN(date.getTime());
@@ -38,202 +12,143 @@ function pad(value) {
     return String(value).padStart(2, "0");
 }
 
-function buildLocalDate(
-    year,
-    month,
-    day,
-    hours = 0,
-    minutes = 0,
-    seconds = 0
-) {
-    const date = new Date(
-        Number(year),
-        Number(month) - 1,
-        Number(day),
-        Number(hours),
-        Number(minutes),
-        Number(seconds)
-    );
+function buildDate(year, month, day, hours = 0, minutes = 0, seconds = 0) {
+    const date = new Date(year, month - 1, day, hours, minutes, seconds);
 
-    return isValidDate(date) ? date : null;
+    if (!isValidDate(date)) {
+        return null;
+    }
+
+    if (
+        date.getFullYear() !== Number(year) ||
+        date.getMonth() !== Number(month) - 1 ||
+        date.getDate() !== Number(day)
+    ) {
+        return null;
+    }
+
+    return date;
 }
 
-function normalizeAmPmHours(hours, ampm) {
-    let parsedHours = Number(hours);
-
-    if (!ampm) {
-        return parsedHours;
-    }
-
-    const upperAmPm = String(ampm).toUpperCase();
-
-    if (upperAmPm === "AM" && parsedHours === 12) {
-        return 0;
-    }
-
-    if (upperAmPm === "PM" && parsedHours < 12) {
-        return parsedHours + 12;
-    }
-
-    return parsedHours;
-}
-
-export function parseDateValue(value) {
-    if (!hasValue(value)) {
+export function toDateValue(value) {
+    if (value === null || value === undefined || value === "") {
         return null;
     }
 
     if (value instanceof Date) {
-        return isValidDate(value) ? value : null;
+        return isValidDate(value) ? new Date(value.getTime()) : null;
     }
 
     if (typeof value === "number") {
-        const timestamp = value < 1e12 ? value * 1000 : value;
-        const date = new Date(timestamp);
+        const date = new Date(value);
         return isValidDate(date) ? date : null;
     }
 
-    const text = String(value).trim();
-
-    if (!text) {
+    if (typeof value !== "string") {
         return null;
     }
 
-    if (/^\d+$/.test(text)) {
-        const numeric = Number(text);
+    const raw = value.trim();
 
-        if (Number.isFinite(numeric)) {
-            const timestamp = numeric < 1e12 ? numeric * 1000 : numeric;
-            const date = new Date(timestamp);
-
-            if (isValidDate(date)) {
-                return date;
-            }
-        }
+    if (!raw) {
+        return null;
     }
 
-    const deMatch = text.match(
-        /^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:[,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
-    );
-
-    if (deMatch) {
-        const [, day, month, year, hours = "0", minutes = "0", seconds = "0"] = deMatch;
-        return buildLocalDate(year, month, day, hours, minutes, seconds);
+    if (/^\d+$/.test(raw)) {
+        const numericDate = new Date(Number(raw));
+        return isValidDate(numericDate) ? numericDate : null;
     }
 
-    const isoMatch = text.match(
-        /^(\d{4})-(\d{2})-(\d{2})(?:[T\s]+(\d{2}):(\d{2})(?::(\d{2}))?)?$/
-    );
-
-    if (isoMatch) {
-        const [, year, month, day, hours = "0", minutes = "0", seconds = "0"] = isoMatch;
-        return buildLocalDate(year, month, day, hours, minutes, seconds);
+    const dateOnlyMatch = raw.match(DATE_ONLY_PATTERN);
+    if (dateOnlyMatch) {
+        const [, year, month, day] = dateOnlyMatch;
+        return buildDate(Number(year), Number(month), Number(day));
     }
 
-    const usAmPmMatch = text.match(
-        /^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM))?$/i
-    );
+    const dateTimeLocalMatch = raw.match(DATE_TIME_LOCAL_PATTERN);
+    if (dateTimeLocalMatch) {
+        const [, year, month, day, hours, minutes, seconds = "0"] =
+            dateTimeLocalMatch;
 
-    if (usAmPmMatch) {
-        const [, month, day, year, hours = "0", minutes = "0", seconds = "0", ampm = ""] =
-            usAmPmMatch;
-
-        return buildLocalDate(
-            year,
-            month,
-            day,
-            normalizeAmPmHours(hours, ampm),
-            minutes,
-            seconds
+        return buildDate(
+            Number(year),
+            Number(month),
+            Number(day),
+            Number(hours),
+            Number(minutes),
+            Number(seconds)
         );
     }
 
-    const us24Match = text.match(
-        /^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
-    );
-
-    if (us24Match) {
-        const [, month, day, year, hours = "0", minutes = "0", seconds = "0"] = us24Match;
-        return buildLocalDate(year, month, day, hours, minutes, seconds);
+    const dmyDotsMatch = raw.match(DMY_DOTS_PATTERN);
+    if (dmyDotsMatch) {
+        const [, day, month, year] = dmyDotsMatch;
+        return buildDate(Number(year), Number(month), Number(day));
     }
 
-    const normalizedText = text.includes(" ") ? text.replace(" ", "T") : text;
-    const parsed = new Date(normalizedText);
-
-    if (isValidDate(parsed)) {
-        return parsed;
+    const dmySlashMatch = raw.match(DMY_SLASH_PATTERN);
+    if (dmySlashMatch) {
+        const [, day, month, year] = dmySlashMatch;
+        return buildDate(Number(year), Number(month), Number(day));
     }
 
-    return null;
+    const parsed = new Date(raw);
+    return isValidDate(parsed) ? parsed : null;
 }
 
-export function formatDate(value, fallback = DEFAULT_FALLBACK) {
-    const parsed = parseDateValue(value);
+export function formatDateDMY(value, fallback = "—") {
+    const date = toDateValue(value);
 
-    if (!parsed) {
+    if (!date) {
         return fallback;
     }
 
-    return DATE_FORMATTER.format(parsed);
+    return `${pad(date.getDate())}.${pad(date.getMonth() + 1)}.${date.getFullYear()}`;
 }
 
-export function formatDateTime(value, fallback = DEFAULT_FALLBACK) {
-    const parsed = parseDateValue(value);
+export function formatTimeHM(value, fallback = "—") {
+    const date = toDateValue(value);
 
-    if (!parsed) {
+    if (!date) {
         return fallback;
     }
 
-    return DATE_TIME_FORMATTER.format(parsed);
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-export function formatTime(value, fallback = DEFAULT_FALLBACK) {
-    if (!hasValue(value)) {
+export function formatDateTimeDMY(value, fallback = "—") {
+    const date = toDateValue(value);
+
+    if (!date) {
         return fallback;
     }
 
-    if (value instanceof Date) {
-        if (!isValidDate(value)) {
-            return fallback;
-        }
-
-        return `${pad(value.getHours())}:${pad(value.getMinutes())}`;
-    }
-
-    if (typeof value === "number") {
-        const timestamp = value < 1e12 ? value * 1000 : value;
-        const date = new Date(timestamp);
-
-        if (!isValidDate(date)) {
-            return fallback;
-        }
-
-        return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
-    }
-
-    const text = String(value).trim();
-
-    if (!text) {
-        return fallback;
-    }
-
-    const timeMatch = text.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i);
-
-    if (timeMatch) {
-        const [, hours, minutes, , ampm = ""] = timeMatch;
-        const normalizedHours = normalizeAmPmHours(hours, ampm);
-        return `${pad(normalizedHours)}:${pad(minutes)}`;
-    }
-
-    const parsedDate = parseDateValue(text);
-
-    if (!parsedDate) {
-        return fallback;
-    }
-
-    return `${pad(parsedDate.getHours())}:${pad(parsedDate.getMinutes())}`;
+    return `${formatDateDMY(date, fallback)}, ${formatTimeHM(date, fallback)}`;
 }
 
-export function formatInstrumentDate(value, fallback = DEFAULT_FALLBACK) {
-    return formatDate(value, fallback);
+export function toInputDateValue(value) {
+    const date = toDateValue(value);
+
+    if (!date) {
+        return "";
+    }
+
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
+
+export function toInputDateTimeValue(value) {
+    const date = toDateValue(value);
+
+    if (!date) {
+        return "";
+    }
+
+    return `${toInputDateValue(date)}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/*
+ Rückwärtskompatible Exporte für bestehende Imports in der App
+*/
+export const formatDate = formatDateDMY;
+export const formatDateTime = formatDateTimeDMY;
+export const formatTime = formatTimeHM;

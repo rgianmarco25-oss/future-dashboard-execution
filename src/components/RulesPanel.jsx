@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { getAccountById } from "../utils/storage";
 import {
     getRulesForAccount,
@@ -17,15 +17,51 @@ const COLORS = {
     neutral: "#dbeafe",
     cyan: "#22d3ee",
     orange: "#fb923c",
+    yellow: "#facc15",
+    green: "#22c55e",
+    lightGreen: "#4ade80",
+    red: "#ef4444",
     cardBg: "rgba(255, 255, 255, 0.03)",
     mutedBg: "rgba(255, 255, 255, 0.02)",
     buttonBg: "#7dd3fc",
     buttonText: "#04111d",
 };
 
+const CHECKLIST_STORAGE_KEY = "future-dashboard-ifvg-checklist-v1";
+
+const TRADE_CRITERIA = [
+    { key: "tradeInBias", label: "Trade im Bias" },
+    { key: "beLevel", label: "BE Level" },
+    { key: "sweep", label: "Sweep" },
+    { key: "displacement", label: "Displacement" },
+    { key: "legFvgClosed", label: "Leg FVG geschlossen" },
+    { key: "fvgReaction", label: "FVG Reaktion" },
+    { key: "fvgSize", label: "FVG Größe" },
+    { key: "candleCount", label: "Anzahl Kerzen" },
+];
+
+const TARGETS = [
+    { key: "equalHL", label: "Equal H / L" },
+    { key: "sessionHL", label: "Session H / L" },
+    { key: "newsHL", label: "News H / L" },
+    { key: "htfSwingPoint", label: "HTF Swing Point" },
+    { key: "htfOb", label: "HTF OB" },
+    { key: "htfFvg", label: "HTF FVG" },
+];
+
+const TOTAL_CHECKLIST_POINTS = TRADE_CRITERIA.length + 1;
+
 function toNumber(value) {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function cleanString(value) {
+    if (value === null || value === undefined) {
+        return "";
+    }
+
+    return String(value).trim();
 }
 
 function formatMoney(value) {
@@ -138,11 +174,17 @@ function translateNoteToGerman(note) {
         return "Genehmigte Auszahlungen werden zu 100% ausgeschüttet.";
     }
 
-    if (normalized === "No single profitable day may account for 50% or more of total profit since last approved payout.") {
+    if (
+        normalized ===
+        "No single profitable day may account for 50% or more of total profit since last approved payout."
+    ) {
         return "Kein einzelner profitabler Tag darf 50% oder mehr des Gesamtprofits seit der letzten genehmigten Auszahlung ausmachen.";
     }
 
-    if (normalized === "Safety Net = drawdown limit + 100 USD. Only profit above safety net is payout eligible.") {
+    if (
+        normalized ===
+        "Safety Net = drawdown limit + 100 USD. Only profit above safety net is payout eligible."
+    ) {
         return "Safety Net = Drawdown Limit + 100 USD. Nur Profit oberhalb des Safety Net ist auszahlungsfähig.";
     }
 
@@ -224,10 +266,214 @@ function renderTierTable(tiers, type) {
     );
 }
 
+function createDefaultChecklistState() {
+    const state = {};
+
+    [...TRADE_CRITERIA, ...TARGETS].forEach((item) => {
+        state[item.key] = false;
+    });
+
+    return state;
+}
+
+function normalizeChecklistState(value) {
+    const base = createDefaultChecklistState();
+
+    if (!value || typeof value !== "object") {
+        return base;
+    }
+
+    return Object.keys(base).reduce((accumulator, key) => {
+        accumulator[key] = Boolean(value[key]);
+        return accumulator;
+    }, {});
+}
+
+function readChecklistStorage() {
+    if (typeof window === "undefined") {
+        return {};
+    }
+
+    try {
+        const raw = window.localStorage.getItem(CHECKLIST_STORAGE_KEY);
+
+        if (!raw) {
+            return {};
+        }
+
+        const parsed = JSON.parse(raw);
+
+        if (!parsed || typeof parsed !== "object") {
+            return {};
+        }
+
+        return parsed;
+    } catch {
+        return {};
+    }
+}
+
+function getChecklistForAccount(accountId) {
+    const safeAccountId = cleanString(accountId);
+
+    if (!safeAccountId) {
+        return createDefaultChecklistState();
+    }
+
+    const storage = readChecklistStorage();
+    return normalizeChecklistState(storage[safeAccountId]);
+}
+
+function saveChecklistForAccount(accountId, value) {
+    const safeAccountId = cleanString(accountId);
+
+    if (!safeAccountId || typeof window === "undefined") {
+        return;
+    }
+
+    const storage = readChecklistStorage();
+    storage[safeAccountId] = normalizeChecklistState(value);
+
+    window.localStorage.setItem(CHECKLIST_STORAGE_KEY, JSON.stringify(storage));
+}
+
+function getChecklistTone(score) {
+    if (score >= 9) {
+        return {
+            label: "A+ Setup",
+            text: COLORS.green,
+            border: "rgba(34, 197, 94, 0.35)",
+            background: "rgba(34, 197, 94, 0.10)",
+            bar: COLORS.green,
+        };
+    }
+
+    if (score >= 7) {
+        return {
+            label: "Stark",
+            text: COLORS.lightGreen,
+            border: "rgba(74, 222, 128, 0.35)",
+            background: "rgba(74, 222, 128, 0.10)",
+            bar: COLORS.lightGreen,
+        };
+    }
+
+    if (score >= 5) {
+        return {
+            label: "Mittel",
+            text: COLORS.yellow,
+            border: "rgba(250, 204, 21, 0.35)",
+            background: "rgba(250, 204, 21, 0.10)",
+            bar: COLORS.yellow,
+        };
+    }
+
+    if (score >= 3) {
+        return {
+            label: "Schwach",
+            text: COLORS.orange,
+            border: "rgba(251, 146, 60, 0.35)",
+            background: "rgba(251, 146, 60, 0.10)",
+            bar: COLORS.orange,
+        };
+    }
+
+    return {
+        label: "Nicht valide",
+        text: COLORS.red,
+        border: "rgba(239, 68, 68, 0.35)",
+        background: "rgba(239, 68, 68, 0.10)",
+        bar: COLORS.red,
+    };
+}
+
+function ChecklistItem({ label, checked, onToggle }) {
+    return (
+        <button type="button" onClick={onToggle} style={styles.checkItemButton}>
+            <div style={styles.checkItemLeft}>
+                <span
+                    style={{
+                        ...styles.checkIndicator,
+                        borderColor: checked ? COLORS.green : COLORS.borderStrong,
+                        background: checked ? "rgba(34, 197, 94, 0.18)" : "transparent",
+                        color: checked ? COLORS.green : COLORS.label,
+                    }}
+                >
+                    {checked ? "✓" : ""}
+                </span>
+                <span
+                    style={{
+                        color: checked ? COLORS.neutral : COLORS.label,
+                        fontSize: 14,
+                        fontWeight: checked ? 700 : 500,
+                        lineHeight: 1.35,
+                        textAlign: "left",
+                    }}
+                >
+                    {label}
+                </span>
+            </div>
+
+            <span
+                style={{
+                    color: checked ? COLORS.green : COLORS.red,
+                    fontSize: 16,
+                    fontWeight: 800,
+                    minWidth: 18,
+                    textAlign: "right",
+                }}
+            >
+                {checked ? "✓" : "×"}
+            </span>
+        </button>
+    );
+}
+
+function MiniCard({ label, value, color }) {
+    return (
+        <div style={styles.miniCard}>
+            <div style={styles.miniCardLabel}>{label}</div>
+            <div style={{ ...styles.miniCardValue, color: color || COLORS.neutral }}>{value}</div>
+        </div>
+    );
+}
+
 export default function RulesPanel({ accountId, account: accountProp }) {
     const resolvedAccountId = accountId || accountProp?.id || "";
     const storedAccount = resolvedAccountId ? getAccountById(resolvedAccountId) : null;
     const account = accountProp || storedAccount || null;
+
+    const [checklistState, setChecklistState] = useState(() =>
+        getChecklistForAccount(resolvedAccountId)
+    );
+
+    useEffect(() => {
+        setChecklistState(getChecklistForAccount(resolvedAccountId));
+    }, [resolvedAccountId]);
+
+    function updateChecklist(nextValue) {
+        const normalized = normalizeChecklistState(nextValue);
+        setChecklistState(normalized);
+        saveChecklistForAccount(resolvedAccountId, normalized);
+    }
+
+    function toggleChecklistItem(key) {
+        updateChecklist({
+            ...checklistState,
+            [key]: !checklistState[key],
+        });
+    }
+
+    function resetChecklist() {
+        updateChecklist(createDefaultChecklistState());
+    }
+
+    const checklistPoints = TRADE_CRITERIA.filter((item) => checklistState[item.key]).length;
+    const targetHit = TARGETS.some((item) => checklistState[item.key]);
+    const targetPoints = targetHit ? 1 : 0;
+    const totalPoints = checklistPoints + targetPoints;
+    const progressPercent = Math.round((totalPoints / TOTAL_CHECKLIST_POINTS) * 100);
+    const tone = getChecklistTone(totalPoints);
 
     if (!account) {
         return (
@@ -274,8 +520,116 @@ export default function RulesPanel({ accountId, account: accountProp }) {
 
     return (
         <div style={styles.wrapper}>
+            <div
+                style={{
+                    ...styles.checklistPanel,
+                    borderColor: tone.border,
+                    background: tone.background,
+                }}
+            >
+                <div style={styles.checklistHeader}>
+                    <div>
+                        <div style={styles.checklistTitle}>Trade Checkliste</div>
+                        <div style={styles.checklistSubTitle}>
+                            Oben Einstieg. Unten Ziele. Ziele zählen gemeinsam als 1 Punkt.
+                        </div>
+                    </div>
+
+                    <div style={styles.checklistHeaderActions}>
+                        <div
+                            style={{
+                                ...styles.scoreBadge,
+                                borderColor: tone.border,
+                                color: tone.text,
+                                background: "rgba(0, 0, 0, 0.18)",
+                            }}
+                        >
+                            {totalPoints} von {TOTAL_CHECKLIST_POINTS} • {progressPercent}%
+                        </div>
+
+                        <button
+                            type="button"
+                            onClick={resetChecklist}
+                            style={styles.resetButton}
+                        >
+                            Reset
+                        </button>
+                    </div>
+                </div>
+
+                <div style={styles.progressWrap}>
+                    <div style={styles.progressTrack}>
+                        <div
+                            style={{
+                                ...styles.progressBar,
+                                width: `${progressPercent}%`,
+                                background: tone.bar,
+                            }}
+                        />
+                    </div>
+                    <div style={{ ...styles.progressLabel, color: tone.text }}>{tone.label}</div>
+                </div>
+
+                <div style={styles.miniGrid}>
+                    <MiniCard
+                        label="Checkliste"
+                        value={`${checklistPoints} / ${TRADE_CRITERIA.length}`}
+                        color={tone.text}
+                    />
+                    <MiniCard
+                        label="Zielblock"
+                        value={targetHit ? "1 / 1" : "0 / 1"}
+                        color={targetHit ? COLORS.green : COLORS.label}
+                    />
+                    <MiniCard
+                        label="Setup Score"
+                        value={`${progressPercent}%`}
+                        color={tone.text}
+                    />
+                    <MiniCard
+                        label="Status"
+                        value={tone.label}
+                        color={tone.text}
+                    />
+                </div>
+
+                <div style={styles.checklistSection}>
+                    <div style={styles.checklistSectionTitle}>Trade Kriterien</div>
+                    <div style={styles.checklistGrid}>
+                        {TRADE_CRITERIA.map((item) => (
+                            <ChecklistItem
+                                key={item.key}
+                                label={item.label}
+                                checked={Boolean(checklistState[item.key])}
+                                onToggle={() => toggleChecklistItem(item.key)}
+                            />
+                        ))}
+                    </div>
+                </div>
+
+                <div style={styles.checklistSection}>
+                    <div style={styles.checklistSectionTitle}>Ziele</div>
+                    <div style={styles.checklistHint}>
+                        Mindestens ein Ziel unten gibt 1 Punkt.
+                    </div>
+                    <div style={styles.checklistGrid}>
+                        {TARGETS.map((item) => (
+                            <ChecklistItem
+                                key={item.key}
+                                label={item.label}
+                                checked={Boolean(checklistState[item.key])}
+                                onToggle={() => toggleChecklistItem(item.key)}
+                            />
+                        ))}
+                    </div>
+                </div>
+            </div>
+
+            <div style={styles.sectionDivider} />
+
             <div style={styles.headerRow}>
                 <div style={styles.headerBlock}>
+                    <div style={styles.rulesTitle}>Apex Regeln</div>
                     <div style={styles.subTitle}>
                         {rules.productType.toUpperCase()} | {rules.accountPhase.toUpperCase()} |{" "}
                         {Number(rules.accountSize).toLocaleString("de-DE")}
@@ -323,7 +677,9 @@ export default function RulesPanel({ accountId, account: accountProp }) {
                             ? formatMoney(rules.dailyLossLimit.value)
                             : rules.dailyLossLimit.kind === "tiered"
                                 ? currentBalance !== null && resolvedDailyLossLimit !== null
-                                    ? `${formatMoney(resolvedDailyLossLimit)} bei Balance ${formatMoney(currentBalance)}`
+                                    ? `${formatMoney(
+                                        resolvedDailyLossLimit
+                                    )} bei Balance ${formatMoney(currentBalance)}`
                                     : "Tier basiert"
                                 : formatRuleValue(rules.dailyLossLimit)}
                     </div>
@@ -336,7 +692,9 @@ export default function RulesPanel({ accountId, account: accountProp }) {
                             ? rules.maxContracts.value
                             : rules.maxContracts.kind === "tiered"
                                 ? currentBalance !== null && resolvedMaxContracts !== null
-                                    ? `${resolvedMaxContracts} bei Balance ${formatMoney(currentBalance)}`
+                                    ? `${resolvedMaxContracts} bei Balance ${formatMoney(
+                                        currentBalance
+                                    )}`
                                     : "Tier basiert"
                                 : formatRuleValue(rules.maxContracts)}
                     </div>
@@ -517,6 +875,163 @@ const styles = {
         minWidth: 0,
         overflowX: "hidden",
     },
+    checklistPanel: {
+        border: `1px solid ${COLORS.borderStrong}`,
+        borderRadius: 18,
+        padding: 16,
+        marginBottom: 20,
+    },
+    checklistHeader: {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "flex-start",
+        gap: 12,
+        flexWrap: "wrap",
+        marginBottom: 14,
+    },
+    checklistTitle: {
+        fontSize: 20,
+        fontWeight: 800,
+        color: COLORS.neutral,
+        lineHeight: 1.2,
+    },
+    checklistSubTitle: {
+        fontSize: 13,
+        color: COLORS.label,
+        marginTop: 6,
+        lineHeight: 1.4,
+    },
+    checklistHeaderActions: {
+        display: "flex",
+        gap: 10,
+        flexWrap: "wrap",
+        alignItems: "center",
+    },
+    scoreBadge: {
+        border: `1px solid ${COLORS.borderStrong}`,
+        borderRadius: 999,
+        padding: "10px 14px",
+        fontSize: 13,
+        fontWeight: 800,
+        lineHeight: 1,
+        whiteSpace: "nowrap",
+    },
+    resetButton: {
+        border: `1px solid rgba(239, 68, 68, 0.35)`,
+        background: "transparent",
+        color: COLORS.red,
+        borderRadius: 12,
+        padding: "10px 14px",
+        fontSize: 13,
+        fontWeight: 700,
+        cursor: "pointer",
+    },
+    progressWrap: {
+        marginBottom: 16,
+    },
+    progressTrack: {
+        width: "100%",
+        height: 12,
+        borderRadius: 999,
+        background: "rgba(255, 255, 255, 0.06)",
+        overflow: "hidden",
+        border: `1px solid ${COLORS.border}`,
+    },
+    progressBar: {
+        height: "100%",
+        borderRadius: 999,
+        transition: "width 180ms ease",
+    },
+    progressLabel: {
+        marginTop: 8,
+        fontSize: 13,
+        fontWeight: 700,
+    },
+    miniGrid: {
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+        gap: 12,
+        marginBottom: 18,
+    },
+    miniCard: {
+        background: COLORS.cardBg,
+        border: `1px solid ${COLORS.border}`,
+        borderRadius: 12,
+        padding: 12,
+        minWidth: 0,
+    },
+    miniCardLabel: {
+        fontSize: 12,
+        color: COLORS.label,
+        marginBottom: 6,
+        lineHeight: 1.35,
+    },
+    miniCardValue: {
+        fontSize: 18,
+        fontWeight: 800,
+        lineHeight: 1.2,
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
+    },
+    checklistSection: {
+        marginTop: 14,
+    },
+    checklistSectionTitle: {
+        fontSize: 15,
+        fontWeight: 800,
+        color: COLORS.title,
+        marginBottom: 10,
+    },
+    checklistHint: {
+        fontSize: 12,
+        color: COLORS.label,
+        marginBottom: 10,
+        lineHeight: 1.4,
+    },
+    checklistGrid: {
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+        gap: 10,
+    },
+    checkItemButton: {
+        width: "100%",
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        gap: 12,
+        background: COLORS.cardBg,
+        border: `1px solid ${COLORS.border}`,
+        borderRadius: 12,
+        padding: "12px 14px",
+        cursor: "pointer",
+        textAlign: "left",
+        boxSizing: "border-box",
+        minHeight: 54,
+    },
+    checkItemLeft: {
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        minWidth: 0,
+        flex: 1,
+    },
+    checkIndicator: {
+        width: 18,
+        height: 18,
+        borderRadius: 4,
+        border: `1px solid ${COLORS.borderStrong}`,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontSize: 12,
+        fontWeight: 900,
+        flex: "0 0 18px",
+    },
+    sectionDivider: {
+        height: 1,
+        background: "rgba(255,255,255,0.06)",
+        marginBottom: 20,
+    },
     headerRow: {
         display: "flex",
         justifyContent: "space-between",
@@ -531,6 +1046,13 @@ const styles = {
     headerBlock: {
         minWidth: 0,
         maxWidth: "100%",
+    },
+    rulesTitle: {
+        fontSize: 20,
+        fontWeight: 800,
+        color: COLORS.neutral,
+        marginBottom: 6,
+        lineHeight: 1.2,
     },
     subTitle: {
         fontSize: 14,

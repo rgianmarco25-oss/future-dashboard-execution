@@ -1,3 +1,4 @@
+import { formatDate } from "../utils/dateFormat";
 import { getAccountById } from "../utils/storage";
 import { getActiveRuleMode, getSessionContext } from "../utils/sessionUtils";
 
@@ -196,6 +197,7 @@ export default function SessionRadar({ accountId, account: accountProp, timezone
     const context = getSessionContext(account);
     const activeRuleMode = getActiveRuleMode(account);
     const sessionCards = buildSessionCards(context);
+    const displayedTradingDate = formatDate(context.tradingDate);
 
     return (
         <div style={wrapperStyle}>
@@ -208,7 +210,7 @@ export default function SessionRadar({ accountId, account: accountProp, timezone
 
                     <div style={infoItemStyle}>
                         <div style={infoLabelStyle}>Trading Date</div>
-                        <div style={infoValueStyle}>{context.tradingDate}</div>
+                        <div style={infoValueStyle}>{displayedTradingDate}</div>
                     </div>
 
                     <div style={infoItemStyle}>

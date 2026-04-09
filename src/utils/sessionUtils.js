@@ -24,16 +24,26 @@ function toDateParts(date, timeZone) {
         }
     }
 
+    const year = Number(map.year);
+    const month = Number(map.month);
+    const day = Number(map.day);
+    const hour = Number(map.hour);
+    const minute = Number(map.minute);
+    const second = Number(map.second);
+
     return {
-        year: Number(map.year),
-        month: Number(map.month),
-        day: Number(map.day),
-        hour: Number(map.hour),
-        minute: Number(map.minute),
-        second: Number(map.second),
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
         weekday: map.weekday,
         dateKey: `${map.year}-${map.month}-${map.day}`,
-        timeKey: `${map.hour}:${map.minute}:${map.second}`,
+        dateDisplay: `${pad(day)}.${pad(month)}.${year}`,
+        timeKey: `${pad(hour)}:${pad(minute)}:${pad(second)}`,
+        timeDisplay: `${pad(hour)}:${pad(minute)}`,
+        dateTimeDisplay: `${pad(day)}.${pad(month)}.${year}, ${pad(hour)}:${pad(minute)}`,
     };
 }
 
@@ -88,7 +98,10 @@ export function getSessionContext(account, now = new Date()) {
     return {
         timeZone,
         tradingDate: parts.dateKey,
+        tradingDateDisplay: parts.dateDisplay,
         localTime: parts.timeKey,
+        localTimeDisplay: parts.timeDisplay,
+        localDateTimeDisplay: parts.dateTimeDisplay,
         weekday: parts.weekday,
         sessionOpen,
         isIntradayPhase,

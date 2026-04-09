@@ -1,920 +1,1322 @@
-import { useEffect, useState } from "react";
-import {
-    getAccountById,
-    getDailyState,
-    getLiveAccountSnapshot,
-    getRisk,
-    saveRisk,
-} from "../utils/storage";
-import { evaluateRiskWarnings } from "../utils/riskEngine";
-import { getRulesForAccount } from "../utils/apexRules";
-import * as csvImportUtils from "../utils/csvImportUtils";
-import { formatDate, formatDateTime } from "../utils/dateFormat";
+import { useMemo, useState } from "react";
+import { formatDateTime } from "../utils/dateFormat";
 
 const COLORS = {
+    panelBg: "rgba(255, 255, 255, 0.04)",
+    panelBgStrong: "rgba(255, 255, 255, 0.06)",
     border: "rgba(125, 211, 252, 0.18)",
     borderStrong: "rgba(125, 211, 252, 0.28)",
-    label: "#94a3b8",
-    neutral: "#ffffff",
+    shadow: "0 0 30px rgba(0, 0, 0, 0.25)",
+    title: "#e0f2fe",
+    text: "#dbeafe",
+    textSoft: "#94a3b8",
     cyan: "#22d3ee",
+    green: "#4ade80",
     orange: "#fb923c",
-    inputBg: "#000",
-    cardBg: "rgba(255, 255, 255, 0.03)",
-    okBg: "rgba(34, 211, 238, 0.12)",
-    okBorder: "rgba(34, 211, 238, 0.35)",
-    okText: "#67e8f9",
-    warningBg: "rgba(251, 146, 60, 0.12)",
-    warningBorder: "rgba(251, 146, 60, 0.35)",
-    warningText: "#fdba74",
-    breachBg: "rgba(248, 113, 113, 0.14)",
-    breachBorder: "rgba(248, 113, 113, 0.35)",
-    breachText: "#fca5a5",
-    accountTypeBg: "rgba(125, 211, 252, 0.08)",
-    accountTypeBorder: "rgba(125, 211, 252, 0.28)",
-    accountTypeText: "#c4b5fd",
+    red: "#f87171",
+    purple: "#a78bfa",
+    yellow: "#facc15",
 };
 
-const wrapperStyle = {
-    width: "100%",
+const DEFAULT_SIMULATION_DRAFT = {
+    instrument: "MNQ",
+    side: "long",
+    qty: 1,
+    pnl: 0,
 };
 
-const headerRowStyle = {
-    display: "flex",
-    justifyContent: "flex-end",
-    marginBottom: "16px",
+const EMPTY_SIMULATION = {
+    trades: [],
+    updatedAt: null,
 };
 
-const inputGridStyle = {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-    gap: "12px",
-};
+function cleanString(value) {
+    if (value === null || value === undefined) {
+        return "";
+    }
 
-const labelStyle = {
-    display: "block",
-    color: COLORS.label,
-    fontSize: "14px",
-    marginBottom: "8px",
-    textAlign: "center",
-};
-
-const inputStyle = {
-    width: "100%",
-    background: COLORS.inputBg,
-    color: COLORS.neutral,
-    border: `1px solid ${COLORS.borderStrong}`,
-    borderRadius: "14px",
-    padding: "12px 14px",
-    boxSizing: "border-box",
-    outline: "none",
-};
-
-const readonlyInputStyle = {
-    ...inputStyle,
-    opacity: 1,
-};
-
-const emptyStyle = {
-    border: `1px solid ${COLORS.border}`,
-    borderRadius: "16px",
-    padding: "18px",
-    textAlign: "center",
-    color: COLORS.label,
-    background: COLORS.cardBg,
-};
-
-const infoGridStyle = {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-    gap: "12px",
-    marginTop: "16px",
-};
-
-const infoCardStyle = {
-    border: `1px solid ${COLORS.border}`,
-    borderRadius: "16px",
-    padding: "14px",
-    background: COLORS.cardBg,
-    textAlign: "center",
-    minHeight: "92px",
-};
-
-const infoLabelStyle = {
-    color: COLORS.label,
-    fontSize: "13px",
-    marginBottom: "8px",
-    lineHeight: 1.35,
-};
-
-const chipRowStyle = {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: "8px",
-    marginTop: "16px",
-};
-
-const chipBaseStyle = {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: "8px",
-    padding: "8px 12px",
-    borderRadius: "999px",
-    fontSize: "12px",
-    fontWeight: "700",
-    border: "1px solid transparent",
-    lineHeight: 1.3,
-};
-
-const noticeListStyle = {
-    display: "grid",
-    gap: "10px",
-    marginTop: "16px",
-};
-
-const accountTypeStyle = {
-    color: COLORS.accountTypeText,
-    fontSize: "16px",
-    fontWeight: "700",
-    lineHeight: 1.35,
-    overflowWrap: "anywhere",
-    wordBreak: "break-word",
-};
-
-function createDefaultRisk() {
-    return {
-        takeProfit: "",
-        stopLoss: "0",
-        breakEven: "",
-    };
-}
-
-function createEmptyLiveSnapshot(accountId = "") {
-    return {
-        accountId,
-        accountName: accountId,
-        numericAccountId: "",
-        tradeDate: "",
-        cashDate: "",
-        cashTimestamp: "",
-        startingBalance: 0,
-        realizedPnl: 0,
-        tradePnl: 0,
-        fees: 0,
-        totalAmount: 0,
-        liveBalance: 0,
-        currentBalance: 0,
-        currency: "USD",
-        hasImportedData: false,
-    };
+    return String(value).trim();
 }
 
 function toNumber(value, fallback = 0) {
-    const parsed = Number(value);
+    if (typeof value === "number") {
+        return Number.isFinite(value) ? value : fallback;
+    }
+
+    const safeValue = cleanString(value).replace(",", ".");
+    const parsed = Number(safeValue);
     return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function formatMoney(value) {
-    if (value === null || value === undefined) {
-        return "-";
+function normalizeAccountSize(value, fallback = 0) {
+    const numeric = toNumber(value, 0);
+
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+        return fallback;
     }
 
-    const numericValue = Number(value);
+    const standardSizes = [25000, 50000, 100000, 150000, 250000, 300000];
 
-    if (!Number.isFinite(numericValue)) {
-        return "-";
+    let closest = standardSizes[0];
+    let smallestDistance = Math.abs(numeric - closest);
+
+    for (const size of standardSizes) {
+        const distance = Math.abs(numeric - size);
+        if (distance < smallestDistance) {
+            smallestDistance = distance;
+            closest = size;
+        }
     }
 
-    return `${numericValue.toLocaleString("de-DE", {
+    return closest;
+}
+
+function formatAccountSizeLabel(value) {
+    const normalized = normalizeAccountSize(value, 0);
+
+    if (!normalized) {
+        return "";
+    }
+
+    return `${Math.round(normalized / 1000)}K`;
+}
+
+function formatCurrency(value) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {
+        return "–";
+    }
+
+    return Number(value).toLocaleString("de-CH", {
+        style: "currency",
+        currency: "USD",
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
-    })} $`;
-}
-
-function getStatusText(status) {
-    if (status === "breach") {
-        return "Verletzt";
-    }
-
-    if (status === "warning") {
-        return "Warnung";
-    }
-
-    return "OK";
-}
-
-function getChipStyle(status) {
-    if (status === "breach") {
-        return {
-            ...chipBaseStyle,
-            background: COLORS.breachBg,
-            color: COLORS.breachText,
-            borderColor: COLORS.breachBorder,
-        };
-    }
-
-    if (status === "warning") {
-        return {
-            ...chipBaseStyle,
-            background: COLORS.warningBg,
-            color: COLORS.warningText,
-            borderColor: COLORS.warningBorder,
-        };
-    }
-
-    return {
-        ...chipBaseStyle,
-        background: COLORS.okBg,
-        color: COLORS.okText,
-        borderColor: COLORS.okBorder,
-    };
-}
-
-function getNoticeStyle(level) {
-    if (level === "breach") {
-        return {
-            padding: "14px 16px",
-            borderRadius: "16px",
-            border: `1px solid ${COLORS.breachBorder}`,
-            background: COLORS.breachBg,
-            color: COLORS.breachText,
-            lineHeight: 1.45,
-        };
-    }
-
-    if (level === "warning") {
-        return {
-            padding: "14px 16px",
-            borderRadius: "16px",
-            border: `1px solid ${COLORS.warningBorder}`,
-            background: COLORS.warningBg,
-            color: COLORS.warningText,
-            lineHeight: 1.45,
-        };
-    }
-
-    return {
-        padding: "14px 16px",
-        borderRadius: "16px",
-        border: `1px solid ${COLORS.okBorder}`,
-        background: COLORS.okBg,
-        color: COLORS.okText,
-        lineHeight: 1.45,
-    };
-}
-
-function getValueColor(value) {
-    const numericValue = toNumber(value);
-
-    if (numericValue > 0) {
-        return COLORS.cyan;
-    }
-
-    if (numericValue < 0) {
-        return COLORS.orange;
-    }
-
-    return COLORS.neutral;
-}
-
-function getValueStyle(value) {
-    return {
-        color: getValueColor(value),
-        fontSize: "16px",
-        fontWeight: "700",
-        lineHeight: 1.35,
-        overflowWrap: "anywhere",
-        wordBreak: "break-word",
-    };
-}
-
-export default function RiskPanel({ accountId, account: accountProp }) {
-    const resolvedAccountId = accountId || accountProp?.id || "";
-    const [riskByAccount, setRiskByAccount] = useState({});
-    const [, setRefreshVersion] = useState(0);
-
-    useEffect(() => {
-        const handleRefresh = () => {
-            setRefreshVersion((prev) => prev + 1);
-        };
-
-        window.addEventListener("tradovate-csv-imports-updated", handleRefresh);
-        window.addEventListener("storage", handleRefresh);
-        window.addEventListener("focus", handleRefresh);
-
-        return () => {
-            window.removeEventListener("tradovate-csv-imports-updated", handleRefresh);
-            window.removeEventListener("storage", handleRefresh);
-            window.removeEventListener("focus", handleRefresh);
-        };
-    }, []);
-
-    const storedAccount = resolvedAccountId ? getAccountById(resolvedAccountId) : null;
-    const liveSnapshot = resolvedAccountId
-        ? getLiveAccountSnapshot(resolvedAccountId) || createEmptyLiveSnapshot(resolvedAccountId)
-        : createEmptyLiveSnapshot();
-
-    const fallbackProfile = {
-        ...(storedAccount || {}),
-        ...(accountProp || {}),
-        id: resolvedAccountId || accountProp?.id || storedAccount?.id || "",
-    };
-
-    const importData =
-        typeof csvImportUtils.getAllParsedImports === "function"
-            ? csvImportUtils.getAllParsedImports()
-            : null;
-
-    const importedLiveData =
-        resolvedAccountId &&
-            importData &&
-            typeof csvImportUtils.buildLiveCardData === "function"
-            ? csvImportUtils.buildLiveCardData(importData, resolvedAccountId, fallbackProfile)
-            : null;
-
-    const importedRiskData =
-        resolvedAccountId &&
-            importData &&
-            typeof csvImportUtils.buildRiskData === "function"
-            ? csvImportUtils.buildRiskData(importData, resolvedAccountId)
-            : null;
-
-    const hasImportedBalance = Boolean(
-        importData?.accountBalanceHistory?.byAccount?.[resolvedAccountId]?.length
-    );
-
-    const hasImportedPositions = Boolean(
-        importData?.positionHistory?.byAccount?.[resolvedAccountId]?.length
-    );
-
-    const hasImportedPerformance = Boolean(importData?.performance?.rows?.length);
-
-    const isCsvMode = Boolean(hasImportedBalance || hasImportedPositions);
-
-    const importedCurrentBalance = toNumber(
-        importedLiveData?.liveBalance,
-        toNumber(importedRiskData?.accountBalance, toNumber(liveSnapshot.liveBalance, 0))
-    );
-
-    const account = resolvedAccountId
-        ? {
-            ...(storedAccount || {}),
-            ...(accountProp || {}),
-            id: resolvedAccountId,
-            currentBalance: isCsvMode
-                ? importedCurrentBalance
-                : toNumber(
-                    liveSnapshot.liveBalance,
-                    typeof accountProp?.currentBalance === "number"
-                        ? accountProp.currentBalance
-                        : typeof storedAccount?.currentBalance === "number"
-                            ? storedAccount.currentBalance
-                            : 0
-                ),
-        }
-        : null;
-
-    const risk = resolvedAccountId
-        ? riskByAccount[resolvedAccountId] || getRisk(resolvedAccountId) || createDefaultRisk()
-        : createDefaultRisk();
-
-    const dailyState = resolvedAccountId ? getDailyState(resolvedAccountId) : null;
-    const rules = account ? getRulesForAccount(account) : null;
-
-    const startingBalance = isCsvMode
-        ? toNumber(importedLiveData?.startBalance, toNumber(account?.accountSize, 0))
-        : toNumber(liveSnapshot.startingBalance, toNumber(account?.accountSize, 0));
-
-    const realizedPnl = isCsvMode
-        ? toNumber(importedLiveData?.realizedPnL, toNumber(importedRiskData?.realizedPnL, 0))
-        : toNumber(liveSnapshot.realizedPnl, 0);
-
-    const unrealizedPnl = 0;
-
-    const dailyPnl = isCsvMode
-        ? toNumber(importedRiskData?.todayPnL, 0)
-        : toNumber(realizedPnl + unrealizedPnl, 0);
-
-    const realizedBalance = isCsvMode
-        ? toNumber(
-            importedLiveData?.realizedBalance,
-            startingBalance + realizedPnl
-        )
-        : toNumber(liveSnapshot.totalAmount, toNumber(account?.currentBalance, 0));
-
-    const liveBalance = isCsvMode
-        ? toNumber(importedLiveData?.liveBalance, realizedBalance)
-        : toNumber(liveSnapshot.liveBalance, toNumber(account?.currentBalance, 0));
-
-    const plannedStop = isCsvMode ? 0 : toNumber(risk.stopLoss, 0);
-
-    const stopRiskViolationCount = isCsvMode
-        ? 0
-        : toNumber(dailyState?.stopRiskViolationCount, 0);
-
-    const totalTrades = isCsvMode ? toNumber(importedRiskData?.totalTrades, 0) : 0;
-    const winners = isCsvMode ? toNumber(importedRiskData?.winners, 0) : 0;
-    const losers = isCsvMode ? toNumber(importedRiskData?.losers, 0) : 0;
-    const totalContracts = isCsvMode ? toNumber(importedRiskData?.totalContracts, 0) : 0;
-    const bestTrade = isCsvMode ? toNumber(importedRiskData?.bestTrade, 0) : 0;
-    const worstTrade = isCsvMode ? toNumber(importedRiskData?.worstTrade, 0) : 0;
-    const averageDuration = isCsvMode ? importedRiskData?.averageDuration || "-" : "-";
-
-    const evaluatedRisk = evaluateRiskWarnings({
-        account,
-        rules,
-        plannedStop,
-        realizedPnl: dailyPnl,
-        unrealizedPnl,
-        stopRiskViolationCount,
     });
+}
 
-    function handleChange(field, value) {
-        if (!resolvedAccountId || isCsvMode) {
-            return;
+function formatSignedCurrency(value) {
+    const numeric = toNumber(value, 0);
+    const absolute = formatCurrency(Math.abs(numeric));
+
+    return numeric >= 0 ? `+${absolute}` : `-${absolute}`;
+}
+
+function formatAccountSizeValue(value) {
+    const label = formatAccountSizeLabel(value);
+
+    if (label) {
+        return label;
+    }
+
+    const numeric = toNumber(value, 0);
+
+    if (numeric <= 0) {
+        return "–";
+    }
+
+    return String(numeric);
+}
+
+function normalizeString(value) {
+    return cleanString(value).toLowerCase();
+}
+
+function normalizeDigits(value) {
+    return cleanString(value).replace(/\D/g, "");
+}
+
+function getSimulationStorageKey(accountId) {
+    const normalized = normalizeString(accountId) || "__unknown_account__";
+    return `trade-simulation:${normalized}`;
+}
+
+function toSafeInteger(value, fallback = 1) {
+    const parsed = Math.round(toNumber(value, fallback));
+
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return fallback;
+    }
+
+    return parsed;
+}
+
+function createId() {
+    return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getTradeSimulationForAccount(accountId) {
+    if (typeof window === "undefined") {
+        return EMPTY_SIMULATION;
+    }
+
+    try {
+        const raw = window.localStorage.getItem(getSimulationStorageKey(accountId));
+
+        if (!raw) {
+            return EMPTY_SIMULATION;
         }
 
-        const updated = {
-            ...risk,
-            [field]: value,
+        const parsed = JSON.parse(raw);
+
+        return {
+            trades: Array.isArray(parsed?.trades)
+                ? parsed.trades.filter(Boolean).map((trade) => ({
+                    id: cleanString(trade?.id) || createId(),
+                    accountId: cleanString(trade?.accountId),
+                    instrument: cleanString(trade?.instrument) || "MNQ",
+                    side: cleanString(trade?.side) === "short" ? "short" : "long",
+                    qty: toSafeInteger(trade?.qty, 1),
+                    pnl: toNumber(trade?.pnl, 0),
+                    createdAt: cleanString(trade?.createdAt) || new Date().toISOString(),
+                }))
+                : [],
+            updatedAt: cleanString(parsed?.updatedAt) || null,
         };
+    } catch {
+        return EMPTY_SIMULATION;
+    }
+}
 
-        setRiskByAccount((prev) => ({
-            ...prev,
-            [resolvedAccountId]: updated,
-        }));
-
-        saveRisk(resolvedAccountId, updated);
+function persistTradeSimulationForAccount(accountId, simulation) {
+    if (typeof window === "undefined") {
+        return;
     }
 
-    if (!resolvedAccountId) {
-        return <div style={emptyStyle}>Kein Account gewählt.</div>;
+    window.localStorage.setItem(
+        getSimulationStorageKey(accountId),
+        JSON.stringify(simulation)
+    );
+}
+
+function firstString(row, keys) {
+    if (!row || typeof row !== "object") {
+        return "";
     }
 
-    if (isCsvMode) {
-        return (
-            <div style={wrapperStyle}>
-                <div style={headerRowStyle}>
-                    <div style={getChipStyle(evaluatedRisk.overallStatus)}>
-                        Gesamtstatus. {getStatusText(evaluatedRisk.overallStatus)}
-                    </div>
-                </div>
+    for (const key of keys) {
+        const value = row[key];
+        if (typeof value === "string" && value.trim()) {
+            return value.trim();
+        }
+    }
 
-                <div style={infoGridStyle}>
-                    <div style={infoCardStyle}>
-                        <div style={infoLabelStyle}>Balance CSV Datei</div>
-                        <div style={getValueStyle(0)}>
-                            {importData?.accountBalanceHistory?.meta?.fileName || "-"}
-                        </div>
-                    </div>
+    return "";
+}
 
-                    <div style={infoCardStyle}>
-                        <div style={infoLabelStyle}>Position History Datei</div>
-                        <div style={getValueStyle(0)}>
-                            {importData?.positionHistory?.meta?.fileName || "-"}
-                        </div>
-                    </div>
+function firstNumber(row, keys) {
+    if (!row || typeof row !== "object") {
+        return null;
+    }
 
-                    <div style={infoCardStyle}>
-                        <div style={infoLabelStyle}>Performance Datei</div>
-                        <div style={getValueStyle(0)}>
-                            {importData?.performance?.meta?.fileName || "-"}
-                        </div>
-                    </div>
+    for (const key of keys) {
+        const value = row[key];
 
-                    <div style={infoCardStyle}>
-                        <div style={infoLabelStyle}>Import Zeit</div>
-                        <div style={getValueStyle(0)}>
-                            {formatDateTime(
-                                importData?.positionHistory?.meta?.importedAt ||
-                                importData?.accountBalanceHistory?.meta?.importedAt ||
-                                importData?.performance?.meta?.importedAt
-                            )}
-                        </div>
-                    </div>
+        if (typeof value === "number" && Number.isFinite(value)) {
+            return value;
+        }
 
-                    <div style={infoCardStyle}>
-                        <div style={infoLabelStyle}>Letzter Trading Tag</div>
-                        <div style={getValueStyle(0)}>
-                            {formatDate(importedRiskData?.tradeDate || importedLiveData?.tradeDate)}
-                        </div>
-                    </div>
+        if (typeof value === "string" && value.trim()) {
+            const parsed = Number(value.replace(/\s/g, "").replace(/,/g, "."));
+            if (Number.isFinite(parsed)) {
+                return parsed;
+            }
+        }
+    }
 
-                    <div style={infoCardStyle}>
-                        <div style={infoLabelStyle}>Performance aktiv</div>
-                        <div style={getValueStyle(hasImportedPerformance ? 1 : 0)}>
-                            {hasImportedPerformance ? "Ja" : "Nein"}
-                        </div>
-                    </div>
-                </div>
+    return null;
+}
 
-                {account && rules ? (
-                    <>
-                        <div style={infoGridStyle}>
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Start Balance</div>
-                                <div style={getValueStyle(startingBalance)}>
-                                    {formatMoney(startingBalance)}
-                                </div>
-                            </div>
+function toDateOrNull(value) {
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        return value;
+    }
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Aktuelle Balance</div>
-                                <div style={getValueStyle(toNumber(account.currentBalance))}>
-                                    {formatMoney(toNumber(account.currentBalance))}
-                                </div>
-                            </div>
+    if (typeof value === "number") {
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? null : date;
+    }
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Realized Balance</div>
-                                <div style={getValueStyle(realizedBalance)}>
-                                    {formatMoney(realizedBalance)}
-                                </div>
-                            </div>
+    if (typeof value !== "string") {
+        return null;
+    }
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Live Balance</div>
-                                <div style={getValueStyle(liveBalance)}>
-                                    {formatMoney(liveBalance)}
-                                </div>
-                            </div>
+    const trimmed = value.trim();
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Max Drawdown</div>
-                                <div style={getValueStyle(-Math.abs(rules?.maxDrawdown?.value ?? 0))}>
-                                    {formatMoney(rules?.maxDrawdown?.value ?? null)}
-                                </div>
-                            </div>
+    if (!trimmed) {
+        return null;
+    }
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Daily Loss Limit</div>
-                                <div style={getValueStyle(-Math.abs(evaluatedRisk.dailyLossLimit ?? 0))}>
-                                    {formatMoney(evaluatedRisk.dailyLossLimit)}
-                                </div>
-                            </div>
+    const direct = new Date(trimmed);
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Drawdown Floor</div>
-                                <div style={getValueStyle(evaluatedRisk.drawdownFloor)}>
-                                    {formatMoney(evaluatedRisk.drawdownFloor)}
-                                </div>
-                            </div>
+    if (!Number.isNaN(direct.getTime())) {
+        return direct;
+    }
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Puffer bis Drawdown</div>
-                                <div style={getValueStyle(evaluatedRisk.remainingDrawdownBuffer)}>
-                                    {formatMoney(evaluatedRisk.remainingDrawdownBuffer)}
-                                </div>
-                            </div>
+    const european = trimmed.match(
+        /^(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})(?:[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
+    );
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Realized PnL</div>
-                                <div style={getValueStyle(realizedPnl)}>
-                                    {formatMoney(realizedPnl)}
-                                </div>
-                            </div>
+    if (!european) {
+        return null;
+    }
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Unrealized PnL</div>
-                                <div style={getValueStyle(unrealizedPnl)}>
-                                    {formatMoney(unrealizedPnl)}
-                                </div>
-                            </div>
+    const day = Number(european[1]);
+    const month = Number(european[2]) - 1;
+    const year = Number(european[3]);
+    const hour = Number(european[4] || 0);
+    const minute = Number(european[5] || 0);
+    const second = Number(european[6] || 0);
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Daily PnL</div>
-                                <div style={getValueStyle(dailyPnl)}>
-                                    {formatMoney(dailyPnl)}
-                                </div>
-                            </div>
+    const date = new Date(year, month, day, hour, minute, second);
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Geplanter Stop</div>
-                                <div style={getValueStyle(0)}>
-                                    CSV Read Only
-                                </div>
-                            </div>
+    return Number.isNaN(date.getTime()) ? null : date;
+}
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Puffer nach Stop</div>
-                                <div style={getValueStyle(evaluatedRisk.remainingDrawdownBufferAfterStop)}>
-                                    {formatMoney(evaluatedRisk.remainingDrawdownBufferAfterStop)}
-                                </div>
-                            </div>
+function getDayKey(input) {
+    const date = input instanceof Date ? input : toDateOrNull(input);
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Stop Risk Violations</div>
-                                <div style={getValueStyle(-Math.abs(stopRiskViolationCount))}>
-                                    {stopRiskViolationCount}
-                                </div>
-                            </div>
+    if (!date) {
+        return "";
+    }
 
-                            <div
-                                style={{
-                                    ...infoCardStyle,
-                                    background: COLORS.accountTypeBg,
-                                    border: `1px solid ${COLORS.accountTypeBorder}`,
-                                }}
-                            >
-                                <div style={infoLabelStyle}>Account Typ</div>
-                                <div style={accountTypeStyle}>
-                                    {String(account.productType || "").toUpperCase()} /{" "}
-                                    {String(account.accountPhase || "").toUpperCase()}
-                                </div>
-                            </div>
-                        </div>
+    const day = String(date.getDate()).padStart(2, "0");
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const year = String(date.getFullYear());
 
-                        <div style={infoGridStyle}>
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Trades erkannt</div>
-                                <div style={getValueStyle(totalTrades)}>{totalTrades}</div>
-                            </div>
+    return `${day}.${month}.${year}`;
+}
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Gewinner</div>
-                                <div style={getValueStyle(winners)}>{winners}</div>
-                            </div>
+function getFillTimestamp(row) {
+    return (
+        toDateOrNull(
+            firstString(row, [
+                "timestamp",
+                "timestampIso",
+                "time",
+                "dateTime",
+                "datetime",
+                "filledAt",
+                "fillTime",
+                "executionTime",
+                "execTime",
+                "tradeDate",
+                "date",
+                "Date",
+                "Created At",
+            ])
+        ) || null
+    );
+}
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Verlierer</div>
-                                <div style={getValueStyle(-Math.abs(losers))}>{losers}</div>
-                            </div>
+function getFillPnl(row) {
+    return firstNumber(row, [
+        "pnl",
+        "PnL",
+        "realizedPnl",
+        "realized_pnl",
+        "profit",
+        "netPnl",
+        "Realized PnL",
+    ]);
+}
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Kontrakte</div>
-                                <div style={getValueStyle(totalContracts)}>{totalContracts}</div>
-                            </div>
+function getTradeKey(row, timestamp) {
+    const explicitId = firstString(row, [
+        "fillId",
+        "execId",
+        "executionId",
+        "tradeId",
+        "orderId",
+        "order_id",
+        "Execution ID",
+        "Order ID",
+    ]);
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Bester Trade</div>
-                                <div style={getValueStyle(bestTrade)}>
-                                    {formatMoney(bestTrade)}
-                                </div>
-                            </div>
+    if (explicitId) {
+        return explicitId;
+    }
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Schlechtester Trade</div>
-                                <div style={getValueStyle(worstTrade)}>
-                                    {formatMoney(worstTrade)}
-                                </div>
-                            </div>
+    const instrument =
+        firstString(row, ["instrument", "symbol", "ticker", "contract"]) || "NA";
+    const side = firstString(row, ["side", "action"]) || "NA";
+    const qty = firstNumber(row, ["qty", "quantity", "filledQty", "size"]) || 0;
 
-                            <div style={infoCardStyle}>
-                                <div style={infoLabelStyle}>Durchschnitt Dauer</div>
-                                <div style={getValueStyle(0)}>{averageDuration}</div>
-                            </div>
-                        </div>
+    return `${instrument}|${side}|${qty}|${timestamp.toISOString()}`;
+}
 
-                        <div style={chipRowStyle}>
-                            <div style={getChipStyle(evaluatedRisk.statuses.drawdownFloor)}>
-                                Drawdown Floor. {getStatusText(evaluatedRisk.statuses.drawdownFloor)}
-                            </div>
+function getUniqueTradesForToday(rows) {
+    const safeRows = Array.isArray(rows) ? rows : [];
+    const todayKey = getDayKey(new Date());
+    const seen = new Set();
+    const result = [];
 
-                            <div style={getChipStyle(evaluatedRisk.statuses.dailyLoss)}>
-                                Daily Loss. {getStatusText(evaluatedRisk.statuses.dailyLoss)}
-                            </div>
+    for (const row of safeRows) {
+        const timestamp = getFillTimestamp(row);
 
-                            <div style={getChipStyle(evaluatedRisk.statuses.stopRisk)}>
-                                Stop Risiko. {getStatusText(evaluatedRisk.statuses.stopRisk)}
-                            </div>
+        if (!timestamp) {
+            continue;
+        }
 
-                            <div style={getChipStyle(evaluatedRisk.statuses.stopRiskViolations)}>
-                                Stop Violations. {getStatusText(evaluatedRisk.statuses.stopRiskViolations)}
-                            </div>
-                        </div>
+        if (getDayKey(timestamp) !== todayKey) {
+            continue;
+        }
 
-                        <div style={noticeListStyle}>
-                            <div style={getNoticeStyle("ok")}>
-                                Position History und Account Balance History CSV sind aktiv. Risk zeigt jetzt importierte Werte read only an.
-                            </div>
+        const tradeKey = getTradeKey(row, timestamp);
 
-                            {evaluatedRisk.items.length === 0 ? (
-                                <div style={getNoticeStyle("ok")}>
-                                    Keine Regelwarnungen aktiv.
-                                </div>
-                            ) : (
-                                evaluatedRisk.items.map((item) => (
-                                    <div key={item.code} style={getNoticeStyle(item.level)}>
-                                        {item.text}
-                                    </div>
-                                ))
-                            )}
-                        </div>
-                    </>
-                ) : (
-                    <div style={noticeListStyle}>
-                        <div style={getNoticeStyle("warning")}>
-                            Für diesen Account sind noch keine aktiven Regelwerte verfügbar.
-                        </div>
-                    </div>
-                )}
+        if (seen.has(tradeKey)) {
+            continue;
+        }
+
+        seen.add(tradeKey);
+        result.push(row);
+    }
+
+    return result.sort((a, b) => {
+        const aTime = (getFillTimestamp(a) || new Date(0)).getTime();
+        const bTime = (getFillTimestamp(b) || new Date(0)).getTime();
+        return aTime - bTime;
+    });
+}
+
+function rowMatchesAccount(row, accountId) {
+    const targetKey = normalizeString(accountId);
+    const targetDigits = normalizeDigits(accountId);
+
+    if (!targetKey && !targetDigits) {
+        return true;
+    }
+
+    const candidates = [
+        firstString(row, [
+            "account",
+            "accountId",
+            "account_id",
+            "Account",
+            "Account ID",
+            "accountName",
+            "account_name",
+        ]),
+    ].filter(Boolean);
+
+    if (!candidates.length) {
+        return false;
+    }
+
+    return candidates.some((candidate) => {
+        const candidateKey = normalizeString(candidate);
+        const candidateDigits = normalizeDigits(candidate);
+
+        const keyMatch =
+            Boolean(candidateKey) &&
+            Boolean(targetKey) &&
+            (
+                candidateKey === targetKey ||
+                candidateKey.includes(targetKey) ||
+                targetKey.includes(candidateKey)
+            );
+
+        const digitMatch =
+            Boolean(candidateDigits) &&
+            Boolean(targetDigits) &&
+            (
+                candidateDigits === targetDigits ||
+                candidateDigits.includes(targetDigits) ||
+                targetDigits.includes(candidateDigits)
+            );
+
+        return keyMatch || digitMatch;
+    });
+}
+
+function scopeRowsByAccount(rows, accountId) {
+    const safeRows = Array.isArray(rows) ? rows : [];
+    const cleanAccountId = cleanString(accountId);
+
+    if (!cleanAccountId) {
+        return safeRows;
+    }
+
+    const matched = safeRows.filter((row) => rowMatchesAccount(row, cleanAccountId));
+
+    if (matched.length > 0) {
+        return matched;
+    }
+
+    return safeRows;
+}
+
+function getBalanceTimestamp(row) {
+    return (
+        toDateOrNull(
+            firstString(row, [
+                "timestamp",
+                "time",
+                "dateTime",
+                "datetime",
+                "tradeDate",
+                "transactionDate",
+                "date",
+                "Date",
+                "createdAt",
+                "updatedAt",
+            ])
+        ) || null
+    );
+}
+
+function getBalanceValue(row) {
+    return firstNumber(row, [
+        "totalAmount",
+        "currentBalance",
+        "balance",
+        "Balance",
+        "accountBalance",
+        "Account Balance",
+        "endBalance",
+        "endingBalance",
+        "equity",
+        "netLiq",
+        "Net Liq",
+        "cashBalance",
+        "amount",
+    ]);
+}
+
+function deriveAccountSize({ accountId, startBalance, currentBalance, fallbackSize }) {
+    const explicitFallback = normalizeAccountSize(fallbackSize, 0);
+
+    if (explicitFallback > 0) {
+        return explicitFallback;
+    }
+
+    const accountIdMatch = cleanString(accountId).match(/(\d{2,3})\s*k/i);
+
+    if (accountIdMatch) {
+        return normalizeAccountSize(Number(accountIdMatch[1]) * 1000, 0);
+    }
+
+    const reference =
+        startBalance !== null && startBalance !== undefined
+            ? startBalance
+            : currentBalance;
+
+    return normalizeAccountSize(reference, 0);
+}
+
+function sumNumbers(values) {
+    const safeValues = Array.isArray(values) ? values : [];
+    return safeValues.reduce((sum, value) => sum + toNumber(value, 0), 0);
+}
+
+function getRiskStatus(tradeCount) {
+    if (tradeCount >= 4) {
+        return {
+            label: "Rot",
+            color: COLORS.red,
+            background: "rgba(248, 113, 113, 0.10)",
+            border: COLORS.red,
+            badgeText: "STOPP !!!",
+            subline: "Auf dem Weg dein Account zu schrotten.",
+            message: "Auf dem Weg dein Account zu schrotten.",
+        };
+    }
+
+    if (tradeCount === 3) {
+        return {
+            label: "Orange",
+            color: COLORS.orange,
+            background: "rgba(251, 146, 60, 0.10)",
+            border: COLORS.orange,
+            badgeText: "WARNUNG !!!",
+            subline: "FÜR HEUTE IST SCHLUSS.",
+            message:
+                "Drei Trades erreicht. Noch ein Klick bringt dich weg von sauberer Ausführung. Für heute ist Schluss.",
+        };
+    }
+
+    return {
+        label: "Grün",
+        color: COLORS.green,
+        background: "rgba(74, 222, 128, 0.10)",
+        border: COLORS.green,
+        badgeText: "",
+        subline: "",
+        message:
+            "Im Plan. Null bis zwei Trades. Fokus auf saubere Ausführung und Regelkonformität.",
+    };
+}
+
+function InfoCard({ label, value, hint, color }) {
+    return (
+        <div
+            style={{
+                background: COLORS.panelBg,
+                border: `1px solid ${color || COLORS.border}`,
+                borderRadius: 16,
+                padding: 14,
+                minHeight: 78,
+            }}
+        >
+            <div
+                style={{
+                    color: COLORS.textSoft,
+                    fontSize: 11,
+                    marginBottom: 6,
+                }}
+            >
+                {label}
             </div>
-        );
+
+            <div
+                style={{
+                    color: color || COLORS.text,
+                    fontSize: 14,
+                    fontWeight: 700,
+                    wordBreak: "break-word",
+                }}
+            >
+                {value || "–"}
+            </div>
+
+            {hint ? (
+                <div
+                    style={{
+                        color: COLORS.textSoft,
+                        fontSize: 11,
+                        marginTop: 6,
+                        lineHeight: 1.4,
+                    }}
+                >
+                    {hint}
+                </div>
+            ) : null}
+        </div>
+    );
+}
+
+function InputField({ label, children }) {
+    return (
+        <label
+            style={{
+                display: "grid",
+                gap: 6,
+            }}
+        >
+            <div
+                style={{
+                    color: COLORS.textSoft,
+                    fontSize: 12,
+                    fontWeight: 600,
+                }}
+            >
+                {label}
+            </div>
+            {children}
+        </label>
+    );
+}
+
+function CenterAlertBox({ riskStatus }) {
+    if (!riskStatus.badgeText) {
+        return null;
     }
 
     return (
-        <div style={wrapperStyle}>
-            <div style={headerRowStyle}>
-                <div style={getChipStyle(evaluatedRisk.overallStatus)}>
-                    Gesamtstatus. {getStatusText(evaluatedRisk.overallStatus)}
-                </div>
+        <div
+            style={{
+                width: "100%",
+                minHeight: 150,
+                border: `1px solid ${riskStatus.border}`,
+                borderRadius: 18,
+                background: "rgba(255, 255, 255, 0.02)",
+                display: "grid",
+                justifyItems: "center",
+                alignContent: "center",
+                gap: 14,
+                padding: "20px 24px",
+            }}
+        >
+            <div
+                style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    minHeight: 76,
+                    padding: "0 36px",
+                    borderRadius: 14,
+                    border: `1px solid ${riskStatus.border}`,
+                    background: "rgba(255, 255, 255, 0.05)",
+                    color: riskStatus.color,
+                    fontSize: 44,
+                    fontWeight: 900,
+                    letterSpacing: "0.06em",
+                    textTransform: "uppercase",
+                    boxShadow:
+                        riskStatus.label === "Orange"
+                            ? "0 0 20px rgba(251, 146, 60, 0.18)"
+                            : "0 0 20px rgba(248, 113, 113, 0.18)",
+                }}
+            >
+                {riskStatus.badgeText}
             </div>
 
-            <div style={inputGridStyle}>
-                <div>
-                    <label style={labelStyle}>Take Profit</label>
-                    <input
-                        style={inputStyle}
-                        type="number"
-                        step="0.01"
-                        value={risk.takeProfit}
-                        onChange={(e) => handleChange("takeProfit", e.target.value)}
-                        placeholder="0.00"
-                    />
-                </div>
+            <div
+                style={{
+                    color: riskStatus.color,
+                    fontSize: 30,
+                    fontWeight: 900,
+                    lineHeight: 1,
+                    textAlign: "center",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                    textShadow:
+                        riskStatus.label === "Orange"
+                            ? "0 0 20px rgba(251, 146, 60, 0.28)"
+                            : "0 0 20px rgba(248, 113, 113, 0.28)",
+                }}
+            >
+                {riskStatus.subline}
+            </div>
+        </div>
+    );
+}
 
+export default function RiskPanel(props) {
+    const resolvedAccount =
+        props?.account || props?.activeAccount || props?.selectedAccount || null;
+
+    const resolvedAccountId =
+        cleanString(props?.resolvedAccountId) ||
+        cleanString(props?.accountId) ||
+        cleanString(props?.activeAccountId) ||
+        cleanString(props?.selectedAccountId) ||
+        cleanString(resolvedAccount?.id);
+
+    const fillsProp = props?.fills;
+    const accountBalanceHistoryProp = props?.accountBalanceHistory;
+
+    const rawFills = useMemo(() => {
+        return Array.isArray(fillsProp) ? fillsProp : [];
+    }, [fillsProp]);
+
+    const rawAccountBalanceHistory = useMemo(() => {
+        return Array.isArray(accountBalanceHistoryProp)
+            ? accountBalanceHistoryProp
+            : [];
+    }, [accountBalanceHistoryProp]);
+
+    const accountFills = useMemo(() => {
+        return scopeRowsByAccount(rawFills, resolvedAccountId);
+    }, [rawFills, resolvedAccountId]);
+
+    const accountBalanceRows = useMemo(() => {
+        const filtered = scopeRowsByAccount(rawAccountBalanceHistory, resolvedAccountId);
+
+        return [...filtered].sort((a, b) => {
+            const aTime = (getBalanceTimestamp(a) || new Date(0)).getTime();
+            const bTime = (getBalanceTimestamp(b) || new Date(0)).getTime();
+            return aTime - bTime;
+        });
+    }, [rawAccountBalanceHistory, resolvedAccountId]);
+
+    const liveTodayTrades = useMemo(() => {
+        return getUniqueTradesForToday(accountFills);
+    }, [accountFills]);
+
+    const liveTodayTradeCount = liveTodayTrades.length;
+
+    const liveTodayPnl = useMemo(() => {
+        return sumNumbers(
+            liveTodayTrades.map((row) => {
+                return getFillPnl(row) || 0;
+            })
+        );
+    }, [liveTodayTrades]);
+
+    const historyCurrentBalance =
+        accountBalanceRows.length > 0
+            ? getBalanceValue(accountBalanceRows[accountBalanceRows.length - 1])
+            : null;
+
+    const historyStartBalance =
+        accountBalanceRows.length > 0 ? getBalanceValue(accountBalanceRows[0]) : null;
+
+    const currentBalance =
+        historyCurrentBalance !== null && historyCurrentBalance !== undefined
+            ? historyCurrentBalance
+            : toNumber(
+                resolvedAccount?.currentBalance,
+                resolvedAccount?.accountSize || 0
+            );
+
+    const startBalance =
+        historyStartBalance !== null && historyStartBalance !== undefined
+            ? historyStartBalance
+            : toNumber(
+                resolvedAccount?.startingBalance,
+                resolvedAccount?.accountSize || 0
+            );
+
+    const detectedAccountSize = deriveAccountSize({
+        accountId: resolvedAccountId,
+        startBalance,
+        currentBalance,
+        fallbackSize: resolvedAccount?.accountSize,
+    });
+
+    const [tradeSimulation, setTradeSimulation] = useState(() => {
+        return getTradeSimulationForAccount(resolvedAccountId);
+    });
+
+    const [simulationDraft, setSimulationDraft] = useState(
+        DEFAULT_SIMULATION_DRAFT
+    );
+
+    const simulatedTradeCount = Array.isArray(tradeSimulation?.trades)
+        ? tradeSimulation.trades.length
+        : 0;
+
+    const simulatedPnl = sumNumbers(
+        (tradeSimulation?.trades || []).map((trade) => trade?.pnl || 0)
+    );
+
+    const testModeActive = simulatedTradeCount > 0;
+    const effectiveTradeCount = testModeActive
+        ? simulatedTradeCount
+        : liveTodayTradeCount;
+
+    const effectivePnl = testModeActive ? simulatedPnl : liveTodayPnl;
+    const riskStatus = getRiskStatus(effectiveTradeCount);
+
+    function handleDraftChange(key, value) {
+        setSimulationDraft((prev) => ({
+            ...prev,
+            [key]: value,
+        }));
+    }
+
+    function handleAddTestTrade() {
+        const nextTrade = {
+            id: createId(),
+            accountId: resolvedAccountId,
+            instrument: cleanString(simulationDraft.instrument) || "MNQ",
+            side: simulationDraft.side === "short" ? "short" : "long",
+            qty: toSafeInteger(simulationDraft.qty, 1),
+            pnl: toNumber(simulationDraft.pnl, 0),
+            createdAt: new Date().toISOString(),
+        };
+
+        setTradeSimulation((prev) => {
+            const previousTrades = Array.isArray(prev?.trades) ? prev.trades : [];
+            const next = {
+                trades: [...previousTrades, nextTrade],
+                updatedAt: new Date().toISOString(),
+            };
+
+            persistTradeSimulationForAccount(resolvedAccountId, next);
+            return next;
+        });
+    }
+
+    function handleResetSimulation() {
+        persistTradeSimulationForAccount(resolvedAccountId, EMPTY_SIMULATION);
+        setTradeSimulation(EMPTY_SIMULATION);
+        setSimulationDraft(DEFAULT_SIMULATION_DRAFT);
+    }
+
+    const balanceDelta =
+        currentBalance !== null &&
+            currentBalance !== undefined &&
+            startBalance !== null &&
+            startBalance !== undefined
+            ? currentBalance - startBalance
+            : null;
+
+    return (
+        <div
+            style={{
+                display: "grid",
+                gap: 16,
+            }}
+        >
+            <div
+                style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    gap: 12,
+                    flexWrap: "wrap",
+                }}
+            >
                 <div>
-                    <label style={labelStyle}>Geplanter Stop</label>
-                    <input
+                    <div
                         style={{
-                            ...readonlyInputStyle,
-                            color: getValueColor(plannedStop),
+                            color: COLORS.title,
+                            fontSize: 18,
+                            fontWeight: 800,
                         }}
-                        type="number"
-                        step="0.01"
-                        value={plannedStop}
-                        readOnly
-                        placeholder="0.00"
-                    />
+                    >
+                        Risk Übersicht
+                    </div>
+                    <div
+                        style={{
+                            color: COLORS.textSoft,
+                            fontSize: 13,
+                            marginTop: 4,
+                            wordBreak: "break-word",
+                        }}
+                    >
+                        Account {resolvedAccount?.displayName || resolvedAccountId || "Unbekannt"}
+                    </div>
                 </div>
 
-                <div>
-                    <label style={labelStyle}>Break Even</label>
-                    <input
-                        style={inputStyle}
-                        type="number"
-                        step="0.01"
-                        value={risk.breakEven}
-                        onChange={(e) => handleChange("breakEven", e.target.value)}
-                        placeholder="0.00"
-                    />
+                <div
+                    style={{
+                        border: `1px solid ${riskStatus.border}`,
+                        borderRadius: 999,
+                        padding: "8px 14px",
+                        color: riskStatus.color,
+                        fontSize: 12,
+                        fontWeight: 800,
+                        whiteSpace: "nowrap",
+                        background: riskStatus.background,
+                    }}
+                >
+                    {riskStatus.label}
                 </div>
             </div>
 
-            {account && rules ? (
-                <>
-                    <div style={infoGridStyle}>
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Start Balance</div>
-                            <div style={getValueStyle(startingBalance)}>
-                                {formatMoney(startingBalance)}
-                            </div>
-                        </div>
+            <div
+                style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                    gap: 10,
+                }}
+            >
+                <InfoCard
+                    label="Balance"
+                    value={formatCurrency(currentBalance)}
+                    hint={
+                        accountBalanceRows.length
+                            ? `Letzter Eintrag ${formatDateTime(
+                                getBalanceTimestamp(
+                                    accountBalanceRows[accountBalanceRows.length - 1]
+                                )
+                            )}`
+                            : "Aktueller Account Wert"
+                    }
+                    color={COLORS.cyan}
+                />
 
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Aktuelle Balance</div>
-                            <div style={getValueStyle(toNumber(account.currentBalance))}>
-                                {formatMoney(toNumber(account.currentBalance))}
-                            </div>
-                        </div>
+                <InfoCard
+                    label="Startbalance"
+                    value={formatCurrency(startBalance)}
+                    hint={
+                        accountBalanceRows.length
+                            ? `Erster Eintrag ${formatDateTime(
+                                getBalanceTimestamp(accountBalanceRows[0])
+                            )}`
+                            : "Startwert aus Account"
+                    }
+                    color={COLORS.yellow}
+                />
 
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Realized Balance</div>
-                            <div style={getValueStyle(realizedBalance)}>
-                                {formatMoney(realizedBalance)}
-                            </div>
-                        </div>
+                <InfoCard
+                    label="Kontogrösse"
+                    value={formatAccountSizeValue(detectedAccountSize)}
+                    hint={
+                        balanceDelta === null
+                            ? "Kein Delta"
+                            : `Delta ${formatSignedCurrency(balanceDelta)}`
+                    }
+                    color={COLORS.purple}
+                />
+            </div>
 
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Live Balance</div>
-                            <div style={getValueStyle(liveBalance)}>
-                                {formatMoney(liveBalance)}
-                            </div>
-                        </div>
-
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Max Drawdown</div>
-                            <div style={getValueStyle(-Math.abs(rules?.maxDrawdown?.value ?? 0))}>
-                                {formatMoney(rules?.maxDrawdown?.value ?? null)}
-                            </div>
-                        </div>
-
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Daily Loss Limit</div>
-                            <div style={getValueStyle(-Math.abs(evaluatedRisk.dailyLossLimit ?? 0))}>
-                                {formatMoney(evaluatedRisk.dailyLossLimit)}
-                            </div>
-                        </div>
-
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Drawdown Floor</div>
-                            <div style={getValueStyle(evaluatedRisk.drawdownFloor)}>
-                                {formatMoney(evaluatedRisk.drawdownFloor)}
-                            </div>
-                        </div>
-
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Puffer bis Drawdown</div>
-                            <div style={getValueStyle(evaluatedRisk.remainingDrawdownBuffer)}>
-                                {formatMoney(evaluatedRisk.remainingDrawdownBuffer)}
-                            </div>
-                        </div>
-
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Geplanter Stop</div>
-                            <div style={getValueStyle(-Math.abs(plannedStop))}>
-                                {formatMoney(plannedStop)}
-                            </div>
-                        </div>
-
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Puffer nach Stop</div>
-                            <div style={getValueStyle(evaluatedRisk.remainingDrawdownBufferAfterStop)}>
-                                {formatMoney(evaluatedRisk.remainingDrawdownBufferAfterStop)}
-                            </div>
-                        </div>
-
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Realized PnL</div>
-                            <div style={getValueStyle(realizedPnl)}>
-                                {formatMoney(realizedPnl)}
-                            </div>
-                        </div>
-
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Unrealized PnL</div>
-                            <div style={getValueStyle(unrealizedPnl)}>
-                                {formatMoney(unrealizedPnl)}
-                            </div>
-                        </div>
-
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Daily PnL</div>
-                            <div style={getValueStyle(dailyPnl)}>
-                                {formatMoney(dailyPnl)}
-                            </div>
-                        </div>
-
-                        <div style={infoCardStyle}>
-                            <div style={infoLabelStyle}>Stop Risk Violations</div>
-                            <div style={getValueStyle(-Math.abs(stopRiskViolationCount))}>
-                                {evaluatedRisk.stopRiskViolationCount}
-                            </div>
+            <div
+                style={{
+                    background: riskStatus.background,
+                    border: `1px solid ${riskStatus.border}`,
+                    borderRadius: 20,
+                    padding: 18,
+                    boxShadow: COLORS.shadow,
+                    display: "grid",
+                    gap: 14,
+                }}
+            >
+                <div
+                    style={{
+                        display: "grid",
+                        gridTemplateColumns: "220px minmax(320px, 1fr) 160px",
+                        gap: 16,
+                        alignItems: "stretch",
+                    }}
+                >
+                    <div
+                        style={{
+                            display: "flex",
+                            flexDirection: "column",
+                            justifyContent: "flex-start",
+                        }}
+                    >
+                        <div
+                            style={{
+                                color: COLORS.title,
+                                fontSize: 13,
+                                fontWeight: 700,
+                            }}
+                        >
+                            Trades heute
                         </div>
 
                         <div
                             style={{
-                                ...infoCardStyle,
-                                background: COLORS.accountTypeBg,
-                                border: `1px solid ${COLORS.accountTypeBorder}`,
+                                color: COLORS.text,
+                                fontSize: 34,
+                                fontWeight: 900,
+                                lineHeight: 1,
+                                marginTop: 6,
                             }}
                         >
-                            <div style={infoLabelStyle}>Account Typ</div>
-                            <div style={accountTypeStyle}>
-                                {String(account.productType || "").toUpperCase()} /{" "}
-                                {String(account.accountPhase || "").toUpperCase()}
-                            </div>
+                            {effectiveTradeCount}
+                        </div>
+
+                        <div
+                            style={{
+                                color: COLORS.textSoft,
+                                fontSize: 12,
+                                marginTop: 8,
+                            }}
+                        >
+                            Quelle {testModeActive ? "Testmodus" : "Live CSV"}
                         </div>
                     </div>
 
-                    <div style={chipRowStyle}>
-                        <div style={getChipStyle(evaluatedRisk.statuses.drawdownFloor)}>
-                            Drawdown Floor. {getStatusText(evaluatedRisk.statuses.drawdownFloor)}
-                        </div>
+                    <CenterAlertBox riskStatus={riskStatus} />
 
-                        <div style={getChipStyle(evaluatedRisk.statuses.dailyLoss)}>
-                            Daily Loss. {getStatusText(evaluatedRisk.statuses.dailyLoss)}
-                        </div>
-
-                        <div style={getChipStyle(evaluatedRisk.statuses.stopRisk)}>
-                            Stop Risiko. {getStatusText(evaluatedRisk.statuses.stopRisk)}
-                        </div>
-
-                        <div style={getChipStyle(evaluatedRisk.statuses.stopRiskViolations)}>
-                            Stop Violations. {getStatusText(evaluatedRisk.statuses.stopRiskViolations)}
-                        </div>
-                    </div>
-
-                    <div style={noticeListStyle}>
-                        {evaluatedRisk.items.length === 0 ? (
-                            <div style={getNoticeStyle("ok")}>
-                                Keine Regelwarnungen aktiv.
-                            </div>
-                        ) : (
-                            evaluatedRisk.items.map((item) => (
-                                <div key={item.code} style={getNoticeStyle(item.level)}>
-                                    {item.text}
-                                </div>
-                            ))
-                        )}
-                    </div>
-                </>
-            ) : (
-                <div style={noticeListStyle}>
-                    <div style={getNoticeStyle("warning")}>
-                        Für diesen Account sind noch keine aktiven Regelwerte verfügbar.
+                    <div
+                        style={{
+                            display: "grid",
+                            gap: 8,
+                            alignContent: "start",
+                        }}
+                    >
+                        <InfoCard
+                            label="Live Trades heute"
+                            value={String(liveTodayTradeCount)}
+                            hint={`${accountFills.length} Fills für Account`}
+                        />
+                        <InfoCard
+                            label="Test Trades"
+                            value={String(simulatedTradeCount)}
+                        />
+                        <InfoCard
+                            label="PnL"
+                            value={formatSignedCurrency(effectivePnl)}
+                        />
                     </div>
                 </div>
-            )}
+
+                <div
+                    style={{
+                        border: `1px solid ${COLORS.border}`,
+                        borderRadius: 14,
+                        padding: 14,
+                        background: "rgba(255, 255, 255, 0.04)",
+                        color: COLORS.text,
+                        fontSize: 15,
+                        lineHeight: 1.5,
+                        fontWeight: 700,
+                    }}
+                >
+                    {riskStatus.message}
+                </div>
+            </div>
+
+            <div
+                style={{
+                    background: COLORS.panelBg,
+                    border: `1px solid ${COLORS.border}`,
+                    borderRadius: 20,
+                    padding: 18,
+                    boxShadow: COLORS.shadow,
+                    display: "grid",
+                    gap: 14,
+                }}
+            >
+                <div
+                    style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 12,
+                        flexWrap: "wrap",
+                    }}
+                >
+                    <div>
+                        <div
+                            style={{
+                                color: COLORS.title,
+                                fontSize: 16,
+                                fontWeight: 800,
+                            }}
+                        >
+                            Simulation
+                        </div>
+                        <div
+                            style={{
+                                color: COLORS.textSoft,
+                                fontSize: 13,
+                                marginTop: 4,
+                            }}
+                        >
+                            Testet Grün, Orange und Rot direkt im UI
+                        </div>
+                    </div>
+
+                    <div
+                        style={{
+                            color: COLORS.textSoft,
+                            fontSize: 12,
+                        }}
+                    >
+                        Letzte Änderung{" "}
+                        {tradeSimulation?.updatedAt
+                            ? formatDateTime(tradeSimulation.updatedAt)
+                            : "Keine"}
+                    </div>
+                </div>
+
+                <div
+                    style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                        gap: 12,
+                    }}
+                >
+                    <InputField label="Instrument">
+                        <input
+                            value={simulationDraft.instrument}
+                            onChange={(event) =>
+                                handleDraftChange(
+                                    "instrument",
+                                    event.target.value.toUpperCase()
+                                )
+                            }
+                            style={{
+                                width: "100%",
+                                padding: "12px 14px",
+                                borderRadius: 12,
+                                border: `1px solid ${COLORS.borderStrong}`,
+                                background: "rgba(0,0,0,0.25)",
+                                color: COLORS.text,
+                                outline: "none",
+                            }}
+                            placeholder="MNQ"
+                        />
+                    </InputField>
+
+                    <InputField label="Seite">
+                        <select
+                            value={simulationDraft.side}
+                            onChange={(event) =>
+                                handleDraftChange(
+                                    "side",
+                                    event.target.value === "short" ? "short" : "long"
+                                )
+                            }
+                            style={{
+                                width: "100%",
+                                padding: "12px 14px",
+                                borderRadius: 12,
+                                border: `1px solid ${COLORS.borderStrong}`,
+                                background: "rgba(0,0,0,0.25)",
+                                color: COLORS.text,
+                                outline: "none",
+                            }}
+                        >
+                            <option value="long">long</option>
+                            <option value="short">short</option>
+                        </select>
+                    </InputField>
+
+                    <InputField label="Menge">
+                        <input
+                            type="number"
+                            min={1}
+                            step={1}
+                            value={simulationDraft.qty}
+                            onChange={(event) =>
+                                handleDraftChange(
+                                    "qty",
+                                    toSafeInteger(event.target.value, 1)
+                                )
+                            }
+                            style={{
+                                width: "100%",
+                                padding: "12px 14px",
+                                borderRadius: 12,
+                                border: `1px solid ${COLORS.borderStrong}`,
+                                background: "rgba(0,0,0,0.25)",
+                                color: COLORS.text,
+                                outline: "none",
+                            }}
+                        />
+                    </InputField>
+
+                    <InputField label="PnL">
+                        <input
+                            type="number"
+                            step="0.01"
+                            value={simulationDraft.pnl}
+                            onChange={(event) =>
+                                handleDraftChange("pnl", toNumber(event.target.value, 0))
+                            }
+                            style={{
+                                width: "100%",
+                                padding: "12px 14px",
+                                borderRadius: 12,
+                                border: `1px solid ${COLORS.borderStrong}`,
+                                background: "rgba(0,0,0,0.25)",
+                                color: COLORS.text,
+                                outline: "none",
+                            }}
+                        />
+                    </InputField>
+                </div>
+
+                <div
+                    style={{
+                        display: "flex",
+                        gap: 10,
+                        flexWrap: "wrap",
+                    }}
+                >
+                    <button
+                        type="button"
+                        onClick={handleAddTestTrade}
+                        style={{
+                            border: `1px solid ${COLORS.green}`,
+                            color: COLORS.green,
+                            background: "transparent",
+                            borderRadius: 12,
+                            padding: "12px 14px",
+                            fontWeight: 800,
+                            cursor: "pointer",
+                        }}
+                    >
+                        Test Trade hinzufügen
+                    </button>
+
+                    <button
+                        type="button"
+                        onClick={handleResetSimulation}
+                        style={{
+                            border: `1px solid ${COLORS.orange}`,
+                            color: COLORS.orange,
+                            background: "transparent",
+                            borderRadius: 12,
+                            padding: "12px 14px",
+                            fontWeight: 800,
+                            cursor: "pointer",
+                        }}
+                    >
+                        Reset
+                    </button>
+                </div>
+
+                <div
+                    style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                        gap: 10,
+                    }}
+                >
+                    <InfoCard
+                        label="Test Trades"
+                        value={String(simulatedTradeCount)}
+                        hint="Nur Simulation"
+                    />
+                    <InfoCard
+                        label="Test PnL"
+                        value={formatSignedCurrency(simulatedPnl)}
+                        hint="Nur Simulation"
+                    />
+                    <InfoCard
+                        label="Status Vorschau"
+                        value={getRiskStatus(simulatedTradeCount).label}
+                        hint={
+                            simulatedTradeCount > 0
+                                ? getRiskStatus(simulatedTradeCount).message
+                                : "Keine Test Trades"
+                        }
+                    />
+                </div>
+
+                <div
+                    style={{
+                        border: `1px solid ${COLORS.border}`,
+                        borderRadius: 16,
+                        overflow: "hidden",
+                    }}
+                >
+                    <div
+                        style={{
+                            display: "grid",
+                            gridTemplateColumns: "160px 100px 90px 90px 1fr",
+                            gap: 10,
+                            padding: "12px 14px",
+                            background: COLORS.panelBgStrong,
+                            color: COLORS.textSoft,
+                            fontSize: 11,
+                            fontWeight: 700,
+                            textTransform: "uppercase",
+                        }}
+                    >
+                        <div>Zeit</div>
+                        <div>Instrument</div>
+                        <div>Seite</div>
+                        <div>Menge</div>
+                        <div>PnL</div>
+                    </div>
+
+                    {simulatedTradeCount === 0 ? (
+                        <div
+                            style={{
+                                padding: 16,
+                                color: COLORS.textSoft,
+                                fontSize: 14,
+                            }}
+                        >
+                            Keine Test Trades vorhanden
+                        </div>
+                    ) : (
+                        tradeSimulation.trades
+                            .slice()
+                            .reverse()
+                            .map((trade) => (
+                                <div
+                                    key={trade.id}
+                                    style={{
+                                        display: "grid",
+                                        gridTemplateColumns: "160px 100px 90px 90px 1fr",
+                                        gap: 10,
+                                        padding: "12px 14px",
+                                        borderTop: `1px solid ${COLORS.border}`,
+                                        color: COLORS.text,
+                                        fontSize: 13,
+                                    }}
+                                >
+                                    <div>{formatDateTime(trade.createdAt)}</div>
+                                    <div>{trade.instrument}</div>
+                                    <div>{trade.side}</div>
+                                    <div>{trade.qty}</div>
+                                    <div>{formatSignedCurrency(trade.pnl)}</div>
+                                </div>
+                            ))
+                    )}
+                </div>
+            </div>
         </div>
     );
 }

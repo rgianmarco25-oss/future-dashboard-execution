@@ -1,4 +1,4 @@
-import { getAccountById, getOrders, getPositions, updateAccount } from "./storage";
+import { getAccountById, getFills, getOrders, getPositions, updateAccount } from "./storage";
 
 function toNumber(value) {
     const parsed = Number(value);
@@ -83,6 +83,44 @@ function readPlannedStopFromOrder(order) {
     return 0;
 }
 
+function readCommissionFromFill(fill) {
+    if (!fill || typeof fill !== "object") return 0;
+
+    const candidates = [
+        fill.commission,
+        fill.fee,
+        fill.fees,
+    ];
+
+    for (const value of candidates) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) {
+            return parsed;
+        }
+    }
+
+    return 0;
+}
+
+function readContractsFromFill(fill) {
+    if (!fill || typeof fill !== "object") return 0;
+
+    const candidates = [
+        fill.contracts,
+        fill.quantity,
+        fill.qty,
+    ];
+
+    for (const value of candidates) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) {
+            return parsed;
+        }
+    }
+
+    return 0;
+}
+
 export function getStartingBalanceForAccount(account) {
     if (!account) return 0;
     return toNumber(account.accountSize);
@@ -109,6 +147,22 @@ export function getPlannedStopTotal(accountId) {
 
     return orders.reduce((sum, order) => {
         return sum + readPlannedStopFromOrder(order);
+    }, 0);
+}
+
+export function getFillCommissionTotal(accountId) {
+    const fills = getFills(accountId) || [];
+
+    return fills.reduce((sum, fill) => {
+        return sum + readCommissionFromFill(fill);
+    }, 0);
+}
+
+export function getFillContractsTotal(accountId) {
+    const fills = getFills(accountId) || [];
+
+    return fills.reduce((sum, fill) => {
+        return sum + readContractsFromFill(fill);
     }, 0);
 }
 
@@ -155,13 +209,19 @@ export function getAccountBalanceSnapshot(accountId) {
             realizedPnl: 0,
             unrealizedPnl: 0,
             plannedStop: 0,
+            fillCount: 0,
+            fillContracts: 0,
+            fillCommission: 0,
         };
     }
 
+    const fills = getFills(accountId) || [];
     const startingBalance = getStartingBalanceForAccount(account);
     const realizedPnl = getRealizedPnlTotal(accountId);
     const unrealizedPnl = getUnrealizedPnlTotal(accountId);
     const plannedStop = getPlannedStopTotal(accountId);
+    const fillCommission = getFillCommissionTotal(accountId);
+    const fillContracts = getFillContractsTotal(accountId);
 
     const realizedBalance = startingBalance + realizedPnl;
     const liveBalance = realizedBalance + unrealizedPnl;
@@ -173,5 +233,8 @@ export function getAccountBalanceSnapshot(accountId) {
         realizedPnl,
         unrealizedPnl,
         plannedStop,
+        fillCount: fills.length,
+        fillContracts,
+        fillCommission,
     };
 }

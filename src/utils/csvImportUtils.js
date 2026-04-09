@@ -1,1204 +1,1071 @@
-export const CSV_IMPORT_STORAGE_KEY = "tradovateCsvImports"
+import {
+    getActiveAccountId,
+    getCsvImports,
+    saveParsedCsvImport,
+    clearParsedCsvImport,
+} from "./storage";
 
-export const CSV_TYPES = {
-    ACCOUNT_BALANCE_HISTORY: "accountBalanceHistory",
-    POSITION_HISTORY: "positionHistory",
-    ORDERS: "orders",
-    FILLS: "fills",
-    PERFORMANCE: "performance",
-    UNKNOWN: "unknown",
-}
-
-function createEmptyImportStore() {
-    return {
-        accountBalanceHistory: null,
-        positionHistory: null,
-        orders: null,
-        fills: null,
-        performance: null,
-
-        trades: null,
-        daily: null,
-        account: null,
-    }
-}
-
-function cloneJson(value) {
-    return JSON.parse(JSON.stringify(value))
-}
-
-function cleanBom(value) {
-    return String(value || "").replace(/^\uFEFF/, "")
-}
+const IMPORT_UPDATED_EVENT = "tradovate-csv-imports-updated";
+const IMPORT_KEYS = [
+    "orders",
+    "trades",
+    "cashHistory",
+    "performance",
+    "positionHistory",
+];
 
 function cleanString(value) {
-    return String(value ?? "").trim()
+    if (value === null || value === undefined) {
+        return "";
+    }
+
+    return String(value).trim();
 }
 
-function cleanLooseString(value) {
-    return String(value ?? "").replace(/\r/g, "").trim()
+function createEmptyImport(type) {
+    return {
+        type,
+        fileName: "",
+        importedAt: "",
+        headers: [],
+        rows: [],
+        previewRows: [],
+        rawText: "",
+    };
+}
+
+function getEmptyImports() {
+    const cashHistory = createEmptyImport("cashHistory");
+
+    return {
+        orders: createEmptyImport("orders"),
+        trades: createEmptyImport("trades"),
+        cashHistory,
+        dailySummary: {
+            ...cashHistory,
+            type: "dailySummary",
+        },
+        performance: createEmptyImport("performance"),
+        positionHistory: createEmptyImport("positionHistory"),
+    };
+}
+
+function cloneImportEntry(type, source = {}) {
+    return {
+        ...createEmptyImport(type),
+        ...source,
+        type,
+        fileName: cleanString(source.fileName),
+        importedAt: cleanString(source.importedAt),
+        headers: Array.isArray(source.headers) ? source.headers : [],
+        rows: Array.isArray(source.rows) ? source.rows : [],
+        previewRows: Array.isArray(source.previewRows) ? source.previewRows : [],
+        rawText: String(source.rawText || ""),
+    };
+}
+
+function normalizeImportsShape(value) {
+    const base = getEmptyImports();
+
+    if (!value || typeof value !== "object") {
+        return base;
+    }
+
+    const sourceCashHistory =
+        value.cashHistory ||
+        value.dailySummary ||
+        createEmptyImport("cashHistory");
+
+    const normalized = {
+        orders: cloneImportEntry("orders", value.orders || {}),
+        trades: cloneImportEntry("trades", value.trades || {}),
+        cashHistory: cloneImportEntry("cashHistory", sourceCashHistory),
+        performance: cloneImportEntry("performance", value.performance || {}),
+        positionHistory: cloneImportEntry(
+            "positionHistory",
+            value.positionHistory || {}
+        ),
+    };
+
+    return {
+        ...normalized,
+        dailySummary: {
+            ...normalized.cashHistory,
+            type: "dailySummary",
+        },
+    };
+}
+
+function emitImportsUpdated() {
+    if (typeof window === "undefined") {
+        return;
+    }
+
+    window.dispatchEvent(new CustomEvent(IMPORT_UPDATED_EVENT));
+}
+
+function resolveAccountId(accountId = "") {
+    const directAccountId = cleanString(accountId);
+
+    if (directAccountId) {
+        return directAccountId;
+    }
+
+    return cleanString(getActiveAccountId());
 }
 
 function normalizeHeader(value) {
-    return cleanBom(value)
+    return cleanString(value)
         .toLowerCase()
-        .replace(/\s+/g, " ")
-        .trim()
+        .replace(/\u00a0/g, " ")
+        .replace(/[^\p{L}\p{N}]+/gu, "");
 }
 
-function parseNumber(value, fallback = 0) {
-    if (value === null || value === undefined || value === "") {
-        return fallback
+function normalizeAccountLookup(value) {
+    return cleanString(value)
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+function normalizeAccountDigits(value) {
+    return cleanString(value).replace(/\D/g, "");
+}
+
+function parseFlexibleNumber(value) {
+    if (typeof value === "number") {
+        return Number.isFinite(value) ? value : null;
     }
 
-    const raw = String(value).trim()
+    const textValue = cleanString(value);
 
-    if (!raw) {
-        return fallback
+    if (!textValue) {
+        return null;
     }
 
-    const negativeByParens = raw.startsWith("(") && raw.endsWith(")")
-    const normalized = raw
-        .replace(/\$/g, "")
-        .replace(/,/g, "")
-        .replace(/[()]/g, "")
-        .trim()
+    let text = textValue
+        .replace(/\s/g, "")
+        .replace(/[$€£]/g, "")
+        .replace(/USD|EUR|CHF/gi, "")
+        .replace(/'/g, "");
 
-    const parsed = Number(normalized)
+    const negativeByParens = text.startsWith("(") && text.endsWith(")");
+    text = text.replace(/[()]/g, "");
+
+    if (!text) {
+        return null;
+    }
+
+    const hasComma = text.includes(",");
+    const hasDot = text.includes(".");
+
+    if (hasComma && hasDot) {
+        if (text.lastIndexOf(",") > text.lastIndexOf(".")) {
+            text = text.replace(/\./g, "").replace(/,/g, ".");
+        } else {
+            text = text.replace(/,/g, "");
+        }
+    } else if (hasComma && !hasDot) {
+        const lastPart = text.split(",").pop() || "";
+
+        if (lastPart.length === 1 || lastPart.length === 2) {
+            text = text.replace(/,/g, ".");
+        } else {
+            text = text.replace(/,/g, "");
+        }
+    }
+
+    const parsed = Number(text);
 
     if (!Number.isFinite(parsed)) {
-        return fallback
+        return null;
     }
 
-    return negativeByParens ? -parsed : parsed
+    return negativeByParens ? -Math.abs(parsed) : parsed;
 }
 
-function parseInteger(value, fallback = 0) {
-    const parsed = parseInt(String(value ?? "").replace(/,/g, "").trim(), 10)
-    return Number.isFinite(parsed) ? parsed : fallback
+function toNumber(value, fallback = 0) {
+    const parsed = parseFlexibleNumber(value);
+    return parsed !== null ? parsed : fallback;
 }
 
-function parseDateTime(value) {
-    const raw = cleanString(value)
+function splitCsvText(text) {
+    const safeText = String(text || "").replace(/^\uFEFF/, "");
+    const rows = [];
 
-    if (!raw) {
-        return null
-    }
+    let row = [];
+    let cell = "";
+    let inQuotes = false;
 
-    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-        return new Date(`${raw}T00:00:00`)
-    }
-
-    if (/^\d{4}-\d{2}-\d{2}T/.test(raw)) {
-        const parsed = new Date(raw)
-        return Number.isNaN(parsed.getTime()) ? null : parsed
-    }
-
-    const match = raw.match(
-        /^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
-    )
-
-    if (match) {
-        const [, mm, dd, yyyyRaw, hh = "0", mi = "0", ss = "0"] = match
-        const yyyy = yyyyRaw.length === 2 ? `20${yyyyRaw}` : yyyyRaw
-        const parsed = new Date(
-            Number(yyyy),
-            Number(mm) - 1,
-            Number(dd),
-            Number(hh),
-            Number(mi),
-            Number(ss)
-        )
-
-        return Number.isNaN(parsed.getTime()) ? null : parsed
-    }
-
-    const parsed = new Date(raw)
-    return Number.isNaN(parsed.getTime()) ? null : parsed
-}
-
-export function toIsoDate(date) {
-    if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
-        return ""
-    }
-
-    const year = date.getFullYear()
-    const month = String(date.getMonth() + 1).padStart(2, "0")
-    const day = String(date.getDate()).padStart(2, "0")
-
-    return `${year}-${month}-${day}`
-}
-
-export function toIsoDateTime(date) {
-    if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
-        return ""
-    }
-
-    const year = date.getFullYear()
-    const month = String(date.getMonth() + 1).padStart(2, "0")
-    const day = String(date.getDate()).padStart(2, "0")
-    const hours = String(date.getHours()).padStart(2, "0")
-    const minutes = String(date.getMinutes()).padStart(2, "0")
-    const seconds = String(date.getSeconds()).padStart(2, "0")
-
-    return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`
-}
-
-export function inferCsvType(fileName = "") {
-    const normalized = cleanString(fileName).toLowerCase()
-
-    if (normalized.includes("account balance history")) {
-        return CSV_TYPES.ACCOUNT_BALANCE_HISTORY
-    }
-
-    if (normalized.includes("position history")) {
-        return CSV_TYPES.POSITION_HISTORY
-    }
-
-    if (normalized.includes("orders")) {
-        return CSV_TYPES.ORDERS
-    }
-
-    if (normalized.includes("fills")) {
-        return CSV_TYPES.FILLS
-    }
-
-    if (normalized.includes("performance")) {
-        return CSV_TYPES.PERFORMANCE
-    }
-
-    return CSV_TYPES.UNKNOWN
-}
-
-function splitCsvLine(line) {
-    const result = []
-    let current = ""
-    let insideQuotes = false
-
-    for (let i = 0; i < line.length; i += 1) {
-        const char = line[i]
-        const nextChar = line[i + 1]
+    for (let i = 0; i < safeText.length; i += 1) {
+        const char = safeText[i];
+        const next = safeText[i + 1];
 
         if (char === '"') {
-            if (insideQuotes && nextChar === '"') {
-                current += '"'
-                i += 1
+            if (inQuotes && next === '"') {
+                cell += '"';
+                i += 1;
             } else {
-                insideQuotes = !insideQuotes
+                inQuotes = !inQuotes;
             }
-            continue
+            continue;
         }
 
-        if (char === "," && !insideQuotes) {
-            result.push(current)
-            current = ""
-            continue
+        if (char === "," && !inQuotes) {
+            row.push(cell);
+            cell = "";
+            continue;
         }
 
-        current += char
+        if ((char === "\n" || char === "\r") && !inQuotes) {
+            if (char === "\r" && next === "\n") {
+                i += 1;
+            }
+
+            row.push(cell);
+            rows.push(row);
+            row = [];
+            cell = "";
+            continue;
+        }
+
+        cell += char;
     }
 
-    result.push(current)
-    return result
+    row.push(cell);
+    rows.push(row);
+
+    return rows
+        .map((currentRow) => currentRow.map((value) => cleanString(value)))
+        .filter((currentRow) => currentRow.some((value) => cleanString(value)));
 }
 
-export function parseCsvText(text) {
-    const safeText = cleanBom(String(text || "")).replace(/\r\n/g, "\n").replace(/\r/g, "\n")
-    const lines = safeText.split("\n").filter((line) => line.trim() !== "")
+function parseCsvText(text) {
+    const rows = splitCsvText(text);
 
-    if (!lines.length) {
+    if (rows.length === 0) {
         return {
             headers: [],
             rows: [],
-        }
+            previewRows: [],
+        };
     }
 
-    const headers = splitCsvLine(lines[0]).map((header, index) => {
-        const value = cleanLooseString(header)
-        return value || `column_${index + 1}`
-    })
+    const headers = rows[0].map((value, index) => value || `Column ${index + 1}`);
+    const dataRows = rows.slice(1).map((values, rowIndex) => {
+        const result = {
+            _rowIndex: rowIndex + 2,
+        };
 
-    const rows = []
+        headers.forEach((header, columnIndex) => {
+            result[header] = values[columnIndex] ?? "";
+        });
 
-    for (let i = 1; i < lines.length; i += 1) {
-        const parts = splitCsvLine(lines[i])
-        const row = {}
-
-        headers.forEach((header, index) => {
-            row[header] = cleanLooseString(parts[index] ?? "")
-        })
-
-        rows.push(row)
-    }
+        return result;
+    });
 
     return {
         headers,
-        rows,
-    }
+        rows: dataRows,
+        previewRows: dataRows.slice(0, 5),
+    };
 }
 
-function getValue(row, keys, fallback = "") {
-    for (const key of keys) {
-        const exact = row[key]
-        if (exact !== undefined && exact !== null && String(exact).trim() !== "") {
-            return String(exact).trim()
-        }
-
-        const normalizedKey = normalizeHeader(key)
-        const found = Object.keys(row).find(
-            (rowKey) => normalizeHeader(rowKey) === normalizedKey
-        )
-
-        if (found && String(row[found]).trim() !== "") {
-            return String(row[found]).trim()
-        }
+function getValue(row, aliases = []) {
+    if (!row || typeof row !== "object") {
+        return "";
     }
 
-    return fallback
-}
+    const keys = Object.keys(row);
+    const normalizedMap = new Map();
 
-function trimEnum(value) {
-    return cleanString(value).replace(/\s+/g, " ")
-}
+    keys.forEach((key) => {
+        normalizedMap.set(normalizeHeader(key), key);
+    });
 
-function normalizeAccountKey({ accountName = "", accountId = "" }) {
-    const primary = cleanString(accountName)
-    const fallback = cleanString(accountId)
+    for (const alias of aliases) {
+        const resolvedKey = normalizedMap.get(normalizeHeader(alias));
 
-    return primary || fallback || ""
-}
-
-function createImportMeta(fileName, type, size = 0, lineCount = 0) {
-    const importedAt = new Date().toISOString()
-
-    return {
-        fileName: cleanString(fileName),
-        type,
-        importedAt,
-        uploadedAt: importedAt,
-        size,
-        lineCount,
-    }
-}
-
-function groupByAccount(rows, getAccountKey) {
-    return rows.reduce((acc, row) => {
-        const accountKey = cleanString(getAccountKey(row))
-
-        if (!accountKey) {
-            return acc
-        }
-
-        if (!acc[accountKey]) {
-            acc[accountKey] = []
-        }
-
-        acc[accountKey].push(row)
-        return acc
-    }, {})
-}
-
-function groupByOrderId(rows = [], getOrderId = (row) => row?.orderId) {
-    return rows.reduce((acc, row) => {
-        const orderId = cleanString(getOrderId(row))
-
-        if (!orderId) {
-            return acc
-        }
-
-        if (!acc[orderId]) {
-            acc[orderId] = []
-        }
-
-        acc[orderId].push(row)
-        return acc
-    }, {})
-}
-
-function sortByDateDesc(rows, getDateValue) {
-    return [...rows].sort((a, b) => {
-        const aDate = parseDateTime(getDateValue(a))
-        const bDate = parseDateTime(getDateValue(b))
-
-        const aTime = aDate ? aDate.getTime() : 0
-        const bTime = bDate ? bDate.getTime() : 0
-
-        return bTime - aTime
-    })
-}
-
-function summarizePositionHistory(rows) {
-    const totalPnL = rows.reduce((sum, row) => sum + parseNumber(row.result, 0), 0)
-    const winners = rows.filter((row) => parseNumber(row.result, 0) > 0).length
-    const losers = rows.filter((row) => parseNumber(row.result, 0) < 0).length
-    const contracts = rows.reduce((sum, row) => sum + parseInteger(row.contracts, 0), 0)
-
-    return {
-        trades: rows.length,
-        totalPnL,
-        winners,
-        losers,
-        contracts,
-    }
-}
-
-function summarizeOrders(rows) {
-    return {
-        total: rows.length,
-        filled: rows.filter((row) => trimEnum(row.status) === "Filled").length,
-        canceled: rows.filter((row) => trimEnum(row.status) === "Canceled").length,
-        working: rows.filter((row) => trimEnum(row.status) === "Working").length,
-        rejected: rows.filter((row) => trimEnum(row.status) === "Rejected").length,
-    }
-}
-
-function summarizeFills(rows) {
-    const totalCommission = rows.reduce(
-        (sum, row) => sum + parseNumber(row.commission, 0),
-        0
-    )
-
-    return {
-        total: rows.length,
-        totalCommission,
-    }
-}
-
-function summarizePerformance(rows) {
-    const totalPnL = rows.reduce((sum, row) => sum + parseNumber(row.pnl, 0), 0)
-    const bestTrade = rows.reduce(
-        (best, row) => Math.max(best, parseNumber(row.pnl, Number.NEGATIVE_INFINITY)),
-        Number.NEGATIVE_INFINITY
-    )
-    const worstTrade = rows.reduce(
-        (worst, row) => Math.min(worst, parseNumber(row.pnl, Number.POSITIVE_INFINITY)),
-        Number.POSITIVE_INFINITY
-    )
-
-    return {
-        total: rows.length,
-        totalPnL,
-        bestTrade: Number.isFinite(bestTrade) ? bestTrade : 0,
-        worstTrade: Number.isFinite(worstTrade) ? worstTrade : 0,
-    }
-}
-
-function summarizeOrderFills(rows = []) {
-    if (!Array.isArray(rows) || rows.length === 0) {
-        return {
-            fillCount: 0,
-            fillContracts: 0,
-            avgFillPrice: 0,
-            firstFillTime: "",
-            lastFillTime: "",
-            totalCommission: 0,
-            side: "",
-            instrument: "",
+        if (resolvedKey) {
+            return cleanString(row[resolvedKey]);
         }
     }
 
-    const sortedAsc = [...rows].sort((a, b) => {
-        const aTime = parseDateTime(a?.date)?.getTime() || 0
-        const bTime = parseDateTime(b?.date)?.getTime() || 0
-        return aTime - bTime
-    })
-
-    const fillContracts = rows.reduce(
-        (sum, row) => sum + parseInteger(row.contracts, 0),
-        0
-    )
-
-    const weightedPriceSum = rows.reduce((sum, row) => {
-        const qty = parseInteger(row.contracts, 0)
-        const price = parseNumber(row.price, 0)
-        return sum + qty * price
-    }, 0)
-
-    const avgFillPrice =
-        fillContracts > 0 ? weightedPriceSum / fillContracts : parseNumber(rows[0]?.price, 0)
-
-    const totalCommission = rows.reduce(
-        (sum, row) => sum + parseNumber(row.commission, 0),
-        0
-    )
-
-    return {
-        fillCount: rows.length,
-        fillContracts,
-        avgFillPrice,
-        firstFillTime: sortedAsc[0]?.date || "",
-        lastFillTime: sortedAsc[sortedAsc.length - 1]?.date || "",
-        totalCommission,
-        side: sortedAsc[0]?.side || "",
-        instrument: sortedAsc[0]?.instrument || sortedAsc[0]?.contract || sortedAsc[0]?.product || "",
-    }
+    return "";
 }
 
-export function parseAccountBalanceHistoryCsv(text, fileName, fileSize = 0) {
-    const parsed = parseCsvText(text)
-    const rawRows = parsed.rows
+function buildDateTimeValue(row, config = {}) {
+    const dateTimeAliases = config.dateTimeAliases || [];
+    const dateAliases = config.dateAliases || [];
+    const timeAliases = config.timeAliases || [];
 
-    const rows = rawRows.map((row, index) => {
-        const accountId = getValue(row, ["Account ID"])
-        const accountName = getValue(row, ["Account Name"])
-        const tradeDate = getValue(row, ["Trade Date"])
-        const totalAmount = parseNumber(getValue(row, ["Total Amount"]))
-        const totalRealizedPnL = parseNumber(getValue(row, ["Total Realized PNL"]))
-        const startBalance = totalAmount - totalRealizedPnL
-        const accountKey = normalizeAccountKey({ accountName, accountId })
+    const direct = getValue(row, dateTimeAliases);
 
-        return {
-            id: `${accountKey || "account"}-${tradeDate || index}`,
-            accountId,
-            accountName,
-            accountKey,
-            tradeDate,
-            date: tradeDate,
-            totalAmount,
-            totalRealizedPnL,
-            startBalance,
-            realizedBalance: totalAmount,
-            liveBalance: totalAmount,
-            unrealizedPnL: 0,
-            raw: row,
-        }
-    })
-
-    const sorted = sortByDateDesc(rows, (row) => row.tradeDate)
-    const byAccount = groupByAccount(sorted, (row) => row.accountKey)
-
-    const latestByAccount = Object.keys(byAccount).reduce((acc, accountKey) => {
-        acc[accountKey] = byAccount[accountKey][0]
-        return acc
-    }, {})
-
-    return {
-        meta: createImportMeta(fileName, CSV_TYPES.ACCOUNT_BALANCE_HISTORY, fileSize, rawRows.length),
-        headers: parsed.headers,
-        rows: sorted,
-        byAccount,
-        latestByAccount,
-        rawText: text,
+    if (direct) {
+        return direct;
     }
+
+    const datePart = getValue(row, dateAliases);
+    const timePart = getValue(row, timeAliases);
+
+    if (datePart && timePart) {
+        return `${datePart} ${timePart}`;
+    }
+
+    return datePart || timePart || "";
 }
 
-export function parsePositionHistoryCsv(text, fileName, fileSize = 0) {
-    const parsed = parseCsvText(text)
-    const rawRows = parsed.rows
+function getAccountCandidates(row) {
+    const values = [
+        getValue(row, [
+            "account",
+            "account id",
+            "accountid",
+            "accountId",
+            "account name",
+            "accountname",
+            "_accountId",
+            "_accountid",
+            "account number",
+            "accountnumber",
+            "acct",
+            "acct id",
+        ]),
+        row?._accountId,
+        row?._accountid,
+    ];
 
-    const rows = rawRows.map((row, index) => {
-        const positionId = getValue(row, ["Position ID"])
-        const tradeDate = getValue(row, ["Trade Date"])
-        const soldTimestamp = getValue(row, ["Sold Timestamp"])
-        const boughtTimestamp = getValue(row, ["Bought Timestamp"])
-        const account = getValue(row, ["Account"])
-        const contract = getValue(row, ["Contract"])
-        const product = getValue(row, ["Product"])
-        const productDescription = getValue(row, ["Product Description"])
-        const pairedQty = parseInteger(getValue(row, ["Paired Qty"]))
-        const buyPrice = parseNumber(getValue(row, ["Buy Price"]))
-        const sellPrice = parseNumber(getValue(row, ["Sell Price"]))
-        const pnl = parseNumber(getValue(row, ["P/L"]))
-        const titleBase = contract || product || "Trade"
-
-        return {
-            id: positionId || `position-${index}`,
-            positionId,
-            account,
-            accountKey: account,
-            tradeDate,
-            date: soldTimestamp || tradeDate || boughtTimestamp,
-            entryTime: boughtTimestamp,
-            exitTime: soldTimestamp,
-            title: `${titleBase} Trade`,
-            result: pnl,
-            instrument: contract || product,
-            contract,
-            product,
-            productDescription,
-            contracts: pairedQty,
-            buyPrice,
-            sellPrice,
-            note: "",
-            raw: row,
-        }
-    })
-
-    const sorted = sortByDateDesc(rows, (row) => row.date)
-    const byAccount = groupByAccount(sorted, (row) => row.accountKey)
-
-    const summaryByAccount = Object.keys(byAccount).reduce((acc, accountKey) => {
-        acc[accountKey] = summarizePositionHistory(byAccount[accountKey])
-        return acc
-    }, {})
-
-    return {
-        meta: createImportMeta(fileName, CSV_TYPES.POSITION_HISTORY, fileSize, rawRows.length),
-        headers: parsed.headers,
-        rows: sorted,
-        byAccount,
-        summaryByAccount,
-        rawText: text,
-    }
+    return values
+        .map((value) => ({
+            raw: cleanString(value),
+            key: normalizeAccountLookup(value),
+            digits: normalizeAccountDigits(value),
+        }))
+        .filter((entry) => entry.raw || entry.key || entry.digits);
 }
 
-export function parseOrdersCsv(text, fileName, fileSize = 0) {
-    const parsed = parseCsvText(text)
-    const rawRows = parsed.rows
+function matchesAccount(row, accountId) {
+    const safeAccountKey = normalizeAccountLookup(accountId);
+    const safeAccountDigits = normalizeAccountDigits(accountId);
 
-    const rows = rawRows.map((row, index) => {
-        const orderId = getValue(row, ["Order ID", "orderId"])
-        const account = getValue(row, ["Account"])
-        const timestamp = getValue(row, ["Timestamp"])
-        const date = getValue(row, ["Date"])
-        const side = trimEnum(getValue(row, ["B/S"]))
-        const contract = getValue(row, ["Contract"])
-        const product = getValue(row, ["Product"])
-        const productDescription = getValue(row, ["Product Description"])
-        const quantity = parseInteger(getValue(row, ["Quantity"]))
-        const type = trimEnum(getValue(row, ["Type"]))
-        const status = trimEnum(getValue(row, ["Status"]))
-        const limitPrice = parseNumber(getValue(row, ["Limit Price", "decimalLimit"]))
-        const stopPrice = parseNumber(getValue(row, ["Stop Price", "decimalStop"]))
-        const filledQty = parseInteger(getValue(row, ["Filled Qty", "filledQty"]))
-        const avgFillPrice = parseNumber(getValue(row, ["Avg Fill Price", "avgPrice"]))
-        const fillTime = getValue(row, ["Fill Time"])
-        const textLabel = getValue(row, ["Text"])
-        const venue = getValue(row, ["Venue"])
-        const notionalValue = parseNumber(getValue(row, ["Notional Value"]))
-        const currency = getValue(row, ["Currency"], "USD")
-
-        return {
-            id: orderId || `order-${index}`,
-            orderId,
-            account,
-            accountKey: account,
-            date: timestamp || date,
-            timestamp,
-            orderDate: date,
-            side,
-            instrument: contract || product,
-            contract,
-            product,
-            productDescription,
-            contracts: quantity,
-            type,
-            status,
-            limitPrice,
-            stopPrice,
-            filledQty,
-            avgFillPrice,
-            fillTime,
-            text: textLabel,
-            venue,
-            notionalValue,
-            currency,
-            raw: row,
-        }
-    })
-
-    const sorted = sortByDateDesc(rows, (row) => row.date)
-    const byAccount = groupByAccount(sorted, (row) => row.accountKey)
-
-    const summaryByAccount = Object.keys(byAccount).reduce((acc, accountKey) => {
-        acc[accountKey] = summarizeOrders(byAccount[accountKey])
-        return acc
-    }, {})
-
-    return {
-        meta: createImportMeta(fileName, CSV_TYPES.ORDERS, fileSize, rawRows.length),
-        headers: parsed.headers,
-        rows: sorted,
-        byAccount,
-        summaryByAccount,
-        rawText: text,
+    if (!safeAccountKey && !safeAccountDigits) {
+        return true;
     }
+
+    const candidates = getAccountCandidates(row);
+
+    if (candidates.length === 0) {
+        return true;
+    }
+
+    return candidates.some((candidate) => {
+        const keyMatch =
+            Boolean(candidate.key) &&
+            Boolean(safeAccountKey) &&
+            (
+                candidate.key === safeAccountKey ||
+                candidate.key.includes(safeAccountKey) ||
+                safeAccountKey.includes(candidate.key)
+            );
+
+        const digitMatch =
+            Boolean(candidate.digits) &&
+            Boolean(safeAccountDigits) &&
+            (
+                candidate.digits === safeAccountDigits ||
+                candidate.digits.includes(safeAccountDigits) ||
+                safeAccountDigits.includes(candidate.digits)
+            );
+
+        return keyMatch || digitMatch;
+    });
 }
 
-export function parseFillsCsv(text, fileName, fileSize = 0) {
-    const parsed = parseCsvText(text)
-    const rawRows = parsed.rows
-
-    const rows = rawRows.map((row, index) => {
-        const fillId = getValue(row, ["Fill ID", "_id"])
-        const orderId = getValue(row, ["Order ID", "_orderId"])
-        const account = getValue(row, ["Account"])
-        const accountId = getValue(row, ["_accountId"])
-        const timestamp = getValue(row, ["Timestamp", "_timestamp"])
-        const date = getValue(row, ["Date", "_tradeDate"])
-        const side = trimEnum(getValue(row, ["B/S"]))
-        const quantity = parseInteger(getValue(row, ["Quantity", "_qty"]))
-        const price = parseNumber(getValue(row, ["Price", "_price"]))
-        const contract = getValue(row, ["Contract"])
-        const product = getValue(row, ["Product"])
-        const productDescription = getValue(row, ["Product Description"])
-        const commission = parseNumber(getValue(row, ["commission"]))
-        const accountKey = normalizeAccountKey({ accountName: account, accountId })
-
-        return {
-            id: fillId || `fill-${index}`,
-            fillId,
-            orderId,
-            account,
-            accountId,
-            accountKey,
-            date: timestamp || date,
-            timestamp,
-            tradeDate: date,
-            side,
-            contracts: quantity,
-            price,
-            instrument: contract || product,
-            contract,
-            product,
-            productDescription,
-            commission,
-            raw: row,
-        }
-    })
-
-    const sorted = sortByDateDesc(rows, (row) => row.date)
-    const byAccount = groupByAccount(sorted, (row) => row.accountKey)
-
-    const summaryByAccount = Object.keys(byAccount).reduce((acc, accountKey) => {
-        acc[accountKey] = summarizeFills(byAccount[accountKey])
-        return acc
-    }, {})
-
-    return {
-        meta: createImportMeta(fileName, CSV_TYPES.FILLS, fileSize, rawRows.length),
-        headers: parsed.headers,
-        rows: sorted,
-        byAccount,
-        summaryByAccount,
-        rawText: text,
-    }
-}
-
-export function parsePerformanceCsv(text, fileName, fileSize = 0) {
-    const parsed = parseCsvText(text)
-    const rawRows = parsed.rows
-
-    const rows = rawRows.map((row, index) => {
-        const symbol = getValue(row, ["symbol"])
-        const qty = parseInteger(getValue(row, ["qty"]))
-        const buyPrice = parseNumber(getValue(row, ["buyPrice"]))
-        const sellPrice = parseNumber(getValue(row, ["sellPrice"]))
-        const pnl = parseNumber(getValue(row, ["pnl"]))
-        const boughtTimestamp = getValue(row, ["boughtTimestamp"])
-        const soldTimestamp = getValue(row, ["soldTimestamp"])
-        const duration = getValue(row, ["duration"])
-
-        return {
-            id: `performance-${index}`,
-            instrument: symbol,
-            contract: symbol,
-            contracts: qty,
-            buyPrice,
-            sellPrice,
-            pnl,
-            entryTime: boughtTimestamp,
-            exitTime: soldTimestamp,
-            duration,
-            date: soldTimestamp || boughtTimestamp,
-            raw: row,
-        }
-    })
-
-    const sorted = sortByDateDesc(rows, (row) => row.date)
-    const summary = summarizePerformance(sorted)
-
-    return {
-        meta: createImportMeta(fileName, CSV_TYPES.PERFORMANCE, fileSize, rawRows.length),
-        headers: parsed.headers,
-        rows: sorted,
-        summary,
-        rawText: text,
-    }
-}
-
-export async function parseImportedCsv(file) {
-    const type = inferCsvType(file?.name || "")
-
-    if (!file || typeof file.text !== "function") {
-        throw new Error("Ungültige Datei.")
+function filterEntriesForAccount(entries = [], accountId = "") {
+    if (!cleanString(accountId)) {
+        return entries;
     }
 
-    const text = await file.text()
+    const matched = entries.filter((entry) =>
+        matchesAccount(entry.raw || entry, accountId)
+    );
 
-    switch (type) {
-        case CSV_TYPES.ACCOUNT_BALANCE_HISTORY:
-            return parseAccountBalanceHistoryCsv(text, file.name, file.size || 0)
-        case CSV_TYPES.POSITION_HISTORY:
-            return parsePositionHistoryCsv(text, file.name, file.size || 0)
-        case CSV_TYPES.ORDERS:
-            return parseOrdersCsv(text, file.name, file.size || 0)
-        case CSV_TYPES.FILLS:
-            return parseFillsCsv(text, file.name, file.size || 0)
-        case CSV_TYPES.PERFORMANCE:
-            return parsePerformanceCsv(text, file.name, file.size || 0)
-        default:
-            return {
-                meta: createImportMeta(file?.name || "", CSV_TYPES.UNKNOWN, file?.size || 0, 0),
-                headers: [],
-                rows: [],
-                rawText: text,
-            }
-    }
-}
-
-export async function parseImportedCsvList(files = []) {
-    const parsedList = await Promise.all(files.map((file) => parseImportedCsv(file)))
-    const result = createEmptyImportStore()
-
-    parsedList.forEach((parsed) => {
-        const type = parsed?.meta?.type
-
-        if (type && type !== CSV_TYPES.UNKNOWN) {
-            result[type] = parsed
-        }
-    })
-
-    if (result.positionHistory) {
-        result.trades = result.positionHistory
+    if (matched.length > 0) {
+        return matched;
     }
 
-    if (result.accountBalanceHistory) {
-        result.account = result.accountBalanceHistory
-    }
-
-    return result
-}
-
-export function getStoredCsvImports() {
-    try {
-        const raw = localStorage.getItem(CSV_IMPORT_STORAGE_KEY)
-        const base = createEmptyImportStore()
-
-        if (!raw) {
-            return base
-        }
-
-        const parsed = JSON.parse(raw)
-        const merged = {
-            ...base,
-            ...parsed,
-        }
-
-        if (!merged.positionHistory && merged.trades) {
-            merged.positionHistory = merged.trades
-        }
-
-        if (!merged.accountBalanceHistory && merged.account) {
-            merged.accountBalanceHistory = merged.account
-        }
-
-        return merged
-    } catch {
-        return createEmptyImportStore()
-    }
-}
-
-function saveStoredCsvImports(nextState) {
-    localStorage.setItem(CSV_IMPORT_STORAGE_KEY, JSON.stringify(cloneJson(nextState)))
-}
-
-export function getAllParsedImports() {
-    const stored = getStoredCsvImports()
-
-    return {
-        accountBalanceHistory: stored.accountBalanceHistory || stored.account || null,
-        positionHistory: stored.positionHistory || stored.trades || null,
-        orders: stored.orders || null,
-        fills: stored.fills || null,
-        performance: stored.performance || null,
-    }
-}
-
-export function mergeStoredCsvImports(partialState = {}) {
-    const current = getStoredCsvImports()
-    const next = {
-        ...current,
-    }
-
-    Object.keys(partialState).forEach((key) => {
-        if (partialState[key] !== undefined && partialState[key] !== null) {
-            next[key] = partialState[key]
-        }
-    })
-
-    if (next.positionHistory) {
-        next.trades = next.positionHistory
-    }
-
-    if (next.accountBalanceHistory) {
-        next.account = next.accountBalanceHistory
-    }
-
-    saveStoredCsvImports(next)
-    return getAllParsedImports()
-}
-
-export async function importAndStoreCsvFiles(files = []) {
-    const parsedList = await Promise.all(files.map((file) => parseImportedCsv(file)))
-    const partial = createEmptyImportStore()
-    const savedTypes = []
-    const skippedFiles = []
-
-    parsedList.forEach((parsed) => {
-        const type = parsed?.meta?.type
-
-        if (!type || type === CSV_TYPES.UNKNOWN) {
-            skippedFiles.push(parsed?.meta?.fileName || "Unbekannte Datei")
-            return
-        }
-
-        partial[type] = parsed
-        savedTypes.push(type)
-    })
-
-    const mergedImports = mergeStoredCsvImports(partial)
-
-    return {
-        mergedImports,
-        savedTypes,
-        skippedFiles,
-    }
-}
-
-export function clearStoredCsvImport(type) {
-    const current = getStoredCsvImports()
-    const next = {
-        ...current,
-    }
-
-    if (type === CSV_TYPES.POSITION_HISTORY) {
-        next.positionHistory = null
-        next.trades = null
-    } else if (type === CSV_TYPES.ACCOUNT_BALANCE_HISTORY) {
-        next.accountBalanceHistory = null
-        next.account = null
-    } else if (Object.prototype.hasOwnProperty.call(next, type)) {
-        next[type] = null
-    }
-
-    saveStoredCsvImports(next)
-    return getAllParsedImports()
-}
-
-export function clearAllStoredCsvImports() {
-    const next = createEmptyImportStore()
-    saveStoredCsvImports(next)
-    return getAllParsedImports()
-}
-
-export function getImportedCsvByType(type) {
-    const imports = getStoredCsvImports()
-
-    if (type === "trades") {
-        return imports.positionHistory || imports.trades || null
-    }
-
-    if (type === "account") {
-        return imports.accountBalanceHistory || imports.account || null
-    }
-
-    return imports[type] || null
-}
-
-export function getImportedAccounts(importData = getAllParsedImports()) {
-    const accountKeys = new Set()
-
-    const pushKeys = (source) => {
-        if (!source?.byAccount) {
-            return
-        }
-
-        Object.keys(source.byAccount).forEach((key) => {
-            if (cleanString(key)) {
-                accountKeys.add(cleanString(key))
-            }
-        })
-    }
-
-    pushKeys(importData?.accountBalanceHistory)
-    pushKeys(importData?.positionHistory)
-    pushKeys(importData?.orders)
-    pushKeys(importData?.fills)
-
-    return [...accountKeys].map((accountKey) => {
-        const balanceRow = importData?.accountBalanceHistory?.latestByAccount?.[accountKey]
-        const accountName = balanceRow?.accountName || accountKey
-        const accountId = balanceRow?.accountId || ""
-
-        return {
-            id: accountKey,
-            accountKey,
-            accountName,
-            accountId,
-        }
-    })
-}
-
-export function buildLiveCardData(importData = getAllParsedImports(), selectedAccountId, fallbackProfile = {}) {
-    const balanceRow =
-        importData?.accountBalanceHistory?.latestByAccount?.[selectedAccountId] || null
-
-    return {
-        accountId: balanceRow?.accountName || selectedAccountId || fallbackProfile?.id || "",
-        platform: fallbackProfile?.platform || "Tradovate",
-        product: fallbackProfile?.productType || "EOD",
-        phase: fallbackProfile?.accountPhase || "Eval",
-        accountSize: fallbackProfile?.accountSize || 25000,
-        startBalance:
-            balanceRow?.startBalance ||
-            fallbackProfile?.accountSize ||
-            25000,
-        realizedPnL: balanceRow?.totalRealizedPnL || 0,
-        unrealizedPnL: 0,
-        realizedBalance: balanceRow?.realizedBalance || 0,
-        liveBalance: balanceRow?.liveBalance || 0,
-        tradeDate: balanceRow?.tradeDate || "",
-        sourceFileName: importData?.accountBalanceHistory?.meta?.fileName || "",
-        importedAt: importData?.accountBalanceHistory?.meta?.importedAt || "",
-    }
-}
-
-export function buildJournalData(importData = getAllParsedImports(), selectedAccountId) {
-    const rows = importData?.positionHistory?.byAccount?.[selectedAccountId] || []
-    const summary = importData?.positionHistory?.summaryByAccount?.[selectedAccountId] || {
-        trades: 0,
-        totalPnL: 0,
-        winners: 0,
-        losers: 0,
-        contracts: 0,
-    }
-
-    return {
-        readOnly: rows.length > 0,
-        fileName: importData?.positionHistory?.meta?.fileName || "",
-        importedAt: importData?.positionHistory?.meta?.importedAt || "",
-        stats: summary,
-        entries: rows.map((row) => ({
-            id: row.id,
-            date: row.date,
-            title: row.title,
-            result: row.result,
-            instrument: row.instrument,
-            contracts: row.contracts,
-            note: row.note,
-            entryTime: row.entryTime,
-            exitTime: row.exitTime,
-        })),
-    }
-}
-
-export function buildFillsData(importData = getAllParsedImports(), selectedAccountId) {
-    const rows = importData?.fills?.byAccount?.[selectedAccountId] || []
-    const summary = importData?.fills?.summaryByAccount?.[selectedAccountId] || {
-        total: 0,
-        totalCommission: 0,
-    }
-
-    return {
-        readOnly: rows.length > 0,
-        fileName: importData?.fills?.meta?.fileName || "",
-        importedAt: importData?.fills?.meta?.importedAt || "",
-        stats: summary,
-        entries: rows,
-    }
-}
-
-export function buildOrdersData(importData = getAllParsedImports(), selectedAccountId) {
-    const rows = importData?.orders?.byAccount?.[selectedAccountId] || []
-    const summary = importData?.orders?.summaryByAccount?.[selectedAccountId] || {
-        total: 0,
-        filled: 0,
-        canceled: 0,
-        working: 0,
-        rejected: 0,
-    }
-
-    const fillRows = importData?.fills?.byAccount?.[selectedAccountId] || []
-    const fillSummary = importData?.fills?.summaryByAccount?.[selectedAccountId] || {
-        total: 0,
-        totalCommission: 0,
-    }
-
-    const fillsByOrderId = groupByOrderId(fillRows, (row) => row?.orderId)
-
-    const entries = rows.map((row) => {
-        const relatedFills = fillsByOrderId[row.orderId] || []
-        const relatedFillSummary = summarizeOrderFills(relatedFills)
-
-        return {
-            ...row,
-            hasFills: relatedFillSummary.fillCount > 0,
-            fillCount: relatedFillSummary.fillCount,
-            fillContracts: relatedFillSummary.fillContracts,
-            fillPrice: relatedFillSummary.avgFillPrice,
-            firstFillTime: relatedFillSummary.firstFillTime,
-            lastFillTime: relatedFillSummary.lastFillTime,
-            totalCommission: relatedFillSummary.totalCommission,
-            effectiveSide: row.side || relatedFillSummary.side || "",
-            effectiveInstrument:
-                row.instrument ||
-                relatedFillSummary.instrument ||
-                row.contract ||
-                row.product ||
-                "",
-            effectiveTime:
-                relatedFillSummary.lastFillTime ||
-                row.fillTime ||
-                row.timestamp ||
-                row.orderDate ||
-                row.date ||
-                "",
-            fills: relatedFills,
-        }
-    })
-
-    return {
-        readOnly: rows.length > 0,
-        fileName: importData?.orders?.meta?.fileName || "",
-        importedAt: importData?.orders?.meta?.importedAt || "",
-        fillsFileName: importData?.fills?.meta?.fileName || "",
-        fillsImportedAt: importData?.fills?.meta?.importedAt || "",
-        stats: {
-            ...summary,
-            totalFills: fillSummary.total || 0,
-            totalCommission: fillSummary.totalCommission || 0,
-            ordersWithFills: entries.filter((entry) => entry.hasFills).length,
-        },
-        entries,
-    }
-}
-
-export function buildRiskData(importData = getAllParsedImports(), selectedAccountId) {
-    const positions = importData?.positionHistory?.byAccount?.[selectedAccountId] || []
-    const latestBalance =
-        importData?.accountBalanceHistory?.latestByAccount?.[selectedAccountId] || null
-    const performanceRows = importData?.performance?.rows || []
-
-    const todayPnL = positions.reduce((sum, row) => sum + parseNumber(row.result, 0), 0)
-    const winners = positions.filter((row) => parseNumber(row.result, 0) > 0).length
-    const losers = positions.filter((row) => parseNumber(row.result, 0) < 0).length
-    const totalTrades = positions.length
-    const totalContracts = positions.reduce(
-        (sum, row) => sum + parseInteger(row.contracts, 0),
-        0
-    )
-
-    const bestTrade = positions.reduce(
-        (best, row) => Math.max(best, parseNumber(row.result, Number.NEGATIVE_INFINITY)),
-        Number.NEGATIVE_INFINITY
-    )
-
-    const worstTrade = positions.reduce(
-        (worst, row) => Math.min(worst, parseNumber(row.result, Number.POSITIVE_INFINITY)),
-        Number.POSITIVE_INFINITY
-    )
-
-    const averageDuration =
-        performanceRows.length > 0
-            ? performanceRows
-                .map((row) => row.duration)
+    const uniqueDigitCandidates = Array.from(
+        new Set(
+            entries
+                .flatMap((entry) => getAccountCandidates(entry.raw || entry))
+                .map((candidate) => candidate.digits)
                 .filter(Boolean)
-                .join(" | ")
-            : ""
+        )
+    );
 
-    return {
-        readOnly: positions.length > 0,
-        fileName: importData?.positionHistory?.meta?.fileName || "",
-        importedAt: importData?.positionHistory?.meta?.importedAt || "",
-        tradeDate: latestBalance?.tradeDate || "",
-        accountBalance: latestBalance?.liveBalance || 0,
-        realizedPnL: latestBalance?.totalRealizedPnL || 0,
-        todayPnL,
-        totalTrades,
-        winners,
-        losers,
-        totalContracts,
-        bestTrade: Number.isFinite(bestTrade) ? bestTrade : 0,
-        worstTrade: Number.isFinite(worstTrade) ? worstTrade : 0,
-        averageDuration,
+    if (uniqueDigitCandidates.length === 1) {
+        return entries;
     }
+
+    const uniqueKeyCandidates = Array.from(
+        new Set(
+            entries
+                .flatMap((entry) => getAccountCandidates(entry.raw || entry))
+                .map((candidate) => candidate.key)
+                .filter(Boolean)
+        )
+    );
+
+    if (uniqueKeyCandidates.length === 1) {
+        return entries;
+    }
+
+    return matched;
 }
 
-export function hasImportedDataForAccount(importData = getAllParsedImports(), selectedAccountId) {
-    return Boolean(
-        importData?.accountBalanceHistory?.byAccount?.[selectedAccountId]?.length ||
-        importData?.positionHistory?.byAccount?.[selectedAccountId]?.length ||
-        importData?.orders?.byAccount?.[selectedAccountId]?.length ||
-        importData?.fills?.byAccount?.[selectedAccountId]?.length
-    )
+function applyResolvedAccount(entries = [], accountId = "") {
+    const resolved = cleanString(accountId);
+
+    if (!resolved) {
+        return entries;
+    }
+
+    return entries.map((entry) => ({
+        ...entry,
+        accountId: cleanString(entry.accountId || resolved),
+        accountName: cleanString(entry.accountName || entry.account || resolved),
+    }));
 }
 
-export function parseOrdersImport() {
-    const imported = getImportedCsvByType("orders")
+function normalizeImportKey(type) {
+    const safeType = cleanString(type);
 
-    if (!imported?.rows) {
+    if (safeType === "dailySummary") {
+        return "cashHistory";
+    }
+
+    if (IMPORT_KEYS.includes(safeType)) {
+        return safeType;
+    }
+
+    return "";
+}
+
+function getCashHistorySource(importData) {
+    return (
+        importData?.cashHistory ||
+        importData?.dailySummary ||
+        createEmptyImport("cashHistory")
+    );
+}
+
+function mapOrdersRows(rows = []) {
+    return rows.map((row, index) => {
+        const orderIdVal =
+            getValue(row, ["Order ID", "orderId", "order_id", "id"]) ||
+            `csv-order-${index + 1}`;
+
+        const instrumentVal = getValue(row, ["Contract", "Product", "Instrument", "Symbol"]);
+
+        const contractsVal =
+            getValue(row, ["Quantity", "Filled Qty", "filledQty", "qty", "Size"]) || "0";
+
+        const filledQtyVal = getValue(row, ["Filled Qty", "filledQty", "Quantity"]) || "0";
+
+        const timestampVal = buildDateTimeValue(row, {
+            dateTimeAliases: ["Timestamp", "Fill Time"],
+            dateAliases: ["Date"],
+            timeAliases: ["Timestamp"],
+        });
+
+        const statusVal = getValue(row, ["Status"]);
+
         return {
-            headers: [],
-            rows: [],
-            meta: null,
+            id: orderIdVal,
+            orderId: orderIdVal,
+            instrument: instrumentVal,
+            symbol: instrumentVal,
+            contract: instrumentVal,
+            side: getValue(row, ["B/S", "Side", "Action"]),
+            action: getValue(row, ["B/S", "Side", "Action"]),
+            status: statusVal,
+            orderStatus: statusVal,
+            type: getValue(row, ["Type"]),
+            contracts: contractsVal,
+            quantity: contractsVal,
+            qty: contractsVal,
+            size: contractsVal,
+            filledQty: filledQtyVal,
+            avgFillPrice: getValue(row, ["Avg Fill Price", "avgPrice", "avg fill price"]),
+            limitPrice: getValue(row, ["Limit Price", "decimalLimit", "limit price"]),
+            stopPrice: getValue(row, ["Stop Price", "decimalStop", "stop price"]),
+            timestamp: timestampVal,
+            createdAt: timestampVal,
+            submittedAt: timestampVal,
+            time: timestampVal,
+            date: timestampVal,
+            accountId: getValue(row, ["Account ID", "_accountId", "Account"]),
+            accountName: getValue(row, ["Account", "Account Name"]),
+            raw: row,
+        };
+    });
+}
+
+function mapTradesRows(rows = []) {
+    return rows.map((row, index) => {
+        const quantityValue =
+            getValue(row, ["Quantity", "_qty", "qty", "contracts"]) || "0";
+
+        const timestampIso = buildDateTimeValue(row, {
+            dateTimeAliases: ["_timestamp", "Timestamp"],
+            dateAliases: ["Date", "_tradeDate", "Trade Date"],
+            timeAliases: ["Timestamp"],
+        });
+
+        return {
+            fillId:
+                getValue(row, ["Fill ID", "_id", "id"]) ||
+                `csv-fill-${index + 1}`,
+            orderId: getValue(row, ["Order ID", "_orderId"]),
+            tradeId: "",
+            symbol: getValue(row, ["Contract", "Product", "Instrument", "Symbol"]),
+            side: getValue(row, ["B/S", "Side", "_action"]),
+            quantity: quantityValue,
+            contracts: quantityValue,
+            price: getValue(row, ["Price", "_price"]),
+            commission: getValue(row, ["commission", "Commission"]),
+            timestampIso,
+            timestamp: timestampIso,
+            date: timestampIso,
+            tradeDate: timestampIso,
+            accountId: getValue(row, ["_accountId", "Account ID", "Account"]),
+            accountName: getValue(row, ["Account", "Account Name"]),
+            raw: row,
+            source: "csv",
+        };
+    });
+}
+
+function mapCashHistoryRows(rows = []) {
+    return rows.map((row, index) => ({
+        id: `cash-history-${index + 1}`,
+        date: buildDateTimeValue(row, {
+            dateTimeAliases: ["Trade Date", "Date", "Timestamp", "Transaction Date"],
+            dateAliases: ["Trade Date", "Date", "Transaction Date"],
+            timeAliases: ["Time"],
+        }),
+        transactionType: getValue(row, [
+            "Transaction Type",
+            "Type",
+            "Activity Type",
+            "Event Type",
+        ]),
+        description: getValue(row, [
+            "Description",
+            "Details",
+            "Memo",
+            "Comment",
+        ]),
+        amount:
+            getValue(row, [
+                "Amount",
+                "Net Amount",
+                "Transaction Amount",
+                "Cash Change",
+            ]) || "0",
+        totalAmount:
+            getValue(row, [
+                "Total Amount",
+                "Balance",
+                "Ending Balance",
+                "End Balance",
+                "End Of Day Balance",
+                "Net Liq",
+                "Net Liquidating Value",
+                "Net Liquidity",
+                "Account Balance",
+                "Cash Balance",
+            ]) || "0",
+        startingBalance:
+            getValue(row, [
+                "Starting Balance",
+                "Start Balance",
+                "Beginning Balance",
+                "Start Of Day Balance",
+                "Starting Account Balance",
+                "Initial Balance",
+            ]) || "",
+        accountSize:
+            getValue(row, [
+                "Account Size",
+                "Starting Account Size",
+                "Initial Balance",
+                "Starting Balance",
+            ]) || "",
+        accountId: getValue(row, [
+            "Account ID",
+            "Account",
+            "_accountId",
+            "Acct",
+            "Acct ID",
+        ]),
+        accountName: getValue(row, ["Account Name", "Account"]),
+        raw: row,
+    }));
+}
+
+function mapPerformanceRows(rows = []) {
+    return rows.map((row, index) => ({
+        id: `performance-${index + 1}`,
+        symbol: getValue(row, ["symbol", "Symbol"]),
+        quantity: getValue(row, ["qty", "Qty"]) || "0",
+        pnl: getValue(row, ["pnl", "P/L"]) || "0",
+        buyPrice: getValue(row, ["buyPrice", "Buy Price"]) || "",
+        sellPrice: getValue(row, ["sellPrice", "Sell Price"]) || "",
+        boughtTimestamp: buildDateTimeValue(row, {
+            dateTimeAliases: ["boughtTimestamp", "Bought Timestamp"],
+            dateAliases: [],
+            timeAliases: [],
+        }),
+        soldTimestamp: buildDateTimeValue(row, {
+            dateTimeAliases: ["soldTimestamp", "Sold Timestamp"],
+            dateAliases: [],
+            timeAliases: [],
+        }),
+        duration: getValue(row, ["duration", "Duration"]) || "",
+        buyFillId: getValue(row, ["buyFillId", "Buy Fill ID"]) || "",
+        sellFillId: getValue(row, ["sellFillId", "Sell Fill ID"]) || "",
+        raw: row,
+    }));
+}
+
+function mapPositionHistoryRows(rows = []) {
+    return rows.map((row, index) => ({
+        id:
+            getValue(row, ["Position ID", "Pair ID"]) ||
+            `position-history-${index + 1}`,
+        positionId: getValue(row, ["Position ID"]) || "",
+        pairId: getValue(row, ["Pair ID"]) || "",
+        timestamp: buildDateTimeValue(row, {
+            dateTimeAliases: ["Timestamp"],
+            dateAliases: ["Trade Date"],
+            timeAliases: [],
+        }),
+        tradeDate: getValue(row, ["Trade Date"]) || "",
+        accountId: getValue(row, ["Account ID", "Account", "_accountId"]) || "",
+        account: getValue(row, ["Account"]) || "",
+        contract: getValue(row, ["Contract"]) || "",
+        product: getValue(row, ["Product"]) || "",
+        netPos: getValue(row, ["Net Pos"]) || "0",
+        netPrice: getValue(row, ["Net Price"]) || "",
+        bought: getValue(row, ["Bought"]) || "0",
+        avgBuy: getValue(row, ["Avg. Buy"]) || "",
+        sold: getValue(row, ["Sold"]) || "0",
+        avgSell: getValue(row, ["Avg. Sell"]) || "",
+        pairedQty: getValue(row, ["Paired Qty"]) || "0",
+        buyPrice: getValue(row, ["Buy Price"]) || "",
+        sellPrice: getValue(row, ["Sell Price"]) || "",
+        pnl: getValue(row, ["P/L"]) || "0",
+        buyFillId: getValue(row, ["Buy Fill ID"]) || "",
+        sellFillId: getValue(row, ["Sell Fill ID"]) || "",
+        boughtTimestamp: buildDateTimeValue(row, {
+            dateTimeAliases: ["Bought Timestamp"],
+            dateAliases: [],
+            timeAliases: [],
+        }),
+        soldTimestamp: buildDateTimeValue(row, {
+            dateTimeAliases: ["Sold Timestamp"],
+            dateAliases: [],
+            timeAliases: [],
+        }),
+        raw: row,
+    }));
+}
+
+function buildStatsForOrders(entries = []) {
+    return entries.reduce(
+        (stats, entry) => {
+            const status = cleanString(entry.status).toLowerCase();
+
+            stats.total += 1;
+
+            if (status.includes("fill")) {
+                stats.filled += 1;
+            } else if (status.includes("cancel")) {
+                stats.canceled += 1;
+            } else if (
+                status.includes("open") ||
+                status.includes("working") ||
+                status.includes("pending") ||
+                status.includes("submit")
+            ) {
+                stats.working += 1;
+            } else if (status.includes("reject")) {
+                stats.rejected += 1;
+            }
+
+            return stats;
+        },
+        {
+            total: 0,
+            filled: 0,
+            canceled: 0,
+            working: 0,
+            rejected: 0,
+        }
+    );
+}
+
+function parseDateToMs(value) {
+    const text = cleanString(value);
+
+    if (!text) {
+        return null;
+    }
+
+    const direct = Date.parse(text);
+
+    if (Number.isFinite(direct)) {
+        return direct;
+    }
+
+    const swissMatch = text.match(
+        /^(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
+    );
+
+    if (swissMatch) {
+        const day = Number(swissMatch[1]);
+        const month = Number(swissMatch[2]) - 1;
+        const year = Number(swissMatch[3].length === 2 ? `20${swissMatch[3]}` : swissMatch[3]);
+        const hour = Number(swissMatch[4] || 0);
+        const minute = Number(swissMatch[5] || 0);
+        const second = Number(swissMatch[6] || 0);
+
+        const ms = new Date(year, month, day, hour, minute, second).getTime();
+        return Number.isFinite(ms) ? ms : null;
+    }
+
+    return null;
+}
+
+function sortEntriesByDate(entries = []) {
+    return [...entries]
+        .map((entry, index) => ({
+            entry,
+            index,
+            ms: parseDateToMs(entry?.date || entry?.timestamp || entry?.tradeDate),
+        }))
+        .sort((left, right) => {
+            if (left.ms !== null && right.ms !== null) {
+                return left.ms - right.ms;
+            }
+
+            if (left.ms !== null) {
+                return -1;
+            }
+
+            if (right.ms !== null) {
+                return 1;
+            }
+
+            return left.index - right.index;
+        })
+        .map((item) => item.entry);
+}
+
+function pickFirstMeaningfulNumber(entries = [], selectors = []) {
+    for (const entry of entries) {
+        for (const selector of selectors) {
+            const value = parseFlexibleNumber(selector(entry));
+
+            if (value !== null && value !== 0) {
+                return value;
+            }
         }
     }
 
-    const rows = imported.rows.map((row, index) => ({
-        id: row.id || `csv-order-${index + 1}`,
-        source: "csv",
-        symbol: row.instrument || row.contract || row.product || "-",
-        side: row.side || "-",
-        type: row.type || "-",
-        quantity: parseInteger(row.contracts, 0),
-        price:
-            parseNumber(row.avgFillPrice, NaN) ||
-            parseNumber(row.limitPrice, NaN) ||
-            parseNumber(row.stopPrice, 0),
-        status: row.status || "-",
-        createdAt: row.timestamp || row.date || row.fillTime || "",
-        raw: row.raw || row,
-    }))
+    for (const entry of entries) {
+        for (const selector of selectors) {
+            const value = parseFlexibleNumber(selector(entry));
 
-    return {
-        headers: imported.headers || [],
-        rows,
-        meta: imported.meta || null,
-    }
-}
-
-export function parseTradesImport() {
-    const imported = getImportedCsvByType("trades")
-
-    if (!imported?.rows) {
-        return {
-            headers: [],
-            rows: [],
-            meta: null,
+            if (value !== null) {
+                return value;
+            }
         }
     }
 
-    const rows = imported.rows.map((row, index) => ({
-        id: row.id || `csv-trade-${index + 1}`,
-        source: "csv",
-        date: row.date || row.tradeDate || "",
-        time: row.exitTime || row.entryTime || "",
-        title: row.title || `${row.instrument || "Trade"} Trade`,
-        result: `${parseNumber(row.result, 0).toFixed(2)} $`,
-        note: row.note || "",
-        symbol: row.instrument || "-",
-        side: row.side || "-",
-        quantity: parseInteger(row.contracts, 0),
-        entryPrice: parseNumber(row.buyPrice, 0),
-        exitPrice: parseNumber(row.sellPrice, 0),
-        pnl: parseNumber(row.result, 0),
-        raw: row.raw || row,
-    }))
+    return null;
+}
+
+function pickLastMeaningfulNumber(entries = [], selectors = []) {
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const entry = entries[index];
+
+        for (const selector of selectors) {
+            const value = parseFlexibleNumber(selector(entry));
+
+            if (value !== null && value !== 0) {
+                return value;
+            }
+        }
+    }
+
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const entry = entries[index];
+
+        for (const selector of selectors) {
+            const value = parseFlexibleNumber(selector(entry));
+
+            if (value !== null) {
+                return value;
+            }
+        }
+    }
+
+    return null;
+}
+
+export function getCsvImportStorageKey() {
+    return "tradingAppData";
+}
+
+export function getCsvImportEventName() {
+    return IMPORT_UPDATED_EVENT;
+}
+
+export function getAllParsedImports(accountId = "") {
+    const resolvedAccountId = resolveAccountId(accountId);
+
+    if (!resolvedAccountId) {
+        return getEmptyImports();
+    }
+
+    return normalizeImportsShape(getCsvImports(resolvedAccountId));
+}
+
+export function getParsedImport(type, accountId = "") {
+    const key = normalizeImportKey(type);
+
+    if (!key) {
+        return createEmptyImport("");
+    }
+
+    const imports = getAllParsedImports(accountId);
+
+    if (key === "cashHistory") {
+        return imports.cashHistory || createEmptyImport("cashHistory");
+    }
+
+    return imports[key] || createEmptyImport(key);
+}
+
+export function clearParsedImport(type, accountId = "") {
+    const key = normalizeImportKey(type);
+    const resolvedAccountId = resolveAccountId(accountId);
+
+    if (!key || !resolvedAccountId) {
+        return;
+    }
+
+    clearParsedCsvImport(resolvedAccountId, key);
+    emitImportsUpdated();
+}
+
+export function saveParsedImport(type, fileName, text, accountId = "") {
+    const key = normalizeImportKey(type);
+    const resolvedAccountId = resolveAccountId(accountId);
+
+    if (!key || !resolvedAccountId) {
+        return createEmptyImport("");
+    }
+
+    const parsed = parseCsvText(text);
+
+    const entry = {
+        type: key,
+        fileName: cleanString(fileName),
+        importedAt: new Date().toISOString(),
+        headers: parsed.headers,
+        rows: parsed.rows,
+        previewRows: parsed.previewRows,
+        rawText: String(text || ""),
+    };
+
+    const savedEntry = saveParsedCsvImport(resolvedAccountId, key, entry);
+    emitImportsUpdated();
+
+    return cloneImportEntry(key, savedEntry);
+}
+
+export function buildOrdersData(importData, accountId = "") {
+    const source = importData?.orders || createEmptyImport("orders");
+    const mappedEntries = mapOrdersRows(source.rows || []);
+    const scopedEntries = applyResolvedAccount(
+        filterEntriesForAccount(mappedEntries, accountId),
+        accountId
+    );
 
     return {
-        headers: imported.headers || [],
-        rows,
-        meta: imported.meta || null,
-    }
+        readOnly: scopedEntries.length > 0,
+        fileName: source.fileName || "",
+        importedAt: source.importedAt || "",
+        stats: buildStatsForOrders(scopedEntries),
+        entries: scopedEntries,
+        previewRows: source.previewRows || [],
+        headers: source.headers || [],
+    };
+}
+
+export function buildFillsData(importData, accountId = "") {
+    const source = importData?.trades || createEmptyImport("trades");
+    const mappedEntries = mapTradesRows(source.rows || []);
+    const scopedEntries = applyResolvedAccount(
+        filterEntriesForAccount(mappedEntries, accountId),
+        accountId
+    );
+
+    const totalCommission = scopedEntries.reduce((sum, row) => {
+        return sum + Math.abs(toNumber(row.commission, 0));
+    }, 0);
+
+    return {
+        readOnly: scopedEntries.length > 0,
+        fileName: source.fileName || "",
+        importedAt: source.importedAt || "",
+        stats: {
+            total: scopedEntries.length,
+            totalCommission,
+        },
+        entries: scopedEntries,
+        previewRows: source.previewRows || [],
+        headers: source.headers || [],
+    };
+}
+
+export function buildCashHistoryData(importData, accountId = "") {
+    const source = getCashHistorySource(importData);
+    const mappedEntries = mapCashHistoryRows(source.rows || []);
+    const scopedEntries = applyResolvedAccount(
+        filterEntriesForAccount(mappedEntries, accountId),
+        accountId
+    );
+
+    const totalAmount = scopedEntries.reduce((sum, row) => {
+        return sum + toNumber(row.amount, 0);
+    }, 0);
+
+    return {
+        readOnly: scopedEntries.length > 0,
+        fileName: source.fileName || "",
+        importedAt: source.importedAt || "",
+        stats: {
+            total: scopedEntries.length,
+            totalAmount,
+        },
+        entries: scopedEntries,
+        previewRows: source.previewRows || [],
+        headers: source.headers || [],
+    };
+}
+
+export function buildDailySummaryData(importData, accountId = "") {
+    return buildCashHistoryData(importData, accountId);
+}
+
+export function deriveCashHistorySnapshot(importData, accountId = "") {
+    const cashHistoryData = buildCashHistoryData(importData, accountId);
+    const sortedEntries = sortEntriesByDate(cashHistoryData.entries || []);
+
+    const startingValue = pickFirstMeaningfulNumber(sortedEntries, [
+        (entry) => entry.accountSize,
+        (entry) => entry.startingBalance,
+        (entry) => entry.totalAmount,
+        (entry) => entry.amount,
+    ]);
+
+    const currentValue = pickLastMeaningfulNumber(sortedEntries, [
+        (entry) => entry.totalAmount,
+        (entry) => entry.amount,
+        (entry) => entry.startingBalance,
+        (entry) => entry.accountSize,
+    ]);
+
+    const firstEntry = sortedEntries[0] || null;
+    const lastEntry = sortedEntries[sortedEntries.length - 1] || null;
+
+    const accountSize = startingValue !== null ? startingValue : 0;
+    const startingBalance = startingValue !== null ? startingValue : 0;
+    const currentBalance =
+        currentValue !== null
+            ? currentValue
+            : startingValue !== null
+                ? startingValue
+                : 0;
+
+    return {
+        hasValues: startingValue !== null || currentValue !== null,
+        rowCount: sortedEntries.length,
+        firstDate: cleanString(firstEntry?.date || firstEntry?.timestamp || ""),
+        lastDate: cleanString(lastEntry?.date || lastEntry?.timestamp || ""),
+        accountSize,
+        startingBalance,
+        currentBalance,
+        sourceFileName: cashHistoryData.fileName || "",
+        importedAt: cashHistoryData.importedAt || "",
+    };
+}
+
+export function buildPerformanceData(importData, accountId = "") {
+    const source = importData?.performance || createEmptyImport("performance");
+    const mappedEntries = mapPerformanceRows(source.rows || []);
+    const scopedEntries = applyResolvedAccount(
+        filterEntriesForAccount(mappedEntries, accountId),
+        accountId
+    );
+
+    const totalPnl = scopedEntries.reduce((sum, row) => {
+        return sum + toNumber(row.pnl, 0);
+    }, 0);
+
+    return {
+        readOnly: scopedEntries.length > 0,
+        fileName: source.fileName || "",
+        importedAt: source.importedAt || "",
+        stats: {
+            total: scopedEntries.length,
+            totalPnl,
+        },
+        entries: scopedEntries,
+        previewRows: source.previewRows || [],
+        headers: source.headers || [],
+    };
+}
+
+export function buildPositionHistoryData(importData, accountId = "") {
+    const source = importData?.positionHistory || createEmptyImport("positionHistory");
+    const mappedEntries = mapPositionHistoryRows(source.rows || []);
+    const scopedEntries = applyResolvedAccount(
+        filterEntriesForAccount(mappedEntries, accountId),
+        accountId
+    );
+
+    const totalPnl = scopedEntries.reduce((sum, row) => {
+        return sum + toNumber(row.pnl, 0);
+    }, 0);
+
+    return {
+        readOnly: scopedEntries.length > 0,
+        fileName: source.fileName || "",
+        importedAt: source.importedAt || "",
+        stats: {
+            total: scopedEntries.length,
+            totalPnl,
+        },
+        entries: scopedEntries,
+        previewRows: source.previewRows || [],
+        headers: source.headers || [],
+    };
+}
+
+export function buildAccountReportData(importData, accountId = "") {
+    return buildPerformanceData(importData, accountId);
 }
