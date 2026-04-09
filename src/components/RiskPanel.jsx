@@ -57,6 +57,37 @@ const INSTRUMENT_CONFIG = {
     },
 };
 
+const ACCOUNT_PRESETS = {
+    "25K_EOD": {
+        label: "25K EOD",
+        accountSize: 25000,
+        dailyLossLimit: 250,
+        maxDrawdown: 1500,
+        dailyTarget: 250,
+    },
+    "50K_EOD": {
+        label: "50K EOD",
+        accountSize: 50000,
+        dailyLossLimit: 500,
+        maxDrawdown: 3000,
+        dailyTarget: 500,
+    },
+    "100K_EOD": {
+        label: "100K EOD",
+        accountSize: 100000,
+        dailyLossLimit: 1000,
+        maxDrawdown: 6000,
+        dailyTarget: 1000,
+    },
+    "150K_EOD": {
+        label: "150K EOD",
+        accountSize: 150000,
+        dailyLossLimit: 1500,
+        maxDrawdown: 9000,
+        dailyTarget: 1500,
+    },
+};
+
 function cleanString(value) {
     if (value === null || value === undefined) {
         return "";
@@ -613,29 +644,23 @@ function getInstrumentConfig(value) {
     return INSTRUMENT_CONFIG[key] || INSTRUMENT_CONFIG.MNQ;
 }
 
-function deriveDefaultDailyLimit(accountSize) {
-    const safeSize = normalizeAccountSize(accountSize, 25000) || 25000;
-    return Math.round(safeSize * 0.01);
+function getDefaultPresetKey() {
+    return "25K_EOD";
 }
 
-function deriveDefaultMaxDrawdown(accountSize) {
-    const safeSize = normalizeAccountSize(accountSize, 25000) || 25000;
-    return Math.round(safeSize * 0.06);
+function getPresetConfig(presetKey) {
+    return ACCOUNT_PRESETS[presetKey] || ACCOUNT_PRESETS[getDefaultPresetKey()];
 }
 
-function deriveDefaultDailyTarget(accountSize) {
-    const safeSize = normalizeAccountSize(accountSize, 25000) || 25000;
-    return Math.round(safeSize * 0.01);
-}
-
-function createDefaultRiskDraft(accountSize) {
-    const safeAccountSize = normalizeAccountSize(accountSize, 25000) || 25000;
+function buildRiskDraftFromPreset(presetKey) {
+    const preset = getPresetConfig(presetKey);
 
     return {
-        accountSize: safeAccountSize,
-        dailyLossLimit: deriveDefaultDailyLimit(safeAccountSize),
-        maxDrawdown: deriveDefaultMaxDrawdown(safeAccountSize),
-        dailyTarget: deriveDefaultDailyTarget(safeAccountSize),
+        presetKey,
+        accountSize: preset.accountSize,
+        dailyLossLimit: preset.dailyLossLimit,
+        maxDrawdown: preset.maxDrawdown,
+        dailyTarget: preset.dailyTarget,
         instrument: "MNQ",
         side: "long",
         entry: "",
@@ -643,6 +668,10 @@ function createDefaultRiskDraft(accountSize) {
         target: "",
         qty: 1,
     };
+}
+
+function createDefaultRiskDraft() {
+    return buildRiskDraftFromPreset(getDefaultPresetKey());
 }
 
 function getCalculatorStatus({
@@ -863,7 +892,7 @@ function RiskPanelContent({
     );
 
     const [riskDraft, setRiskDraft] = useState(() =>
-        createDefaultRiskDraft(detectedAccountSize)
+        createDefaultRiskDraft()
     );
 
     const simulatedTradeCount = Array.isArray(tradeSimulation?.trades)
@@ -896,8 +925,21 @@ function RiskPanelContent({
         }));
     }
 
+    function handlePresetChange(nextPresetKey) {
+        const presetDraft = buildRiskDraftFromPreset(nextPresetKey);
+
+        setRiskDraft((prev) => ({
+            ...prev,
+            presetKey: presetDraft.presetKey,
+            accountSize: presetDraft.accountSize,
+            dailyLossLimit: presetDraft.dailyLossLimit,
+            maxDrawdown: presetDraft.maxDrawdown,
+            dailyTarget: presetDraft.dailyTarget,
+        }));
+    }
+
     function handleResetRiskDraft() {
-        setRiskDraft(createDefaultRiskDraft(detectedAccountSize));
+        setRiskDraft(createDefaultRiskDraft());
     }
 
     function handleAddTestTrade() {
@@ -1317,6 +1359,28 @@ function RiskPanelContent({
                         gap: 12,
                     }}
                 >
+                    <InputField label="Kontomodell">
+                        <select
+                            value={riskDraft.presetKey}
+                            onChange={(event) => handlePresetChange(event.target.value)}
+                            style={{
+                                width: "100%",
+                                padding: "12px 14px",
+                                borderRadius: 12,
+                                border: `1px solid ${COLORS.borderStrong}`,
+                                background: "rgba(0,0,0,0.25)",
+                                color: COLORS.text,
+                                outline: "none",
+                            }}
+                        >
+                            {Object.entries(ACCOUNT_PRESETS).map(([key, preset]) => (
+                                <option key={key} value={key}>
+                                    {preset.label}
+                                </option>
+                            ))}
+                        </select>
+                    </InputField>
+
                     <InputField label="Kontogrösse">
                         <input
                             type="number"
