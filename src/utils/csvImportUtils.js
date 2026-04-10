@@ -96,6 +96,27 @@ function normalizeImportsShape(value) {
     };
 }
 
+function attachLegacyImportAliases(imports, accountId = "") {
+    const resolvedAccountId = cleanString(accountId);
+    const cashRows = Array.isArray(imports?.cashHistory?.rows)
+        ? imports.cashHistory.rows
+        : [];
+
+    return {
+        ...imports,
+        accountBalanceHistory: {
+            byAccount: resolvedAccountId
+                ? {
+                    [resolvedAccountId]: cashRows,
+                }
+                : {},
+            rows: cashRows,
+            fileName: imports?.cashHistory?.fileName || "",
+            importedAt: imports?.cashHistory?.importedAt || "",
+        },
+    };
+}
+
 function emitImportsUpdated() {
     if (typeof window === "undefined") {
         return;
@@ -824,6 +845,20 @@ function pickLastMeaningfulNumber(entries = [], selectors = []) {
     return null;
 }
 
+function pickFirstMeaningfulText(entries = [], selectors = []) {
+    for (const entry of entries) {
+        for (const selector of selectors) {
+            const value = cleanString(selector(entry));
+
+            if (value) {
+                return value;
+            }
+        }
+    }
+
+    return "";
+}
+
 export function getCsvImportStorageKey() {
     return "tradingAppData";
 }
@@ -836,10 +871,11 @@ export function getAllParsedImports(accountId = "") {
     const resolvedAccountId = resolveAccountId(accountId);
 
     if (!resolvedAccountId) {
-        return getEmptyImports();
+        return attachLegacyImportAliases(getEmptyImports(), "");
     }
 
-    return normalizeImportsShape(getCsvImports(resolvedAccountId));
+    const normalizedImports = normalizeImportsShape(getCsvImports(resolvedAccountId));
+    return attachLegacyImportAliases(normalizedImports, resolvedAccountId);
 }
 
 export function getParsedImport(type, accountId = "") {
@@ -1068,4 +1104,63 @@ export function buildPositionHistoryData(importData, accountId = "") {
 
 export function buildAccountReportData(importData, accountId = "") {
     return buildPerformanceData(importData, accountId);
+}
+
+export function buildLiveCardData(importData, accountId = "", account = {}) {
+    const resolvedAccountId = cleanString(accountId);
+    const cashHistoryData = buildCashHistoryData(importData, resolvedAccountId);
+    const cashHistorySnapshot = deriveCashHistorySnapshot(importData, resolvedAccountId);
+    const sortedEntries = sortEntriesByDate(cashHistoryData.entries || []);
+
+    const importedAccountLabel = pickFirstMeaningfulText(sortedEntries, [
+        (entry) => entry.accountName,
+        (entry) => entry.accountId,
+        (entry) => entry.raw?.accountName,
+        (entry) => entry.raw?.accountId,
+        (entry) => entry.raw?.Account,
+        (entry) => entry.raw?.["Account Name"],
+        (entry) => entry.raw?.["Account ID"],
+    ]);
+
+    const fallbackAccountSize = toNumber(account?.accountSize, 0);
+    const fallbackCurrentBalance = toNumber(account?.currentBalance, fallbackAccountSize);
+
+    const accountSize =
+        cashHistorySnapshot.accountSize > 0
+            ? cashHistorySnapshot.accountSize
+            : fallbackAccountSize;
+
+    const startBalance =
+        cashHistorySnapshot.startingBalance > 0
+            ? cashHistorySnapshot.startingBalance
+            : accountSize;
+
+    const liveBalance =
+        cashHistorySnapshot.currentBalance > 0
+            ? cashHistorySnapshot.currentBalance
+            : fallbackCurrentBalance;
+
+    const realizedBalance = liveBalance;
+    const realizedPnL = realizedBalance - startBalance;
+
+    return {
+        accountId:
+            importedAccountLabel ||
+            resolvedAccountId ||
+            cleanString(account?.id) ||
+            cleanString(account?.accountId),
+        platform: cleanString(account?.platform) || "Tradovate",
+        product: cleanString(account?.productType) || "EOD",
+        phase: cleanString(account?.accountPhase) || "EVAL",
+        accountSize,
+        startBalance,
+        realizedPnL,
+        unrealizedPnL: 0,
+        realizedBalance,
+        liveBalance,
+        rowCount: cashHistorySnapshot.rowCount || cashHistoryData.entries.length,
+        sourceFileName:
+            cashHistorySnapshot.sourceFileName || cashHistoryData.fileName || "",
+        importedAt: cashHistorySnapshot.importedAt || cashHistoryData.importedAt || "",
+    };
 }
