@@ -256,27 +256,58 @@ export function formatAccountSizeLabel(value) {
 }
 
 export function detectAccountSize(value) {
-    const text = cleanString(value).toLowerCase()
+    const rawText = cleanString(value).toLowerCase()
 
-    if (!text) {
+    if (!rawText) {
         return 0
     }
 
-    const spaced = text.replace(/[_./-]+/g, " ")
+    const normalized = rawText
+        .replace(/[$()]/g, " ")
+        .replace(/[_./-]+/g, " ")
+        .replace(/,/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
 
-    if (/\b150\s*k\b/.test(spaced) || /\b150000\b/.test(spaced)) {
+    const compact = normalized.replace(/\s+/g, "")
+
+    if (
+        compact.includes("150k") ||
+        compact.includes("150000") ||
+        /\b150\s*k\b/.test(normalized) ||
+        /\b150\s*000\b/.test(normalized) ||
+        /\b150000\b/.test(normalized)
+    ) {
         return 150000
     }
 
-    if (/\b100\s*k\b/.test(spaced) || /\b100000\b/.test(spaced)) {
+    if (
+        compact.includes("100k") ||
+        compact.includes("100000") ||
+        /\b100\s*k\b/.test(normalized) ||
+        /\b100\s*000\b/.test(normalized) ||
+        /\b100000\b/.test(normalized)
+    ) {
         return 100000
     }
 
-    if (/\b50\s*k\b/.test(spaced) || /\b50000\b/.test(spaced)) {
+    if (
+        compact.includes("50k") ||
+        compact.includes("50000") ||
+        /\b50\s*k\b/.test(normalized) ||
+        /\b50\s*000\b/.test(normalized) ||
+        /\b50000\b/.test(normalized)
+    ) {
         return 50000
     }
 
-    if (/\b25\s*k\b/.test(spaced) || /\b25000\b/.test(spaced)) {
+    if (
+        compact.includes("25k") ||
+        compact.includes("25000") ||
+        /\b25\s*k\b/.test(normalized) ||
+        /\b25\s*000\b/.test(normalized) ||
+        /\b25000\b/.test(normalized)
+    ) {
         return 25000
     }
 
@@ -289,6 +320,8 @@ function resolveDetectedAccountSizeFromAccountLike(input = {}) {
         input?.displayName,
         input?.accountId,
         input?.accountName,
+        input?.name,
+        input?.label,
     ]
 
     for (const candidate of candidates) {
@@ -395,7 +428,7 @@ function normalizeAccount(account) {
     return {
         ...base,
         id: cleanString(base.id),
-        displayName: cleanString(base.displayName),
+        displayName: cleanString(base.displayName) || cleanString(base.id),
         productType: normalizeProductType(base.productType),
         accountPhase: normalizeAccountPhase(base.accountPhase),
         accountStatus: normalizeAccountStatus(base.accountStatus),
@@ -947,6 +980,33 @@ function applyAccountUpdates(account, updates = {}) {
             updates.currentBalance ?? updates.balance,
             account.currentBalance
         )
+    }
+
+    const detectedAccountSize = resolveDetectedAccountSizeFromAccountLike({
+        ...account,
+        ...updates,
+        displayName: nextDisplayName,
+        accountId: updates.accountId || account.id,
+        accountName: updates.accountName || nextDisplayName,
+        name: updates.name || nextDisplayName,
+        label: updates.label || nextDisplayName,
+    })
+
+    const repairedAccountSize = normalizeAccountSize(
+        account.accountSize || account.startingBalance || account.currentBalance,
+        detectedAccountSize || account.accountSize || account.startingBalance || account.currentBalance
+    )
+
+    if (repairedAccountSize > 0) {
+        account.accountSize = repairedAccountSize
+    }
+
+    if (!toNumber(account.startingBalance, 0) && account.accountSize > 0) {
+        account.startingBalance = account.accountSize
+    }
+
+    if (!toNumber(account.currentBalance, 0) && account.startingBalance > 0) {
+        account.currentBalance = account.startingBalance
     }
 
     if (account.accountPhase !== nextPhase) {
@@ -1893,6 +1953,24 @@ export function saveLiveAccountSnapshot(accountId, snapshot = {}) {
                     snapshot.accountSize,
                     account.accountSize || account.startingBalance || account.currentBalance
                 )
+            }
+
+            const detectedAccountSize = resolveDetectedAccountSizeFromAccountLike(account)
+            const repairedAccountSize = normalizeAccountSize(
+                account.accountSize || nextState.startingBalance || nextState.currentBalance,
+                detectedAccountSize || account.accountSize || nextState.startingBalance || nextState.currentBalance
+            )
+
+            if (repairedAccountSize > 0) {
+                account.accountSize = repairedAccountSize
+            }
+
+            if (!toNumber(account.startingBalance, 0) && account.accountSize > 0) {
+                account.startingBalance = account.accountSize
+            }
+
+            if (!toNumber(account.currentBalance, 0) && account.startingBalance > 0) {
+                account.currentBalance = account.startingBalance
             }
 
             account.updatedAt = nowIso()

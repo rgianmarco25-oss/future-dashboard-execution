@@ -2,6 +2,11 @@ import { useMemo, useState } from "react";
 import { buildFillAnalytics } from "../utils/fillAnalytics";
 import { formatDateTime } from "../utils/dateFormat";
 import { buildApexRiskSnapshot } from "../utils/apexRiskSnapshot";
+import { buildRiskLimitState, getRiskStatusColors } from "../utils/riskLimitState";
+import { detectAccountSize } from "../utils/storage";
+import RiskTestRunner from "../components/RiskTestRunner";
+
+const SHOW_INTERNAL_TEST_UI = import.meta.env.DEV;
 
 const COLORS = {
     panelBg: "rgba(255, 255, 255, 0.04)",
@@ -514,9 +519,7 @@ function rowMatchesAccount(row, accountId) {
         return true;
     }
 
-    const candidates = [
-        firstString(row, ACCOUNT_MATCH_KEYS),
-    ].filter(Boolean);
+    const candidates = [firstString(row, ACCOUNT_MATCH_KEYS)].filter(Boolean);
 
     if (!candidates.length) {
         return false;
@@ -621,17 +624,34 @@ function getBalanceValue(row) {
     return null;
 }
 
-function deriveAccountSize({ accountId, startBalance, currentBalance, fallbackSize }) {
+function deriveAccountSize({
+    accountId,
+    account,
+    startBalance,
+    currentBalance,
+    fallbackSize,
+}) {
     const explicitFallback = normalizeAccountSize(fallbackSize, 0);
 
     if (explicitFallback > 0) {
         return explicitFallback;
     }
 
-    const accountIdMatch = cleanString(accountId).match(/(\d{2,3})\s*k/i);
+    const candidates = [
+        account?.displayName,
+        account?.id,
+        account?.accountId,
+        account?.accountName,
+        account?.name,
+        accountId,
+    ];
 
-    if (accountIdMatch) {
-        return normalizeAccountSize(Number(accountIdMatch[1]) * 1000, 0);
+    for (const candidate of candidates) {
+        const detected = detectAccountSize(candidate);
+
+        if (detected > 0) {
+            return detected;
+        }
     }
 
     const reference =
@@ -750,6 +770,35 @@ function getDefaultDailyTarget(accountSize) {
     }
 }
 
+function resolveDefaultRiskMode(resolvedAccount) {
+    const phase = cleanString(resolvedAccount?.accountPhase).toLowerCase();
+    const productType = cleanString(resolvedAccount?.productType).toLowerCase();
+
+    if (phase === "pa" && productType === "intraday") {
+        return "PA_INTRADAY";
+    }
+
+    if (phase === "pa" && productType === "eod") {
+        return "PA_EOD";
+    }
+
+    if (phase === "eval" && productType === "intraday") {
+        return "EVAL_INTRADAY";
+    }
+
+    if (phase === "eval" && productType === "eod") {
+        return "EVAL_EOD";
+    }
+
+    return normalizeRiskMode(
+        resolvedAccount?.mode ||
+        resolvedAccount?.accountMode ||
+        resolvedAccount?.phaseMode ||
+        resolvedAccount?.name ||
+        "EVAL_EOD"
+    );
+}
+
 function createDefaultRiskDraft(detectedAccountSize, resolvedAccount) {
     const normalizedAccountSize = normalizeAccountSize(
         detectedAccountSize || resolvedAccount?.accountSize,
@@ -757,14 +806,7 @@ function createDefaultRiskDraft(detectedAccountSize, resolvedAccount) {
     );
 
     return {
-        mode: normalizeRiskMode(
-            resolvedAccount?.mode ||
-            resolvedAccount?.accountMode ||
-            resolvedAccount?.phaseMode ||
-            resolvedAccount?.status ||
-            resolvedAccount?.name ||
-            "EVAL_EOD"
-        ),
+        mode: resolveDefaultRiskMode(resolvedAccount),
         accountSize: normalizedAccountSize,
         dailyTarget: getDefaultDailyTarget(normalizedAccountSize),
         instrument: "MNQ",
@@ -875,12 +917,12 @@ function getCalculatorStatus({
     };
 }
 
-function InfoCard({ label, value, hint, color }) {
+function InfoCard({ label, value, hint, color, background, borderColor }) {
     return (
         <div
             style={{
-                background: COLORS.panelBg,
-                border: `1px solid ${color || COLORS.border}`,
+                background: background || COLORS.panelBg,
+                border: `1px solid ${borderColor || color || COLORS.border}`,
                 borderRadius: 16,
                 padding: 14,
                 minHeight: 78,
@@ -1022,6 +1064,7 @@ function RiskPanelContent({
     detectedAccountSize,
     balanceDelta,
     liveOpenContracts,
+    livePositions,
 }) {
     const [tradeSimulation, setTradeSimulation] = useState(() => {
         return getTradeSimulationForAccount(resolvedAccountId);
@@ -1043,7 +1086,9 @@ function RiskPanelContent({
         (tradeSimulation?.trades || []).map((trade) => trade?.pnl || 0)
     );
 
-    const testModeActive = simulatedTradeCount > 0;
+    const testModeActive =
+        SHOW_INTERNAL_TEST_UI && simulatedTradeCount > 0;
+
     const effectiveTradeCount = testModeActive
         ? simulatedTradeCount
         : liveTodayTradeCount;
@@ -1068,6 +1113,37 @@ function RiskPanelContent({
         currentBalance,
         liveOpenContracts,
     ]);
+
+    const currentInstrumentOpenContracts = useMemo(() => {
+        const selectedInstrument = cleanString(riskDraft.instrument).toUpperCase();
+
+        if (!selectedInstrument) {
+            return 0;
+        }
+
+        const positions = Array.isArray(livePositions) ? livePositions : [];
+
+        return positions.reduce((sum, position) => {
+            const instrumentKey = cleanString(
+                position?.instrument ||
+                position?.symbol ||
+                position?.ticker ||
+                position?.contract ||
+                position?.name
+            ).toUpperCase();
+
+            const matchesInstrument =
+                instrumentKey === selectedInstrument ||
+                instrumentKey.startsWith(selectedInstrument) ||
+                selectedInstrument.startsWith(instrumentKey);
+
+            if (!matchesInstrument) {
+                return sum;
+            }
+
+            return sum + Math.abs(toNumber(position?.quantity, 0));
+        }, 0);
+    }, [livePositions, riskDraft.instrument]);
 
     function handleDraftChange(key, value) {
         setSimulationDraft((prev) => ({
@@ -1185,7 +1261,7 @@ function RiskPanelContent({
 
         const liveContractCount = Math.max(toNumber(liveOpenContracts, 0), 0);
         const maxContractsByRule = Math.max(riskSnapshot.maxContracts || 0, 0);
-        const remainingContractSlots = Math.max(maxContractsByRule - liveContractCount, 0);
+        const remainingContractSlots = maxContractsByRule - liveContractCount;
 
         const maxContractsByThreshold =
             riskPerContract > 0
@@ -1205,7 +1281,7 @@ function RiskPanelContent({
             allowedContracts = Math.min(allowedContracts, maxContractsByDll);
         }
 
-        allowedContracts = Math.min(allowedContracts, remainingContractSlots);
+        allowedContracts = Math.min(allowedContracts, Math.max(remainingContractSlots, 0));
 
         const projectedPnlAfterStop = effectivePnl - totalRisk;
         const projectedPnlAfterTarget = effectivePnl + totalReward;
@@ -1308,6 +1384,49 @@ function RiskPanelContent({
         };
     })();
 
+    const riskLimitState = useMemo(() => {
+        const currentContracts = Math.max(toNumber(calculator.liveContractCount, 0), 0);
+        const plannedContracts = toSafeInteger(riskDraft.qty, 1);
+        const maxContracts = Math.max(toNumber(calculator.maxContractsByRule, 0), 0);
+        const safeSize = Math.max(toNumber(calculator.allowedContracts, 0), 0);
+        const instrumentContracts = Math.max(toNumber(currentInstrumentOpenContracts, 0), 0);
+
+        return buildRiskLimitState({
+            maxContracts,
+            safeSize,
+            currentContracts,
+            plannedContracts,
+            currentInstrumentContracts: instrumentContracts,
+            openAfterEntry: currentContracts + plannedContracts,
+            instrumentAfterEntry: instrumentContracts + plannedContracts,
+            freeSlotsNow: maxContracts - currentContracts,
+            freeSlotsAfterEntry: maxContracts - (currentContracts + plannedContracts),
+            liveOverLimit: Boolean(calculator.hasLiveContractBreach),
+        });
+    }, [
+        calculator.liveContractCount,
+        calculator.maxContractsByRule,
+        calculator.allowedContracts,
+        calculator.hasLiveContractBreach,
+        currentInstrumentOpenContracts,
+        riskDraft.qty,
+    ]);
+
+    const safeSizeCard = riskLimitState.blocks.safeSize;
+    const safeSizeColors = getRiskStatusColors(safeSizeCard.status);
+
+    const openAfterEntryCard = riskLimitState.blocks.openAfterEntry;
+    const openAfterEntryColors = getRiskStatusColors(openAfterEntryCard.status);
+
+    const freeSlotsAfterEntryCard = riskLimitState.blocks.freeSlotsAfterEntry;
+    const freeSlotsAfterEntryColors = getRiskStatusColors(freeSlotsAfterEntryCard.status);
+
+    const liveOverLimitCard = riskLimitState.blocks.liveOverLimit;
+    const liveOverLimitColors = getRiskStatusColors(liveOverLimitCard.status);
+
+    const instrumentAfterEntryCard = riskLimitState.blocks.instrumentAfterEntry;
+    const instrumentAfterEntryColors = getRiskStatusColors(instrumentAfterEntryCard.status);
+
     const safeSizeAvailable =
         !calculator.hasInputError &&
         !calculator.hasDirectionError &&
@@ -1358,21 +1477,6 @@ function RiskPanelContent({
                     >
                         Account {resolvedAccount?.displayName || resolvedAccountId || "Unbekannt"}
                     </div>
-                </div>
-
-                <div
-                    style={{
-                        border: `1px solid ${riskStatus.border}`,
-                        borderRadius: 999,
-                        padding: "8px 14px",
-                        color: riskStatus.color,
-                        fontSize: 12,
-                        fontWeight: 800,
-                        whiteSpace: "nowrap",
-                        background: riskStatus.background,
-                    }}
-                >
-                    {riskStatus.label}
                 </div>
             </div>
 
@@ -1466,7 +1570,12 @@ function RiskPanelContent({
 
                     <div
                         style={{
-                            border: `1px solid ${riskSnapshot.status.level === "danger" ? COLORS.red : riskSnapshot.status.level === "warning" ? COLORS.orange : COLORS.border}`,
+                            border: `1px solid ${riskSnapshot.status.level === "danger"
+                                    ? COLORS.red
+                                    : riskSnapshot.status.level === "warning"
+                                        ? COLORS.orange
+                                        : COLORS.border
+                                }`,
                             borderRadius: 999,
                             padding: "8px 14px",
                             color:
@@ -1587,7 +1696,8 @@ function RiskPanelContent({
                         }}
                     >
                         {APEX_ACCOUNT_SIZE_OPTIONS.map((size) => {
-                            const isActive = normalizeAccountSize(riskDraft.accountSize, 25000) === size;
+                            const isActive =
+                                normalizeAccountSize(riskDraft.accountSize, 25000) === size;
 
                             return (
                                 <button
@@ -1689,8 +1799,8 @@ function RiskPanelContent({
                     />
                     <InfoCard
                         label="Live Kontrakte"
-                        value={formatDecimal(liveOpenContracts, 4)}
-                        hint={`Frei ${formatDecimal(Math.max((riskSnapshot.maxContracts || 0) - toNumber(liveOpenContracts, 0), 0), 4)}`}
+                        value={formatDecimal(liveOpenContracts, 0)}
+                        hint={`Frei ${formatDecimal(Math.max((riskSnapshot.maxContracts || 0) - toNumber(liveOpenContracts, 0), 0), 0)}`}
                         color={
                             riskSnapshot.status.contractBreached
                                 ? COLORS.red
@@ -1718,111 +1828,113 @@ function RiskPanelContent({
                             fontWeight: 800,
                         }}
                     >
-                        Live Überlimit. Offen sind {formatDecimal(liveOpenContracts, 4)} Kontrakte.
+                        Live Überlimit. Offen sind {formatDecimal(liveOpenContracts, 0)} Kontrakte.
                         Erlaubt sind {riskSnapshot.maxContracts}.
                     </div>
                 ) : null}
             </div>
 
-            <div
-                style={{
-                    background: riskStatus.background,
-                    border: `1px solid ${riskStatus.border}`,
-                    borderRadius: 20,
-                    padding: 18,
-                    boxShadow: COLORS.shadow,
-                    display: "grid",
-                    gap: 14,
-                }}
-            >
+            {SHOW_INTERNAL_TEST_UI ? (
                 <div
                     style={{
+                        background: riskStatus.background,
+                        border: `1px solid ${riskStatus.border}`,
+                        borderRadius: 20,
+                        padding: 18,
+                        boxShadow: COLORS.shadow,
                         display: "grid",
-                        gridTemplateColumns: "220px minmax(320px, 1fr) 160px",
-                        gap: 16,
-                        alignItems: "stretch",
+                        gap: 14,
                     }}
                 >
-                    <div
-                        style={{
-                            display: "flex",
-                            flexDirection: "column",
-                            justifyContent: "flex-start",
-                        }}
-                    >
-                        <div
-                            style={{
-                                color: COLORS.title,
-                                fontSize: 13,
-                                fontWeight: 700,
-                            }}
-                        >
-                            Trades heute
-                        </div>
-
-                        <div
-                            style={{
-                                color: COLORS.text,
-                                fontSize: 34,
-                                fontWeight: 900,
-                                lineHeight: 1,
-                                marginTop: 6,
-                            }}
-                        >
-                            {effectiveTradeCount}
-                        </div>
-
-                        <div
-                            style={{
-                                color: COLORS.textSoft,
-                                fontSize: 12,
-                                marginTop: 8,
-                            }}
-                        >
-                            Quelle {testModeActive ? "Testmodus" : "Live CSV"}
-                        </div>
-                    </div>
-
-                    <CenterAlertBox riskStatus={riskStatus} />
-
                     <div
                         style={{
                             display: "grid",
-                            gap: 8,
-                            alignContent: "start",
+                            gridTemplateColumns: "220px minmax(320px, 1fr) 160px",
+                            gap: 16,
+                            alignItems: "stretch",
                         }}
                     >
-                        <InfoCard
-                            label="Live Trades heute"
-                            value={String(liveTodayTradeCount)}
-                            hint={`${accountFills.length} Fills für Account`}
-                        />
-                        <InfoCard
-                            label="Test Trades"
-                            value={String(simulatedTradeCount)}
-                        />
-                        <InfoCard
-                            label="PnL"
-                            value={formatSignedCurrency(effectivePnl)}
-                        />
+                        <div
+                            style={{
+                                display: "flex",
+                                flexDirection: "column",
+                                justifyContent: "flex-start",
+                            }}
+                        >
+                            <div
+                                style={{
+                                    color: COLORS.title,
+                                    fontSize: 13,
+                                    fontWeight: 700,
+                                }}
+                            >
+                                Trades heute
+                            </div>
+
+                            <div
+                                style={{
+                                    color: COLORS.text,
+                                    fontSize: 34,
+                                    fontWeight: 900,
+                                    lineHeight: 1,
+                                    marginTop: 6,
+                                }}
+                            >
+                                {effectiveTradeCount}
+                            </div>
+
+                            <div
+                                style={{
+                                    color: COLORS.textSoft,
+                                    fontSize: 12,
+                                    marginTop: 8,
+                                }}
+                            >
+                                Quelle {testModeActive ? "Testmodus" : "Live CSV"}
+                            </div>
+                        </div>
+
+                        <CenterAlertBox riskStatus={riskStatus} />
+
+                        <div
+                            style={{
+                                display: "grid",
+                                gap: 8,
+                                alignContent: "start",
+                            }}
+                        >
+                            <InfoCard
+                                label="Live Trades heute"
+                                value={String(liveTodayTradeCount)}
+                                hint={`${accountFills.length} Fills für Account`}
+                            />
+                            <InfoCard
+                                label="Test Trades"
+                                value={String(simulatedTradeCount)}
+                            />
+                            <InfoCard
+                                label="PnL"
+                                value={formatSignedCurrency(effectivePnl)}
+                            />
+                        </div>
+                    </div>
+
+                    <div
+                        style={{
+                            border: `1px solid ${COLORS.border}`,
+                            borderRadius: 14,
+                            padding: 14,
+                            background: "rgba(255, 255, 255, 0.04)",
+                            color: COLORS.text,
+                            fontSize: 15,
+                            lineHeight: 1.5,
+                            fontWeight: 700,
+                        }}
+                    >
+                        {riskStatus.message}
                     </div>
                 </div>
-
-                <div
-                    style={{
-                        border: `1px solid ${COLORS.border}`,
-                        borderRadius: 14,
-                        padding: 14,
-                        background: "rgba(255, 255, 255, 0.04)",
-                        color: COLORS.text,
-                        fontSize: 15,
-                        lineHeight: 1.5,
-                        fontWeight: 700,
-                    }}
-                >
-                    {riskStatus.message}
-                </div>
-            </div>
+            ) : null}
 
             <div
                 style={{
@@ -2050,8 +2162,8 @@ function RiskPanelContent({
                                 padding: "12px 14px",
                                 borderRadius: 12,
                                 border: `1px solid ${calculator.isOverAllowedContracts
-                                    ? COLORS.red
-                                    : COLORS.borderStrong
+                                        ? COLORS.red
+                                        : COLORS.borderStrong
                                     }`,
                                 background: calculator.isOverAllowedContracts
                                     ? "rgba(248, 113, 113, 0.10)"
@@ -2080,7 +2192,9 @@ function RiskPanelContent({
                         style={{
                             border: `1px solid ${safeSizeAvailable ? COLORS.green : COLORS.borderStrong}`,
                             color: safeSizeAvailable ? COLORS.green : COLORS.textSoft,
-                            background: safeSizeAvailable ? "rgba(74, 222, 128, 0.08)" : "rgba(255,255,255,0.02)",
+                            background: safeSizeAvailable
+                                ? "rgba(74, 222, 128, 0.08)"
+                                : "rgba(255,255,255,0.02)",
                             borderRadius: 12,
                             padding: "12px 14px",
                             fontWeight: 800,
@@ -2110,11 +2224,11 @@ function RiskPanelContent({
 
                 <div
                     style={{
-                        border: `1px solid ${COLORS.border}`,
+                        border: `1px solid ${safeSizeColors.border}`,
                         borderRadius: 14,
                         padding: 14,
-                        background: "rgba(255, 255, 255, 0.03)",
-                        color: COLORS.textSoft,
+                        background: safeSizeColors.background,
+                        color: safeSizeColors.text,
                         fontSize: 13,
                         lineHeight: 1.5,
                         fontWeight: 600,
@@ -2139,7 +2253,7 @@ function RiskPanelContent({
                         }}
                     >
                         Live Position ist bereits über dem Limit.
-                        Offen sind {formatDecimal(calculator.liveContractCount, 4)} Kontrakte.
+                        Offen sind {formatDecimal(calculator.liveContractCount, 0)} Kontrakte.
                         Erlaubt sind {calculator.maxContractsByRule}.
                     </div>
                 ) : null}
@@ -2234,6 +2348,121 @@ function RiskPanelContent({
                             fontWeight: 800,
                         }}
                     >
+                        Limit Lage
+                    </div>
+
+                    <div
+                        style={{
+                            display: "grid",
+                            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                            gap: 10,
+                        }}
+                    >
+                        <InfoCard
+                            label="Live Kontrakte gesamt"
+                            value={formatDecimal(riskLimitState.currentContracts, 0)}
+                            hint={`Max ${formatDecimal(riskLimitState.maxContracts, 0)}`}
+                            color={liveOverLimitCard.value ? COLORS.red : COLORS.cyan}
+                        />
+                        <InfoCard
+                            label="Live Kontrakte im Instrument"
+                            value={formatDecimal(riskLimitState.currentInstrumentContracts, 0)}
+                            hint={`Instrument ${calculator.instrument.label}`}
+                            color={COLORS.cyan}
+                        />
+                        <InfoCard
+                            label="Neu geplante Kontrakte"
+                            value={formatDecimal(riskLimitState.plannedContracts, 0)}
+                            hint={`Instrument ${calculator.instrument.label}`}
+                            color={COLORS.purple}
+                        />
+                        <InfoCard
+                            label="Freie Slots jetzt"
+                            value={formatDecimal(riskLimitState.freeSlotsNow, 0)}
+                            hint={`Max ${formatDecimal(riskLimitState.maxContracts, 0)}`}
+                            color={
+                                riskLimitState.freeSlotsNow < 0
+                                    ? COLORS.red
+                                    : riskLimitState.freeSlotsNow <= 1
+                                        ? COLORS.orange
+                                        : COLORS.text
+                            }
+                        />
+                        <InfoCard
+                            label="Max Kontrakte"
+                            value={formatDecimal(riskLimitState.maxContracts, 0)}
+                            hint="Regelbasierte Obergrenze"
+                            color={COLORS.green}
+                        />
+                    </div>
+
+                    <div
+                        style={{
+                            display: "grid",
+                            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                            gap: 10,
+                        }}
+                    >
+                        <InfoCard
+                            label="Offen nach Entry"
+                            value={formatDecimal(openAfterEntryCard.value, 0)}
+                            hint={openAfterEntryCard.reason}
+                            color={openAfterEntryColors.text}
+                            background={openAfterEntryColors.background}
+                            borderColor={openAfterEntryColors.border}
+                        />
+                        <InfoCard
+                            label="Freie Slots nach Entry"
+                            value={formatDecimal(freeSlotsAfterEntryCard.value, 0)}
+                            hint={freeSlotsAfterEntryCard.reason}
+                            color={freeSlotsAfterEntryColors.text}
+                            background={freeSlotsAfterEntryColors.background}
+                            borderColor={freeSlotsAfterEntryColors.border}
+                        />
+                        <InfoCard
+                            label="Safe Size"
+                            value={formatDecimal(safeSizeCard.value, 0)}
+                            hint={safeSizeCard.reason}
+                            color={safeSizeColors.text}
+                            background={safeSizeColors.background}
+                            borderColor={safeSizeColors.border}
+                        />
+                        <InfoCard
+                            label="Live Überlimit"
+                            value={liveOverLimitCard.value ? "Ja" : "Nein"}
+                            hint={liveOverLimitCard.reason}
+                            color={liveOverLimitColors.text}
+                            background={liveOverLimitColors.background}
+                            borderColor={liveOverLimitColors.border}
+                        />
+                        <InfoCard
+                            label="Instrument nach Entry"
+                            value={formatDecimal(instrumentAfterEntryCard.value, 0)}
+                            hint={instrumentAfterEntryCard.reason}
+                            color={instrumentAfterEntryColors.text}
+                            background={instrumentAfterEntryColors.background}
+                            borderColor={instrumentAfterEntryColors.border}
+                        />
+                    </div>
+                </div>
+
+                <div
+                    style={{
+                        border: `1px solid ${COLORS.border}`,
+                        borderRadius: 16,
+                        padding: 14,
+                        background: "rgba(255, 255, 255, 0.03)",
+                        display: "grid",
+                        gap: 10,
+                    }}
+                >
+                    <div
+                        style={{
+                            color: COLORS.title,
+                            fontSize: 13,
+                            fontWeight: 800,
+                        }}
+                    >
                         Risiko in Punkten und Prozent
                     </div>
 
@@ -2307,28 +2536,6 @@ function RiskPanelContent({
                         color={COLORS.yellow}
                     />
                     <InfoCard
-                        label="Live Kontrakte"
-                        value={formatDecimal(calculator.liveContractCount, 4)}
-                        hint={`Max ${calculator.maxContractsByRule}`}
-                        color={calculator.hasLiveContractBreach ? COLORS.red : COLORS.cyan}
-                    />
-                    <InfoCard
-                        label="Freie Slots"
-                        value={formatDecimal(calculator.remainingContractSlots, 4)}
-                        hint="Noch frei bis Max Kontrakte"
-                        color={COLORS.purple}
-                    />
-                    <InfoCard
-                        label="Safe Size"
-                        value={String(calculator.allowedContracts)}
-                        hint={
-                            calculator.maxContractsByDll === null
-                                ? `Threshold ${calculator.maxContractsByThreshold} · Slots ${calculator.remainingContractSlots}`
-                                : `Threshold ${calculator.maxContractsByThreshold} · DLL ${calculator.maxContractsByDll} · Slots ${calculator.remainingContractSlots}`
-                        }
-                        color={COLORS.cyan}
-                    />
-                    <InfoCard
                         label="Balance nach Stop"
                         value={formatCurrency(calculator.projectedBalanceAfterStop)}
                         hint={`PnL ${formatSignedCurrency(calculator.projectedPnlAfterStop)}`}
@@ -2368,290 +2575,294 @@ function RiskPanelContent({
                 ) : null}
             </div>
 
-            <div
-                style={{
-                    background: COLORS.panelBg,
-                    border: `1px solid ${COLORS.border}`,
-                    borderRadius: 20,
-                    padding: 18,
-                    boxShadow: COLORS.shadow,
-                    display: "grid",
-                    gap: 14,
-                }}
-            >
+            {SHOW_INTERNAL_TEST_UI ? <RiskTestRunner /> : null}
+
+            {SHOW_INTERNAL_TEST_UI ? (
                 <div
                     style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        gap: 12,
-                        flexWrap: "wrap",
+                        background: COLORS.panelBg,
+                        border: `1px solid ${COLORS.border}`,
+                        borderRadius: 20,
+                        padding: 18,
+                        boxShadow: COLORS.shadow,
+                        display: "grid",
+                        gap: 14,
                     }}
                 >
-                    <div>
-                        <div
-                            style={{
-                                color: COLORS.title,
-                                fontSize: 16,
-                                fontWeight: 800,
-                            }}
-                        >
-                            Simulation
+                    <div
+                        style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                            gap: 12,
+                            flexWrap: "wrap",
+                        }}
+                    >
+                        <div>
+                            <div
+                                style={{
+                                    color: COLORS.title,
+                                    fontSize: 16,
+                                    fontWeight: 800,
+                                }}
+                            >
+                                Simulation
+                            </div>
+                            <div
+                                style={{
+                                    color: COLORS.textSoft,
+                                    fontSize: 13,
+                                    marginTop: 4,
+                                }}
+                            >
+                                Testet Grün, Orange und Rot direkt im UI
+                            </div>
                         </div>
+
                         <div
                             style={{
                                 color: COLORS.textSoft,
-                                fontSize: 13,
-                                marginTop: 4,
+                                fontSize: 12,
                             }}
                         >
-                            Testet Grün, Orange und Rot direkt im UI
+                            Letzte Änderung{" "}
+                            {tradeSimulation?.updatedAt
+                                ? formatDateTime(tradeSimulation.updatedAt)
+                                : "Keine"}
                         </div>
                     </div>
 
-                    <div
-                        style={{
-                            color: COLORS.textSoft,
-                            fontSize: 12,
-                        }}
-                    >
-                        Letzte Änderung{" "}
-                        {tradeSimulation?.updatedAt
-                            ? formatDateTime(tradeSimulation.updatedAt)
-                            : "Keine"}
-                    </div>
-                </div>
-
-                <div
-                    style={{
-                        display: "grid",
-                        gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                        gap: 12,
-                    }}
-                >
-                    <InputField label="Instrument">
-                        <input
-                            value={simulationDraft.instrument}
-                            onChange={(event) =>
-                                handleDraftChange(
-                                    "instrument",
-                                    event.target.value.toUpperCase()
-                                )
-                            }
-                            style={{
-                                width: "100%",
-                                padding: "12px 14px",
-                                borderRadius: 12,
-                                border: `1px solid ${COLORS.borderStrong}`,
-                                background: "rgba(0,0,0,0.25)",
-                                color: COLORS.text,
-                                outline: "none",
-                            }}
-                            placeholder="MNQ"
-                        />
-                    </InputField>
-
-                    <InputField label="Seite">
-                        <select
-                            value={simulationDraft.side}
-                            onChange={(event) =>
-                                handleDraftChange(
-                                    "side",
-                                    event.target.value === "short" ? "short" : "long"
-                                )
-                            }
-                            style={{
-                                width: "100%",
-                                padding: "12px 14px",
-                                borderRadius: 12,
-                                border: `1px solid ${COLORS.borderStrong}`,
-                                background: "rgba(0,0,0,0.25)",
-                                color: COLORS.text,
-                                outline: "none",
-                            }}
-                        >
-                            <option value="long">long</option>
-                            <option value="short">short</option>
-                        </select>
-                    </InputField>
-
-                    <InputField label="Menge">
-                        <input
-                            type="number"
-                            min={1}
-                            step={1}
-                            value={simulationDraft.qty}
-                            onChange={(event) =>
-                                handleDraftChange(
-                                    "qty",
-                                    toSafeInteger(event.target.value, 1)
-                                )
-                            }
-                            style={{
-                                width: "100%",
-                                padding: "12px 14px",
-                                borderRadius: 12,
-                                border: `1px solid ${COLORS.borderStrong}`,
-                                background: "rgba(0,0,0,0.25)",
-                                color: COLORS.text,
-                                outline: "none",
-                            }}
-                        />
-                    </InputField>
-
-                    <InputField label="PnL">
-                        <input
-                            type="number"
-                            step="0.01"
-                            value={simulationDraft.pnl}
-                            onChange={(event) =>
-                                handleDraftChange("pnl", toNumber(event.target.value, 0))
-                            }
-                            style={{
-                                width: "100%",
-                                padding: "12px 14px",
-                                borderRadius: 12,
-                                border: `1px solid ${COLORS.borderStrong}`,
-                                background: "rgba(0,0,0,0.25)",
-                                color: COLORS.text,
-                                outline: "none",
-                            }}
-                        />
-                    </InputField>
-                </div>
-
-                <div
-                    style={{
-                        display: "flex",
-                        gap: 10,
-                        flexWrap: "wrap",
-                    }}
-                >
-                    <button
-                        type="button"
-                        onClick={handleAddTestTrade}
-                        style={{
-                            border: `1px solid ${COLORS.green}`,
-                            color: COLORS.green,
-                            background: "transparent",
-                            borderRadius: 12,
-                            padding: "12px 14px",
-                            fontWeight: 800,
-                            cursor: "pointer",
-                        }}
-                    >
-                        Test Trade hinzufügen
-                    </button>
-
-                    <button
-                        type="button"
-                        onClick={handleResetSimulation}
-                        style={{
-                            border: `1px solid ${COLORS.orange}`,
-                            color: COLORS.orange,
-                            background: "transparent",
-                            borderRadius: 12,
-                            padding: "12px 14px",
-                            fontWeight: 800,
-                            cursor: "pointer",
-                        }}
-                    >
-                        Reset
-                    </button>
-                </div>
-
-                <div
-                    style={{
-                        display: "grid",
-                        gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                        gap: 10,
-                    }}
-                >
-                    <InfoCard
-                        label="Test Trades"
-                        value={String(simulatedTradeCount)}
-                        hint="Nur Simulation"
-                    />
-                    <InfoCard
-                        label="Test PnL"
-                        value={formatSignedCurrency(simulatedPnl)}
-                        hint="Nur Simulation"
-                    />
-                    <InfoCard
-                        label="Status Vorschau"
-                        value={getRiskStatus(simulatedTradeCount).label}
-                        hint={
-                            simulatedTradeCount > 0
-                                ? getRiskStatus(simulatedTradeCount).message
-                                : "Keine Test Trades"
-                        }
-                    />
-                </div>
-
-                <div
-                    style={{
-                        border: `1px solid ${COLORS.border}`,
-                        borderRadius: 16,
-                        overflow: "hidden",
-                    }}
-                >
                     <div
                         style={{
                             display: "grid",
-                            gridTemplateColumns: "160px 100px 90px 90px 1fr",
-                            gap: 10,
-                            padding: "12px 14px",
-                            background: COLORS.panelBgStrong,
-                            color: COLORS.textSoft,
-                            fontSize: 11,
-                            fontWeight: 700,
-                            textTransform: "uppercase",
+                            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                            gap: 12,
                         }}
                     >
-                        <div>Zeit</div>
-                        <div>Instrument</div>
-                        <div>Seite</div>
-                        <div>Menge</div>
-                        <div>PnL</div>
+                        <InputField label="Instrument">
+                            <input
+                                value={simulationDraft.instrument}
+                                onChange={(event) =>
+                                    handleDraftChange(
+                                        "instrument",
+                                        event.target.value.toUpperCase()
+                                    )
+                                }
+                                style={{
+                                    width: "100%",
+                                    padding: "12px 14px",
+                                    borderRadius: 12,
+                                    border: `1px solid ${COLORS.borderStrong}`,
+                                    background: "rgba(0,0,0,0.25)",
+                                    color: COLORS.text,
+                                    outline: "none",
+                                }}
+                                placeholder="MNQ"
+                            />
+                        </InputField>
+
+                        <InputField label="Seite">
+                            <select
+                                value={simulationDraft.side}
+                                onChange={(event) =>
+                                    handleDraftChange(
+                                        "side",
+                                        event.target.value === "short" ? "short" : "long"
+                                    )
+                                }
+                                style={{
+                                    width: "100%",
+                                    padding: "12px 14px",
+                                    borderRadius: 12,
+                                    border: `1px solid ${COLORS.borderStrong}`,
+                                    background: "rgba(0,0,0,0.25)",
+                                    color: COLORS.text,
+                                    outline: "none",
+                                }}
+                            >
+                                <option value="long">long</option>
+                                <option value="short">short</option>
+                            </select>
+                        </InputField>
+
+                        <InputField label="Menge">
+                            <input
+                                type="number"
+                                min={1}
+                                step={1}
+                                value={simulationDraft.qty}
+                                onChange={(event) =>
+                                    handleDraftChange(
+                                        "qty",
+                                        toSafeInteger(event.target.value, 1)
+                                    )
+                                }
+                                style={{
+                                    width: "100%",
+                                    padding: "12px 14px",
+                                    borderRadius: 12,
+                                    border: `1px solid ${COLORS.borderStrong}`,
+                                    background: "rgba(0,0,0,0.25)",
+                                    color: COLORS.text,
+                                    outline: "none",
+                                }}
+                            />
+                        </InputField>
+
+                        <InputField label="PnL">
+                            <input
+                                type="number"
+                                step="0.01"
+                                value={simulationDraft.pnl}
+                                onChange={(event) =>
+                                    handleDraftChange("pnl", toNumber(event.target.value, 0))
+                                }
+                                style={{
+                                    width: "100%",
+                                    padding: "12px 14px",
+                                    borderRadius: 12,
+                                    border: `1px solid ${COLORS.borderStrong}`,
+                                    background: "rgba(0,0,0,0.25)",
+                                    color: COLORS.text,
+                                    outline: "none",
+                                }}
+                            />
+                        </InputField>
                     </div>
 
-                    {simulatedTradeCount === 0 ? (
-                        <div
+                    <div
+                        style={{
+                            display: "flex",
+                            gap: 10,
+                            flexWrap: "wrap",
+                        }}
+                    >
+                        <button
+                            type="button"
+                            onClick={handleAddTestTrade}
                             style={{
-                                padding: 16,
-                                color: COLORS.textSoft,
-                                fontSize: 14,
+                                border: `1px solid ${COLORS.green}`,
+                                color: COLORS.green,
+                                background: "transparent",
+                                borderRadius: 12,
+                                padding: "12px 14px",
+                                fontWeight: 800,
+                                cursor: "pointer",
                             }}
                         >
-                            Keine Test Trades vorhanden
+                            Test Trade hinzufügen
+                        </button>
+
+                        <button
+                            type="button"
+                            onClick={handleResetSimulation}
+                            style={{
+                                border: `1px solid ${COLORS.orange}`,
+                                color: COLORS.orange,
+                                background: "transparent",
+                                borderRadius: 12,
+                                padding: "12px 14px",
+                                fontWeight: 800,
+                                cursor: "pointer",
+                            }}
+                        >
+                            Reset
+                        </button>
+                    </div>
+
+                    <div
+                        style={{
+                            display: "grid",
+                            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                            gap: 10,
+                        }}
+                    >
+                        <InfoCard
+                            label="Test Trades"
+                            value={String(simulatedTradeCount)}
+                            hint="Nur Simulation"
+                        />
+                        <InfoCard
+                            label="Test PnL"
+                            value={formatSignedCurrency(simulatedPnl)}
+                            hint="Nur Simulation"
+                        />
+                        <InfoCard
+                            label="Status Vorschau"
+                            value={getRiskStatus(simulatedTradeCount).label}
+                            hint={
+                                simulatedTradeCount > 0
+                                    ? getRiskStatus(simulatedTradeCount).message
+                                    : "Keine Test Trades"
+                            }
+                        />
+                    </div>
+
+                    <div
+                        style={{
+                            border: `1px solid ${COLORS.border}`,
+                            borderRadius: 16,
+                            overflow: "hidden",
+                        }}
+                    >
+                        <div
+                            style={{
+                                display: "grid",
+                                gridTemplateColumns: "160px 100px 90px 90px 1fr",
+                                gap: 10,
+                                padding: "12px 14px",
+                                background: COLORS.panelBgStrong,
+                                color: COLORS.textSoft,
+                                fontSize: 11,
+                                fontWeight: 700,
+                                textTransform: "uppercase",
+                            }}
+                        >
+                            <div>Zeit</div>
+                            <div>Instrument</div>
+                            <div>Seite</div>
+                            <div>Menge</div>
+                            <div>PnL</div>
                         </div>
-                    ) : (
-                        tradeSimulation.trades
-                            .slice()
-                            .reverse()
-                            .map((trade) => (
-                                <div
-                                    key={trade.id}
-                                    style={{
-                                        display: "grid",
-                                        gridTemplateColumns: "160px 100px 90px 90px 1fr",
-                                        gap: 10,
-                                        padding: "12px 14px",
-                                        borderTop: `1px solid ${COLORS.border}`,
-                                        color: COLORS.text,
-                                        fontSize: 13,
-                                    }}
-                                >
-                                    <div>{formatDateTime(trade.createdAt)}</div>
-                                    <div>{trade.instrument}</div>
-                                    <div>{trade.side}</div>
-                                    <div>{trade.qty}</div>
-                                    <div>{formatSignedCurrency(trade.pnl)}</div>
-                                </div>
-                            ))
-                    )}
+
+                        {simulatedTradeCount === 0 ? (
+                            <div
+                                style={{
+                                    padding: 16,
+                                    color: COLORS.textSoft,
+                                    fontSize: 14,
+                                }}
+                            >
+                                Keine Test Trades vorhanden
+                            </div>
+                        ) : (
+                            tradeSimulation.trades
+                                .slice()
+                                .reverse()
+                                .map((trade) => (
+                                    <div
+                                        key={trade.id}
+                                        style={{
+                                            display: "grid",
+                                            gridTemplateColumns: "160px 100px 90px 90px 1fr",
+                                            gap: 10,
+                                            padding: "12px 14px",
+                                            borderTop: `1px solid ${COLORS.border}`,
+                                            color: COLORS.text,
+                                            fontSize: 13,
+                                        }}
+                                    >
+                                        <div>{formatDateTime(trade.createdAt)}</div>
+                                        <div>{trade.instrument}</div>
+                                        <div>{trade.side}</div>
+                                        <div>{trade.qty}</div>
+                                        <div>{formatSignedCurrency(trade.pnl)}</div>
+                                    </div>
+                                ))
+                        )}
+                    </div>
                 </div>
-            </div>
+            ) : null}
         </div>
     );
 }
@@ -2691,15 +2902,17 @@ export default function RiskPanel(props) {
         });
     }, [accountFills, resolvedAccountId]);
 
-    const liveOpenContracts = useMemo(() => {
-        const positions = Array.isArray(positionAnalytics?.positions)
+    const livePositions = useMemo(() => {
+        return Array.isArray(positionAnalytics?.positions)
             ? positionAnalytics.positions
             : [];
+    }, [positionAnalytics]);
 
-        return positions.reduce((sum, position) => {
+    const liveOpenContracts = useMemo(() => {
+        return livePositions.reduce((sum, position) => {
             return sum + Math.abs(toNumber(position?.quantity, 0));
         }, 0);
-    }, [positionAnalytics]);
+    }, [livePositions]);
 
     const accountBalanceRows = useMemo(() => {
         const filtered = scopeRowsByAccount(rawAccountBalanceHistory, resolvedAccountId);
@@ -2755,6 +2968,7 @@ export default function RiskPanel(props) {
 
     const detectedAccountSize = deriveAccountSize({
         accountId: resolvedAccountId,
+        account: resolvedAccount,
         startBalance,
         currentBalance,
         fallbackSize: resolvedAccount?.accountSize,
@@ -2782,6 +2996,7 @@ export default function RiskPanel(props) {
             detectedAccountSize={detectedAccountSize}
             balanceDelta={balanceDelta}
             liveOpenContracts={liveOpenContracts}
+            livePositions={livePositions}
         />
     );
 }
