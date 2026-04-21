@@ -3054,7 +3054,7 @@ export default function App() {
 
     useEffect(() => {
         const unsubscribe = subscribeStorage?.(() => {
-            setAppState(readAppStateSnapshot());
+            setAppState((current) => readAppStateSnapshot(current.activeAccountId));
         });
 
         return () => {

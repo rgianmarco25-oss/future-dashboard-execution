@@ -3789,13 +3789,17 @@ export default function RiskPanel(props) {
     const currentBalance =
         balanceSummary.currentBalance !== null && balanceSummary.currentBalance !== undefined
             ? balanceSummary.currentBalance
-            : accountCurrentBalance !== null && accountCurrentBalance !== undefined
-                ? accountCurrentBalance
-                : accountStartingBalance !== null && accountStartingBalance !== undefined
-                    ? accountStartingBalance
-                    : accountDeclaredSize !== null && accountDeclaredSize !== undefined
-                        ? accountDeclaredSize
-                        : baseDetectedAccountSize;
+            : provider === "atas"
+                ? (accountDeclaredSize !== null && accountDeclaredSize !== undefined
+                    ? accountDeclaredSize
+                    : baseDetectedAccountSize)
+                : accountCurrentBalance !== null && accountCurrentBalance !== undefined
+                    ? accountCurrentBalance
+                    : accountStartingBalance !== null && accountStartingBalance !== undefined
+                        ? accountStartingBalance
+                        : accountDeclaredSize !== null && accountDeclaredSize !== undefined
+                            ? accountDeclaredSize
+                            : baseDetectedAccountSize;
 
     const startBalance =
         accountStartingBalance !== null && accountStartingBalance > 0
