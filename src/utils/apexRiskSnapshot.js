@@ -1,3 +1,12 @@
+import {
+    getRules,
+    resolveCurrentDailyLossLimit,
+    resolveCurrentMaxContracts,
+    resolveCurrentPaTier,
+    resolvePayoutCapForRequest,
+    resolveStaticPaThresholdStop,
+} from "./apexRules";
+
 const TRADING_TIMEZONE = "America/New_York";
 
 export const APEX_MODES = {
@@ -5,70 +14,6 @@ export const APEX_MODES = {
     EVAL_INTRADAY: "EVAL_INTRADAY",
     PA_EOD: "PA_EOD",
     PA_INTRADAY: "PA_INTRADAY",
-};
-
-const APEX_PRESETS = {
-    "25K": {
-        label: "25K",
-        startBalance: 25000,
-        drawdownAmount: 1000,
-        evalMaxContracts: 4,
-        evalEodDll: 500,
-        paStaticThresholdStop: 25100,
-        payoutSafetyNetBalance: 26100,
-        paTiers: [
-            { level: 1, minProfit: 0, maxContracts: 1, dll: 500 },
-            { level: 2, minProfit: 1000, maxContracts: 2, dll: 500 },
-            { level: 3, minProfit: 2000, maxContracts: 2, dll: 1250 },
-        ],
-    },
-    "50K": {
-        label: "50K",
-        startBalance: 50000,
-        drawdownAmount: 2000,
-        evalMaxContracts: 6,
-        evalEodDll: 1000,
-        paStaticThresholdStop: 50100,
-        payoutSafetyNetBalance: 52100,
-        paTiers: [
-            { level: 1, minProfit: 0, maxContracts: 2, dll: 1000 },
-            { level: 2, minProfit: 1500, maxContracts: 3, dll: 1000 },
-            { level: 3, minProfit: 3000, maxContracts: 4, dll: 2000 },
-            { level: 4, minProfit: 6000, maxContracts: 4, dll: 3000 },
-        ],
-    },
-    "100K": {
-        label: "100K",
-        startBalance: 100000,
-        drawdownAmount: 3000,
-        evalMaxContracts: 8,
-        evalEodDll: 1500,
-        paStaticThresholdStop: 100100,
-        payoutSafetyNetBalance: 103100,
-        paTiers: [
-            { level: 1, minProfit: 0, maxContracts: 3, dll: 1750 },
-            { level: 2, minProfit: 2000, maxContracts: 4, dll: 1750 },
-            { level: 3, minProfit: 3000, maxContracts: 5, dll: 1750 },
-            { level: 4, minProfit: 5000, maxContracts: 6, dll: 2500 },
-            { level: 5, minProfit: 10000, maxContracts: 6, dll: 3500 },
-        ],
-    },
-    "150K": {
-        label: "150K",
-        startBalance: 150000,
-        drawdownAmount: 4000,
-        evalMaxContracts: 12,
-        evalEodDll: 2000,
-        paStaticThresholdStop: 150100,
-        payoutSafetyNetBalance: 154100,
-        paTiers: [
-            { level: 1, minProfit: 0, maxContracts: 4, dll: 2500 },
-            { level: 2, minProfit: 2000, maxContracts: 5, dll: 2500 },
-            { level: 3, minProfit: 3000, maxContracts: 7, dll: 2500 },
-            { level: 4, minProfit: 5000, maxContracts: 10, dll: 3000 },
-            { level: 5, minProfit: 10000, maxContracts: 10, dll: 4000 },
-        ],
-    },
 };
 
 function cleanString(value) {
@@ -224,6 +169,25 @@ function normalizeMode(rawMode, account) {
         return explicit;
     }
 
+    const phase = cleanString(account?.accountPhase).toLowerCase();
+    const productType = cleanString(account?.productType).toLowerCase();
+
+    if (phase === "pa" && productType === "intraday") {
+        return APEX_MODES.PA_INTRADAY;
+    }
+
+    if (phase === "pa" && productType === "eod") {
+        return APEX_MODES.PA_EOD;
+    }
+
+    if (phase === "eval" && productType === "intraday") {
+        return APEX_MODES.EVAL_INTRADAY;
+    }
+
+    if (phase === "eval" && productType === "eod") {
+        return APEX_MODES.EVAL_EOD;
+    }
+
     const inferredSource = [
         account?.mode,
         account?.accountMode,
@@ -262,15 +226,15 @@ function normalizeMode(rawMode, account) {
     return APEX_MODES.EVAL_EOD;
 }
 
-function normalizeAccountSize(rawSize, account) {
+function normalizeAccountSizeNumber(rawSize, account) {
     const direct = parseNumber(rawSize);
 
     if (direct === 25 || direct === 50 || direct === 100 || direct === 150) {
-        return `${direct}K`;
+        return direct * 1000;
     }
 
     if (direct === 25000 || direct === 50000 || direct === 100000 || direct === 150000) {
-        return `${Math.round(direct / 1000)}K`;
+        return direct;
     }
 
     const source = [
@@ -280,32 +244,47 @@ function normalizeAccountSize(rawSize, account) {
         account?.name,
         account?.label,
         account?.accountName,
+        account?.displayName,
     ]
         .map(cleanString)
         .join(" ")
         .toUpperCase();
 
     if (source.includes("150K") || source.includes("150000")) {
-        return "150K";
+        return 150000;
     }
 
     if (source.includes("100K") || source.includes("100000")) {
-        return "100K";
+        return 100000;
     }
 
     if (source.includes("50K") || source.includes("50000")) {
-        return "50K";
+        return 50000;
     }
 
     if (source.includes("25K") || source.includes("25000")) {
-        return "25K";
+        return 25000;
     }
 
-    return "25K";
+    return 25000;
 }
 
-function getPreset(accountSize) {
-    return APEX_PRESETS[accountSize] || APEX_PRESETS["25K"];
+function formatAccountSizeLabel(accountSizeNumber) {
+    return `${Math.round(Number(accountSizeNumber) / 1000)}K`;
+}
+
+function modeToRuleContext(mode) {
+    switch (mode) {
+        case APEX_MODES.EVAL_INTRADAY:
+            return { productType: "intraday", accountPhase: "eval" };
+        case APEX_MODES.PA_EOD:
+            return { productType: "eod", accountPhase: "pa" };
+        case APEX_MODES.PA_INTRADAY:
+            return { productType: "intraday", accountPhase: "pa" };
+        case APEX_MODES.EVAL_EOD:
+        default:
+            return { productType: "eod", accountPhase: "eval" };
+    }
 }
 
 function normalizeBalanceHistoryRows(rows) {
@@ -327,6 +306,9 @@ function normalizeBalanceHistoryRows(rows) {
                 "Date",
                 "CreatedAt",
                 "createdAt",
+                "updatedAt",
+                "transactionDate",
+                "tradeDate",
             ]);
 
             const balance = getFirstNumber(row, [
@@ -349,6 +331,10 @@ function normalizeBalanceHistoryRows(rows) {
                 "CloseBalance",
                 "TotalEquity",
                 "Equity",
+                "currentBalance",
+                "cashBalance",
+                "totalAmount",
+                "amount",
             ]);
 
             if (!timestamp || balance === null) {
@@ -381,6 +367,7 @@ function getDailyCloses(entries) {
 
 function getCompletedDailyCloses(entries, nowDate) {
     const currentTradingDayKey = getTradingDayKey(nowDate);
+
     return getDailyCloses(entries).filter(
         (entry) => entry.tradingDayKey !== currentTradingDayKey
     );
@@ -406,22 +393,6 @@ function clampFloor(value, floor) {
     return Math.max(value, floor);
 }
 
-function getPaTier(preset, balanceForTier) {
-    const growth = Math.max(0, balanceForTier - preset.startBalance);
-    let activeTier = preset.paTiers[0];
-
-    preset.paTiers.forEach((tier) => {
-        if (growth >= tier.minProfit) {
-            activeTier = tier;
-        }
-    });
-
-    return {
-        ...activeTier,
-        growth,
-    };
-}
-
 function buildStatus({
     currentBalance,
     thresholdBalance,
@@ -433,7 +404,10 @@ function buildStatus({
     const thresholdBreached = currentBalance <= thresholdBalance;
     const dllBreached = dll !== null && sessionLoss >= dll;
     const contractBreached =
-        currentContracts !== null && currentContracts > maxContracts;
+        currentContracts !== null &&
+        maxContracts !== null &&
+        maxContracts > 0 &&
+        currentContracts > maxContracts;
 
     let level = "ok";
 
@@ -454,6 +428,342 @@ function buildStatus({
     };
 }
 
+function getFillTimestamp(row) {
+    return (
+        getFirstDate(row, [
+            "timestamp",
+            "timestampIso",
+            "time",
+            "dateTime",
+            "datetime",
+            "filledAt",
+            "fillTime",
+            "executionTime",
+            "execTime",
+            "tradeDate",
+            "date",
+            "Date",
+            "Created At",
+            "createdAt",
+        ]) || null
+    );
+}
+
+function getFillPnl(row) {
+    return getFirstNumber(row, [
+        "pnl",
+        "PnL",
+        "realizedPnl",
+        "realized_pnl",
+        "profit",
+        "netPnl",
+        "Realized PnL",
+        "realizedPnL",
+    ]);
+}
+
+function normalizeFillRows(rows) {
+    if (!Array.isArray(rows)) {
+        return [];
+    }
+
+    return rows
+        .map((row, index) => {
+            const timestamp = getFillTimestamp(row);
+            const pnl = getFillPnl(row);
+
+            if (!timestamp || pnl === null) {
+                return null;
+            }
+
+            return {
+                id: `${timestamp.toISOString()}-${index}`,
+                timestamp,
+                pnl,
+                tradingDayKey: getTradingDayKey(timestamp),
+                raw: row,
+            };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+}
+
+function buildDailyNetPnl(fillEntries) {
+    const byDay = new Map();
+
+    fillEntries.forEach((entry) => {
+        const existing = byDay.get(entry.tradingDayKey) || {
+            tradingDayKey: entry.tradingDayKey,
+            netPnl: 0,
+            fillCount: 0,
+            firstTimestamp: entry.timestamp,
+            lastTimestamp: entry.timestamp,
+        };
+
+        existing.netPnl += entry.pnl;
+        existing.fillCount += 1;
+
+        if (entry.timestamp < existing.firstTimestamp) {
+            existing.firstTimestamp = entry.timestamp;
+        }
+
+        if (entry.timestamp > existing.lastTimestamp) {
+            existing.lastTimestamp = entry.timestamp;
+        }
+
+        byDay.set(entry.tradingDayKey, existing);
+    });
+
+    return [...byDay.values()].sort((a, b) =>
+        a.tradingDayKey.localeCompare(b.tradingDayKey)
+    );
+}
+
+function getApprovedPayoutCount(account) {
+    const count = getFirstNumber(account, [
+        "approvedPayoutCount",
+        "payoutCount",
+        "approvedPayouts",
+        "completedPayoutCount",
+    ]);
+
+    return count === null ? 0 : Math.max(0, Math.floor(count));
+}
+
+function getLastApprovedPayoutDate(account) {
+    return getFirstDate(account, [
+        "lastApprovedPayoutAt",
+        "lastApprovedPayoutDate",
+        "lastPayoutApprovedAt",
+        "lastPayoutDate",
+    ]);
+}
+
+function getAccountLifecycleStartDate(account, firstFillDate) {
+    return (
+        getFirstDate(account, [
+            "paActivatedAt",
+            "activatedAt",
+            "createdAt",
+            "createdOn",
+            "startDate",
+            "openedAt",
+        ]) || firstFillDate || null
+    );
+}
+
+function buildPayoutState({
+    rule,
+    currentBalance,
+    startBalance,
+    fillEntries,
+    account,
+}) {
+    if (!rule || rule.accountPhase !== "pa" || !rule.payoutRules) {
+        return null;
+    }
+
+    const payoutRules = rule.payoutRules;
+    const approvedPayoutCount = getApprovedPayoutCount(account);
+    const lastApprovedPayoutDate = getLastApprovedPayoutDate(account);
+    const requestNumber = approvedPayoutCount + 1;
+    const nextPayoutCap = resolvePayoutCapForRequest(rule, approvedPayoutCount);
+    const cycleFillEntries = lastApprovedPayoutDate
+        ? fillEntries.filter((entry) => entry.timestamp > lastApprovedPayoutDate)
+        : fillEntries;
+
+    const dailyNet = buildDailyNetPnl(cycleFillEntries);
+    const qualifyingDaysCompleted = dailyNet.filter(
+        (day) => day.netPnl >= payoutRules.minDailyProfit
+    ).length;
+    const qualifyingDaysRemaining = Math.max(
+        0,
+        payoutRules.minTradeDays - qualifyingDaysCompleted
+    );
+
+    const currentCycleProfit = dailyNet.reduce((sum, day) => sum + day.netPnl, 0);
+    const bestProfitableDay = dailyNet.reduce((highest, day) => {
+        if (day.netPnl > highest) {
+            return day.netPnl;
+        }
+
+        return highest;
+    }, 0);
+
+    const consistencyPercentCurrent =
+        currentCycleProfit > 0
+            ? (bestProfitableDay / currentCycleProfit) * 100
+            : null;
+
+    const consistencyPassed =
+        consistencyPercentCurrent !== null &&
+        consistencyPercentCurrent < payoutRules.consistencyPercent;
+
+    const profitAboveSafetyNet = Math.max(
+        0,
+        Number(currentBalance) - Number(payoutRules.safetyNet)
+    );
+
+    const maxRequestableByRules =
+        nextPayoutCap === null ? 0 : Math.min(nextPayoutCap, profitAboveSafetyNet);
+
+    const minBalancePassed =
+        Number(currentBalance) >= Number(payoutRules.minBalanceToRequest);
+
+    const minPayoutPassed =
+        maxRequestableByRules >= Number(payoutRules.minPayoutAmount);
+
+    const payoutCycleExhausted = requestNumber > Number(payoutRules.maxPayouts);
+
+    const basisComplete = !(approvedPayoutCount > 0 && !lastApprovedPayoutDate);
+
+    const eligible =
+        !payoutCycleExhausted &&
+        basisComplete &&
+        qualifyingDaysCompleted >= payoutRules.minTradeDays &&
+        consistencyPassed &&
+        minBalancePassed &&
+        minPayoutPassed;
+
+    const reasons = [];
+
+    if (!basisComplete) {
+        reasons.push("Payout Verlauf seit letzter genehmigter Auszahlung fehlt.");
+    }
+
+    if (payoutCycleExhausted) {
+        reasons.push("Maximale Anzahl an Auszahlungen für diese PA erreicht.");
+    }
+
+    if (qualifyingDaysCompleted < payoutRules.minTradeDays) {
+        reasons.push("Zu wenige Qualifying Days.");
+    }
+
+    if (!consistencyPassed) {
+        reasons.push("50 Prozent Consistency noch nicht erfüllt.");
+    }
+
+    if (!minBalancePassed) {
+        reasons.push("Min Balance to Request noch nicht erreicht.");
+    }
+
+    if (!minPayoutPassed) {
+        reasons.push("Auszahlbarer Betrag liegt noch unter 500 USD.");
+    }
+
+    return {
+        available: true,
+        basisComplete,
+        basisLabel: lastApprovedPayoutDate
+            ? "since_last_approved_payout"
+            : "since_start_or_visible_history",
+        approvedPayoutCount,
+        requestNumber,
+        maxPayouts: payoutRules.maxPayouts,
+        nextPayoutCap,
+        minPayoutAmount: payoutRules.minPayoutAmount,
+        payoutSplitPercent: payoutRules.payoutSplitPercent,
+        minTradeDaysRequired: payoutRules.minTradeDays,
+        qualifyingDaysCompleted,
+        qualifyingDaysRemaining,
+        minDailyProfit: payoutRules.minDailyProfit,
+        consistencyLimitPercent: payoutRules.consistencyPercent,
+        consistencyPercentCurrent,
+        consistencyPassed,
+        minBalanceToRequest: payoutRules.minBalanceToRequest,
+        minBalancePassed,
+        safetyNetBalance: payoutRules.safetyNet,
+        profitAboveSafetyNet,
+        requestableAmount: maxRequestableByRules,
+        requestableAmountAfterMinimumCheck: minPayoutPassed ? maxRequestableByRules : 0,
+        currentCycleProfit,
+        bestProfitableDay,
+        eligible,
+        status: payoutCycleExhausted ? "red" : eligible ? "green" : "yellow",
+        reasons,
+        debug: {
+            startBalance,
+            currentBalance,
+            dailyNetCount: dailyNet.length,
+            lastApprovedPayoutDate,
+        },
+    };
+}
+
+function differenceInCalendarDays(fromDate, toDate) {
+    const utcFrom = Date.UTC(
+        fromDate.getUTCFullYear(),
+        fromDate.getUTCMonth(),
+        fromDate.getUTCDate()
+    );
+    const utcTo = Date.UTC(
+        toDate.getUTCFullYear(),
+        toDate.getUTCMonth(),
+        toDate.getUTCDate()
+    );
+
+    return Math.max(0, Math.floor((utcTo - utcFrom) / 86400000));
+}
+
+function buildInactivityState({
+    rule,
+    fillEntries,
+    account,
+    nowDate,
+}) {
+    if (!rule || rule.accountPhase !== "pa" || !rule.inactivityRule) {
+        return null;
+    }
+
+    const dailyNet = buildDailyNetPnl(fillEntries);
+    const requiredNetProfitDay = Number(rule.inactivityRule.requiredNetProfitDay);
+    const qualifyingDays = dailyNet.filter((day) => day.netPnl >= requiredNetProfitDay);
+    const lastQualifyingDay = qualifyingDays.length
+        ? qualifyingDays[qualifyingDays.length - 1]
+        : null;
+
+    const lifecycleStartDate = getAccountLifecycleStartDate(
+        account,
+        fillEntries.length ? fillEntries[0].timestamp : null
+    );
+
+    const referenceDate =
+        lastQualifyingDay?.lastTimestamp || lifecycleStartDate || null;
+
+    const daysSinceReference = referenceDate
+        ? differenceInCalendarDays(referenceDate, nowDate)
+        : null;
+
+    const daysRemaining =
+        daysSinceReference === null
+            ? null
+            : Math.max(0, rule.inactivityRule.windowCalendarDays - daysSinceReference);
+
+    const violated =
+        daysSinceReference !== null &&
+        daysSinceReference > rule.inactivityRule.windowCalendarDays;
+
+    const warning =
+        !violated &&
+        daysRemaining !== null &&
+        daysRemaining <= 15;
+
+    return {
+        available: true,
+        requiredNetProfitDay,
+        windowCalendarDays: rule.inactivityRule.windowCalendarDays,
+        lastQualifyingTradingDayKey: lastQualifyingDay?.tradingDayKey || null,
+        lastQualifyingNetProfit: lastQualifyingDay?.netPnl ?? null,
+        referenceDate,
+        daysSinceReference,
+        daysRemaining,
+        violated,
+        status: violated ? "red" : warning ? "yellow" : "green",
+        basisComplete: Boolean(referenceDate),
+        note: rule.inactivityRule.note,
+    };
+}
+
 export function buildApexRiskSnapshot({
     account = null,
     mode = "",
@@ -461,12 +771,21 @@ export function buildApexRiskSnapshot({
     balanceHistoryRows = [],
     currentBalance = null,
     currentContracts = null,
+    fills = [],
     now = null,
 } = {}) {
     const resolvedMode = normalizeMode(mode, account);
-    const resolvedAccountSize = normalizeAccountSize(accountSize, account);
-    const preset = getPreset(resolvedAccountSize);
+    const resolvedAccountSizeNumber = normalizeAccountSizeNumber(accountSize, account);
+    const resolvedAccountSizeLabel = formatAccountSizeLabel(resolvedAccountSizeNumber);
+    const ruleContext = modeToRuleContext(resolvedMode);
+    const rule = getRules(
+        ruleContext.productType,
+        ruleContext.accountPhase,
+        resolvedAccountSizeNumber
+    );
+
     const normalizedEntries = normalizeBalanceHistoryRows(balanceHistoryRows);
+    const normalizedFillEntries = normalizeFillRows(fills);
     const nowDate = parseDateValue(now) || new Date();
 
     const allDailyCloses = getDailyCloses(normalizedEntries);
@@ -474,7 +793,7 @@ export function buildApexRiskSnapshot({
     const lastEntry = getLastEntry(normalizedEntries);
 
     const currentBalanceResolved =
-        parseNumber(currentBalance) ?? lastEntry?.balance ?? preset.startBalance;
+        parseNumber(currentBalance) ?? lastEntry?.balance ?? resolvedAccountSizeNumber;
 
     const currentContractsResolved =
         parseNumber(currentContracts) ??
@@ -483,23 +802,29 @@ export function buildApexRiskSnapshot({
 
     const peakIntradayBalance = getMaxBalance(
         normalizedEntries,
-        Math.max(preset.startBalance, currentBalanceResolved)
+        Math.max(resolvedAccountSizeNumber, currentBalanceResolved)
     );
 
-    const peakClosedBalance = getMaxBalance(completedDailyCloses, preset.startBalance);
+    const peakClosedBalance = getMaxBalance(
+        completedDailyCloses,
+        resolvedAccountSizeNumber
+    );
+
     const latestCompletedCloseBalance =
-        getLastEntry(completedDailyCloses)?.balance ?? preset.startBalance;
+        getLastEntry(completedDailyCloses)?.balance ?? resolvedAccountSizeNumber;
 
     const sessionStartBalance = latestCompletedCloseBalance;
     const sessionPnL = currentBalanceResolved - sessionStartBalance;
     const sessionLoss = Math.max(0, -sessionPnL);
-    const evaluationFloor = preset.startBalance - preset.drawdownAmount;
+
+    const maxDrawdown = Number(rule.maxDrawdown.value);
+    const evaluationFloor = resolvedAccountSizeNumber - maxDrawdown;
 
     let referenceBalance = currentBalanceResolved;
     let peakBalance = peakIntradayBalance;
     let thresholdBalance = evaluationFloor;
     let dll = null;
-    let maxContracts = preset.evalMaxContracts;
+    let maxContracts = null;
     let tier = null;
     let thresholdModel = "intraday";
 
@@ -507,11 +832,11 @@ export function buildApexRiskSnapshot({
         referenceBalance = latestCompletedCloseBalance;
         peakBalance = peakClosedBalance;
         thresholdBalance = clampFloor(
-            peakBalance - preset.drawdownAmount,
+            peakBalance - maxDrawdown,
             evaluationFloor
         );
-        dll = preset.evalEodDll;
-        maxContracts = preset.evalMaxContracts;
+        dll = resolveCurrentDailyLossLimit(rule, currentBalanceResolved);
+        maxContracts = resolveCurrentMaxContracts(rule, currentBalanceResolved);
         thresholdModel = "eod_close_based";
     }
 
@@ -519,46 +844,46 @@ export function buildApexRiskSnapshot({
         referenceBalance = currentBalanceResolved;
         peakBalance = peakIntradayBalance;
         thresholdBalance = clampFloor(
-            peakBalance - preset.drawdownAmount,
+            peakBalance - maxDrawdown,
             evaluationFloor
         );
-        dll = null;
-        maxContracts = preset.evalMaxContracts;
+        dll = resolveCurrentDailyLossLimit(rule, currentBalanceResolved);
+        maxContracts = resolveCurrentMaxContracts(rule, currentBalanceResolved);
         thresholdModel = "intraday_trailing";
     }
 
     if (resolvedMode === APEX_MODES.PA_EOD) {
         referenceBalance = latestCompletedCloseBalance;
         peakBalance = peakClosedBalance;
-        tier = getPaTier(preset, latestCompletedCloseBalance);
+        tier = resolveCurrentPaTier(rule, latestCompletedCloseBalance);
         thresholdBalance = clampFloor(
-            peakBalance - preset.drawdownAmount,
+            peakBalance - maxDrawdown,
             evaluationFloor
         );
         thresholdBalance = Math.min(
             thresholdBalance,
-            preset.paStaticThresholdStop
+            resolveStaticPaThresholdStop(rule)
         );
-        dll = tier.dll;
-        maxContracts = tier.maxContracts;
-        thresholdModel = "eod_close_based_static_at_safety_stop";
+        dll = resolveCurrentDailyLossLimit(rule, latestCompletedCloseBalance);
+        maxContracts = resolveCurrentMaxContracts(rule, latestCompletedCloseBalance);
+        thresholdModel = "eod_close_based_static_at_start_plus_100";
     }
 
     if (resolvedMode === APEX_MODES.PA_INTRADAY) {
         referenceBalance = currentBalanceResolved;
         peakBalance = peakIntradayBalance;
-        tier = getPaTier(preset, latestCompletedCloseBalance);
+        tier = resolveCurrentPaTier(rule, latestCompletedCloseBalance);
         thresholdBalance = clampFloor(
-            peakBalance - preset.drawdownAmount,
+            peakBalance - maxDrawdown,
             evaluationFloor
         );
         thresholdBalance = Math.min(
             thresholdBalance,
-            preset.paStaticThresholdStop
+            resolveStaticPaThresholdStop(rule)
         );
-        dll = tier.dll;
-        maxContracts = tier.maxContracts;
-        thresholdModel = "intraday_trailing_static_at_safety_stop";
+        dll = resolveCurrentDailyLossLimit(rule, latestCompletedCloseBalance);
+        maxContracts = resolveCurrentMaxContracts(rule, latestCompletedCloseBalance);
+        thresholdModel = "intraday_trailing_static_at_start_plus_100";
     }
 
     const distanceToThreshold = Math.max(
@@ -583,16 +908,34 @@ export function buildApexRiskSnapshot({
         maxContracts,
     });
 
+    const payout = buildPayoutState({
+        rule,
+        currentBalance: currentBalanceResolved,
+        startBalance: resolvedAccountSizeNumber,
+        fillEntries: normalizedFillEntries,
+        account,
+    });
+
+    const inactivity = buildInactivityState({
+        rule,
+        fillEntries: normalizedFillEntries,
+        account,
+        nowDate,
+    });
+
     return {
         mode: resolvedMode,
-        accountSize: resolvedAccountSize,
-        startBalance: preset.startBalance,
+        accountSize: resolvedAccountSizeLabel,
+        accountSizeNumber: resolvedAccountSizeNumber,
+        productType: rule.productType,
+        accountPhase: rule.accountPhase,
+        startBalance: resolvedAccountSizeNumber,
         referenceBalance,
         currentBalance: currentBalanceResolved,
         peakBalance,
         thresholdBalance,
         liquidationBalance: thresholdBalance,
-        drawdownAmount: preset.drawdownAmount,
+        drawdownAmount: maxDrawdown,
         dll,
         sessionStartBalance,
         sessionPnL,
@@ -602,13 +945,17 @@ export function buildApexRiskSnapshot({
         distanceToThreshold,
         remainingDll,
         effectiveRiskBudget,
-        paStaticThresholdStop: preset.paStaticThresholdStop,
-        payoutSafetyNetBalance: preset.payoutSafetyNetBalance,
+        paStaticThresholdStop: resolveStaticPaThresholdStop(rule),
+        payoutSafetyNetBalance: rule.payoutRules?.safetyNet ?? null,
         thresholdModel,
         tier,
+        payout,
+        inactivity,
+        rawRule: rule,
         status,
         debug: {
             entriesLoaded: normalizedEntries.length,
+            fillsLoaded: normalizedFillEntries.length,
             dailyClosesLoaded: allDailyCloses.length,
             completedDailyClosesLoaded: completedDailyCloses.length,
             latestCompletedCloseBalance,

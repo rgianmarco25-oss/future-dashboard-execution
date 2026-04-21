@@ -12,8 +12,8 @@ function toWholeNumber(value, fallback = 0) {
     return Math.max(0, Math.round(toNumber(value, fallback)));
 }
 
-function toSignedWholeNumber(value, fallback = 0) {
-    return Math.round(toNumber(value, fallback));
+function toSignedNumber(value, fallback = 0) {
+    return toNumber(value, fallback);
 }
 
 function buildStatus(status, reason) {
@@ -27,46 +27,65 @@ function buildStatus(status, reason) {
 }
 
 export function buildRiskLimitState(input = {}) {
-    const maxContracts = toWholeNumber(input.maxContracts, 0);
+    const maxContracts = Math.max(toNumber(input.maxContracts, 0), 0);
     const safeSize = toWholeNumber(input.safeSize, 0);
-    const currentContracts = toWholeNumber(input.currentContracts, 0);
+
+    const currentExposureUnits = Math.max(
+        toNumber(input.currentExposureUnits, input.currentContracts ?? 0),
+        0
+    );
+
     const plannedContracts = toWholeNumber(input.plannedContracts, 0);
-    const currentInstrumentContracts = toWholeNumber(input.currentInstrumentContracts, 0);
 
-    const openAfterEntry =
-        input.openAfterEntry !== undefined
-            ? toWholeNumber(input.openAfterEntry, 0)
-            : currentContracts + plannedContracts;
+    const plannedExposureUnits = Math.max(
+        toNumber(input.plannedExposureUnits, plannedContracts),
+        0
+    );
 
-    const instrumentAfterEntry =
-        input.instrumentAfterEntry !== undefined
-            ? toWholeNumber(input.instrumentAfterEntry, 0)
-            : currentInstrumentContracts + plannedContracts;
+    const currentInstrumentExposureUnits = Math.max(
+        toNumber(
+            input.currentInstrumentExposureUnits,
+            input.currentInstrumentContracts ?? 0
+        ),
+        0
+    );
 
-    const freeSlotsNow =
-        input.freeSlotsNow !== undefined
-            ? toSignedWholeNumber(input.freeSlotsNow, 0)
-            : maxContracts - currentContracts;
+    const openAfterEntryExposureUnits =
+        input.openAfterEntryExposureUnits !== undefined
+            ? Math.max(toNumber(input.openAfterEntryExposureUnits, 0), 0)
+            : currentExposureUnits + plannedExposureUnits;
 
-    const freeSlotsAfterEntry =
-        input.freeSlotsAfterEntry !== undefined
-            ? toSignedWholeNumber(input.freeSlotsAfterEntry, 0)
-            : maxContracts - openAfterEntry;
+    const instrumentAfterEntryExposureUnits =
+        input.instrumentAfterEntryExposureUnits !== undefined
+            ? Math.max(toNumber(input.instrumentAfterEntryExposureUnits, 0), 0)
+            : currentInstrumentExposureUnits + plannedExposureUnits;
+
+    const freeExposureNow =
+        input.freeExposureNow !== undefined
+            ? toSignedNumber(input.freeExposureNow, 0)
+            : maxContracts - currentExposureUnits;
+
+    const freeExposureAfterEntry =
+        input.freeExposureAfterEntry !== undefined
+            ? toSignedNumber(input.freeExposureAfterEntry, 0)
+            : maxContracts - openAfterEntryExposureUnits;
+
+    const epsilon = 0.000001;
 
     const liveOverLimit =
         Boolean(input.liveOverLimit) ||
-        (maxContracts > 0 && currentContracts > maxContracts) ||
-        freeSlotsNow < 0;
+        (maxContracts > 0 && currentExposureUnits - maxContracts > epsilon) ||
+        freeExposureNow < -epsilon;
 
     const safeSizeOverLimit =
         plannedContracts > safeSize;
 
     const totalAfterEntryOverLimit =
-        (maxContracts > 0 && openAfterEntry > maxContracts) ||
-        freeSlotsAfterEntry < 0;
+        (maxContracts > 0 && openAfterEntryExposureUnits - maxContracts > epsilon) ||
+        freeExposureAfterEntry < -epsilon;
 
     const instrumentAfterEntryOverLimit =
-        maxContracts > 0 && instrumentAfterEntry > maxContracts;
+        maxContracts > 0 && instrumentAfterEntryExposureUnits - maxContracts > epsilon;
 
     const anyOverLimit =
         liveOverLimit ||
@@ -78,9 +97,9 @@ export function buildRiskLimitState(input = {}) {
         !anyOverLimit &&
         (
             plannedContracts === safeSize ||
-            openAfterEntry === maxContracts ||
-            instrumentAfterEntry === maxContracts ||
-            freeSlotsAfterEntry === 0
+            Math.abs(openAfterEntryExposureUnits - maxContracts) <= epsilon ||
+            Math.abs(instrumentAfterEntryExposureUnits - maxContracts) <= epsilon ||
+            Math.abs(freeExposureAfterEntry) <= epsilon
         );
 
     const nearLimit =
@@ -88,20 +107,20 @@ export function buildRiskLimitState(input = {}) {
         !exactLimit &&
         (
             safeSize - plannedContracts <= 1 ||
-            freeSlotsNow <= 1 ||
-            freeSlotsAfterEntry <= 1
+            freeExposureNow <= 1 ||
+            freeExposureAfterEntry <= 1
         );
 
     let shared;
 
     if (liveOverLimit) {
-        shared = buildStatus("red", "Live Position liegt bereits über dem Max Kontrakt Limit.");
+        shared = buildStatus("red", "Live Exposure liegt bereits über dem Apex Limit.");
     } else if (safeSizeOverLimit) {
         shared = buildStatus("red", "Neue Kontrakte überschreiten die aktuelle Safe Size.");
     } else if (totalAfterEntryOverLimit) {
-        shared = buildStatus("red", "Offen nach Entry liegt über dem Max Kontrakt Limit.");
+        shared = buildStatus("red", "Exposure nach Entry liegt über dem Apex Limit.");
     } else if (instrumentAfterEntryOverLimit) {
-        shared = buildStatus("red", "Instrument nach Entry liegt über dem Max Kontrakt Limit.");
+        shared = buildStatus("red", "Markt Exposure nach Entry liegt über dem Apex Limit.");
     } else if (exactLimit) {
         shared = buildStatus("yellow", "Grenze ist exakt erreicht.");
     } else if (nearLimit) {
@@ -113,13 +132,14 @@ export function buildRiskLimitState(input = {}) {
     return {
         maxContracts,
         safeSize,
-        currentContracts,
         plannedContracts,
-        currentInstrumentContracts,
-        openAfterEntry,
-        instrumentAfterEntry,
-        freeSlotsNow,
-        freeSlotsAfterEntry,
+        currentExposureUnits,
+        plannedExposureUnits,
+        currentInstrumentExposureUnits,
+        openAfterEntryExposureUnits,
+        instrumentAfterEntryExposureUnits,
+        freeExposureNow,
+        freeExposureAfterEntry,
         flags: {
             liveOverLimit,
             safeSizeOverLimit,
@@ -137,11 +157,11 @@ export function buildRiskLimitState(input = {}) {
             },
             openAfterEntry: {
                 ...shared,
-                value: openAfterEntry,
+                value: openAfterEntryExposureUnits,
             },
             freeSlotsAfterEntry: {
                 ...shared,
-                value: freeSlotsAfterEntry,
+                value: freeExposureAfterEntry,
             },
             liveOverLimit: {
                 ...shared,
@@ -149,7 +169,7 @@ export function buildRiskLimitState(input = {}) {
             },
             instrumentAfterEntry: {
                 ...shared,
-                value: instrumentAfterEntry,
+                value: instrumentAfterEntryExposureUnits,
             },
         },
     };

@@ -438,10 +438,24 @@ function MiniCard({ label, value, color }) {
     );
 }
 
-export default function RulesPanel({ accountId, account: accountProp }) {
-    const resolvedAccountId = accountId || accountProp?.id || "";
+export default function RulesPanel(props) {
+    const resolvedAccountId =
+        cleanString(props?.resolvedAccountId) ||
+        cleanString(props?.accountId) ||
+        cleanString(props?.activeAccountId) ||
+        cleanString(props?.selectedAccountId) ||
+        cleanString(props?.account?.id) ||
+        cleanString(props?.activeAccount?.id) ||
+        cleanString(props?.selectedAccount?.id);
+
+    const directAccount =
+        props?.account ||
+        props?.activeAccount ||
+        props?.selectedAccount ||
+        null;
+
     const storedAccount = resolvedAccountId ? getAccountById(resolvedAccountId) : null;
-    const account = accountProp || storedAccount || null;
+    const account = directAccount || storedAccount || null;
 
     const [checklistState, setChecklistState] = useState(() =>
         getChecklistForAccount(resolvedAccountId)

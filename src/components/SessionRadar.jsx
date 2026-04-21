@@ -1,249 +1,338 @@
-import { formatDate } from "../utils/dateFormat";
-import { getAccountById } from "../utils/storage";
-import { getActiveRuleMode, getSessionContext } from "../utils/sessionUtils";
+import { useEffect, useMemo, useState } from "react";
+
+const TRADING_TIMEZONE = "America/New_York";
 
 const COLORS = {
+    panelBg: "rgba(8, 15, 37, 0.92)",
+    panelBgStrong: "rgba(20, 30, 55, 0.96)",
     border: "rgba(125, 211, 252, 0.18)",
-    title: "#7dd3fc",
-    label: "#94a3b8",
-    neutral: "#dbeafe",
-    activeBg: "rgba(34, 211, 238, 0.10)",
-    activeBorder: "rgba(34, 211, 238, 0.35)",
-    activeText: "#67e8f9",
-    inactiveBg: "rgba(255, 255, 255, 0.03)",
-    inactiveBorder: "rgba(125, 211, 252, 0.18)",
-    intradayBg: "rgba(34, 211, 238, 0.12)",
-    intradayBorder: "rgba(34, 211, 238, 0.35)",
-    intradayText: "#67e8f9",
-    eodBg: "rgba(251, 146, 60, 0.12)",
-    eodBorder: "rgba(251, 146, 60, 0.35)",
-    eodText: "#fdba74",
-    cardBg: "rgba(255, 255, 255, 0.03)",
+    borderStrong: "rgba(125, 211, 252, 0.28)",
+    title: "#e0f2fe",
+    text: "#e2e8f0",
+    muted: "#94a3b8",
+    cyan: "#22d3ee",
+    yellow: "#facc15",
+    purple: "#a78bfa",
+    shadow: "0 0 30px rgba(0, 0, 0, 0.25)",
 };
 
-const wrapperStyle = {
-    width: "100%",
-};
+function cleanString(value) {
+    if (value === null || value === undefined) {
+        return "";
+    }
 
-const infoCardStyle = {
-    border: `1px solid ${COLORS.border}`,
-    borderRadius: "18px",
-    padding: "16px",
-    background: COLORS.cardBg,
-    color: COLORS.neutral,
-    marginBottom: "16px",
-};
+    return String(value).trim();
+}
 
-const infoGridStyle = {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-    gap: "12px",
-};
+function getDisplayAccountName(account) {
+    return (
+        cleanString(account?.tradingAccountName) ||
+        cleanString(account?.displayName) ||
+        cleanString(account?.tradingAccountId) ||
+        cleanString(account?.accountName) ||
+        cleanString(account?.name) ||
+        "Kein aktiver Account"
+    );
+}
 
-const infoItemStyle = {
-    border: `1px solid ${COLORS.border}`,
-    borderRadius: "14px",
-    padding: "12px",
-    background: "rgba(255, 255, 255, 0.02)",
-    textAlign: "center",
-};
+function formatDateInTimezone(date, timeZone) {
+    return new Intl.DateTimeFormat("de-CH", {
+        timeZone,
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+    }).format(date);
+}
 
-const infoLabelStyle = {
-    fontSize: "13px",
-    color: COLORS.label,
-    marginBottom: "6px",
-    lineHeight: 1.35,
-};
+function formatTimeInTimezone(date, timeZone) {
+    return new Intl.DateTimeFormat("de-CH", {
+        timeZone,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+    }).format(date);
+}
 
-const infoValueStyle = {
-    fontSize: "15px",
-    fontWeight: "700",
-    color: COLORS.neutral,
-    lineHeight: 1.35,
-    overflowWrap: "anywhere",
-    wordBreak: "break-word",
-};
+function formatWeekdayInTimezone(date, timeZone) {
+    return new Intl.DateTimeFormat("de-CH", {
+        timeZone,
+        weekday: "long",
+    }).format(date);
+}
 
-const sessionGridStyle = {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-    gap: "12px",
-};
+function getTimeZoneLabel(timeZone) {
+    return cleanString(timeZone) || "Europe/Zurich";
+}
 
-const sessionCardBaseStyle = {
-    borderRadius: "18px",
-    padding: "16px",
-    display: "grid",
-    gap: "8px",
-    textAlign: "center",
-    minHeight: "120px",
-    alignContent: "center",
-};
+function getNyParts(date) {
+    const formatter = new Intl.DateTimeFormat("en-US", {
+        timeZone: TRADING_TIMEZONE,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+    });
 
-const statusBadgeBaseStyle = {
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    padding: "6px 10px",
-    borderRadius: "999px",
-    fontSize: "12px",
-    fontWeight: "700",
-    margin: "0 auto",
-    lineHeight: 1.3,
-};
+    const parts = formatter.formatToParts(date);
+    const result = {};
 
-const sessionLabelStyle = {
-    fontSize: "18px",
-    fontWeight: "700",
-    color: COLORS.neutral,
-    lineHeight: 1.35,
-};
+    parts.forEach((part) => {
+        if (part.type !== "literal") {
+            result[part.type] = part.value;
+        }
+    });
 
-const timeStyle = {
-    fontSize: "14px",
-    color: COLORS.label,
-    lineHeight: 1.35,
-};
-
-function getSessionCardStyle(isActive) {
     return {
-        ...sessionCardBaseStyle,
-        border: isActive
-            ? `1px solid ${COLORS.activeBorder}`
-            : `1px solid ${COLORS.inactiveBorder}`,
-        background: isActive ? COLORS.activeBg : COLORS.inactiveBg,
-        color: COLORS.neutral,
-        boxShadow: isActive ? "0 0 18px rgba(34, 211, 238, 0.14)" : "none",
+        year: Number(result.year),
+        month: Number(result.month),
+        day: Number(result.day),
+        hour: Number(result.hour),
+        minute: Number(result.minute),
+        second: Number(result.second),
     };
 }
 
-function getStatusBadgeStyle(isActive) {
-    if (isActive) {
+function addUtcDays(year, month, day, days) {
+    const next = new Date(Date.UTC(year, month - 1, day + days));
+
+    return {
+        year: next.getUTCFullYear(),
+        month: next.getUTCMonth() + 1,
+        day: next.getUTCDate(),
+    };
+}
+
+function getTradingDayLabel(date) {
+    const ny = getNyParts(date);
+
+    const tradingDay =
+        ny.hour >= 18
+            ? addUtcDays(ny.year, ny.month, ny.day, 1)
+            : { year: ny.year, month: ny.month, day: ny.day };
+
+    const local = new Date(
+        tradingDay.year,
+        tradingDay.month - 1,
+        tradingDay.day
+    );
+
+    return new Intl.DateTimeFormat("de-CH", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+    }).format(local);
+}
+
+function getSessionCardStyle(label) {
+    const key = String(label || "").toLowerCase();
+
+    if (key.includes("timezone")) {
         return {
-            ...statusBadgeBaseStyle,
-            border: `1px solid ${COLORS.activeBorder}`,
-            background: COLORS.activeBg,
-            color: COLORS.activeText,
+            border: "rgba(34, 211, 238, 0.28)",
+            background:
+                "linear-gradient(180deg, rgba(8, 47, 73, 0.52) 0%, rgba(15, 23, 42, 0.88) 100%)",
+            valueColor: "#e0f2fe",
+        };
+    }
+
+    if (key.includes("trading day")) {
+        return {
+            border: "rgba(250, 204, 21, 0.30)",
+            background:
+                "linear-gradient(180deg, rgba(71, 57, 11, 0.42) 0%, rgba(15, 23, 42, 0.88) 100%)",
+            valueColor: "#fef08a",
+        };
+    }
+
+    if (key.includes("current time")) {
+        return {
+            border: "rgba(59, 130, 246, 0.28)",
+            background:
+                "linear-gradient(180deg, rgba(30, 41, 59, 0.92) 0%, rgba(15, 23, 42, 0.88) 100%)",
+            valueColor: "#dbeafe",
+        };
+    }
+
+    if (key.includes("weekday")) {
+        return {
+            border: "rgba(167, 139, 250, 0.28)",
+            background:
+                "linear-gradient(180deg, rgba(46, 16, 101, 0.34) 0%, rgba(15, 23, 42, 0.88) 100%)",
+            valueColor: "#ede9fe",
         };
     }
 
     return {
-        ...statusBadgeBaseStyle,
-        border: `1px solid ${COLORS.inactiveBorder}`,
-        background: COLORS.inactiveBg,
-        color: COLORS.neutral,
+        border: "rgba(125, 211, 252, 0.24)",
+        background:
+            "linear-gradient(180deg, rgba(15, 23, 42, 0.88) 0%, rgba(18, 34, 64, 0.82) 100%)",
+        valueColor: "#f8fafc",
     };
 }
 
-function getModeBadgeStyle(mode) {
-    if (mode === "intraday") {
-        return {
-            ...statusBadgeBaseStyle,
-            border: `1px solid ${COLORS.intradayBorder}`,
-            background: COLORS.intradayBg,
-            color: COLORS.intradayText,
+export default function SessionRadar(props) {
+    const resolvedAccount =
+        props?.account || props?.activeAccount || props?.selectedAccount || null;
+
+    const [now, setNow] = useState(() => new Date());
+
+    useEffect(() => {
+        const intervalId = window.setInterval(() => {
+            setNow(new Date());
+        }, 1000);
+
+        return () => {
+            window.clearInterval(intervalId);
         };
-    }
+    }, []);
 
-    return {
-        ...statusBadgeBaseStyle,
-        border: `1px solid ${COLORS.eodBorder}`,
-        background: COLORS.eodBg,
-        color: COLORS.eodText,
-    };
-}
+    const userTimeZone = useMemo(() => {
+        return Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Zurich";
+    }, []);
 
-function buildSessionCards(context) {
-    return [
-        {
-            key: "intraday",
-            label: "Intraday Phase",
-            start: context.sessionWindow.openLabel,
-            end: context.sessionWindow.closeLabel,
-            isActive: context.isIntradayPhase,
-        },
-        {
-            key: "eod",
-            label: "EOD Phase",
-            start: "00:00",
-            end: "23:59",
-            isActive: context.isEodPhase,
-        },
-        {
-            key: "market",
-            label: "Session Window",
-            start: context.sessionWindow.openLabel,
-            end: context.sessionWindow.closeLabel,
-            isActive: context.sessionOpen,
-        },
-    ];
-}
-
-export default function SessionRadar({ accountId, account: accountProp, timezone }) {
-    const resolvedAccountId = accountId || accountProp?.id || "";
-    const storedAccount = resolvedAccountId ? getAccountById(resolvedAccountId) : null;
-
-    const account = {
-        ...(storedAccount || {}),
-        ...(accountProp || {}),
-        id: resolvedAccountId || accountProp?.id || storedAccount?.id || "",
-        timezone:
-            accountProp?.timezone ||
-            storedAccount?.timezone ||
-            timezone ||
-            "Europe/Zurich",
-    };
-
-    const context = getSessionContext(account);
-    const activeRuleMode = getActiveRuleMode(account);
-    const sessionCards = buildSessionCards(context);
-    const displayedTradingDate = formatDate(context.tradingDate);
+    const items = useMemo(() => {
+        return [
+            {
+                label: "Timezone",
+                value: getTimeZoneLabel(userTimeZone),
+            },
+            {
+                label: "Trading Day",
+                value: getTradingDayLabel(now),
+            },
+            {
+                label: "Current Time",
+                value: formatTimeInTimezone(now, userTimeZone),
+            },
+            {
+                label: "Weekday",
+                value: formatWeekdayInTimezone(now, userTimeZone),
+            },
+        ];
+    }, [now, userTimeZone]);
 
     return (
-        <div style={wrapperStyle}>
-            <div style={infoCardStyle}>
-                <div style={infoGridStyle}>
-                    <div style={infoItemStyle}>
-                        <div style={infoLabelStyle}>Timezone</div>
-                        <div style={infoValueStyle}>{context.timeZone}</div>
+        <div
+            style={{
+                borderRadius: 22,
+                border: `1px solid ${COLORS.border}`,
+                background: COLORS.panelBgStrong,
+                boxShadow: COLORS.shadow,
+                padding: 16,
+                display: "grid",
+                gap: 12,
+                minWidth: 0,
+            }}
+        >
+            <div
+                style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "flex-start",
+                    gap: 12,
+                    flexWrap: "wrap",
+                }}
+            >
+                <div style={{ minWidth: 0 }}>
+                    <div
+                        style={{
+                            color: COLORS.title,
+                            fontSize: 18,
+                            fontWeight: 800,
+                            lineHeight: 1.2,
+                        }}
+                    >
+                        Session Radar
                     </div>
 
-                    <div style={infoItemStyle}>
-                        <div style={infoLabelStyle}>Trading Date</div>
-                        <div style={infoValueStyle}>{displayedTradingDate}</div>
+                    <div
+                        style={{
+                            marginTop: 4,
+                            color: COLORS.muted,
+                            fontSize: 12,
+                            lineHeight: 1.35,
+                            wordBreak: "break-word",
+                        }}
+                    >
+                        Account: {getDisplayAccountName(resolvedAccount)}
                     </div>
+                </div>
 
-                    <div style={infoItemStyle}>
-                        <div style={infoLabelStyle}>Current Time</div>
-                        <div style={infoValueStyle}>{context.localTime}</div>
-                    </div>
-
-                    <div style={infoItemStyle}>
-                        <div style={infoLabelStyle}>Weekday</div>
-                        <div style={infoValueStyle}>{context.weekday}</div>
-                    </div>
-
-                    <div style={infoItemStyle}>
-                        <div style={infoLabelStyle}>Active Rule Mode</div>
-                        <div style={getModeBadgeStyle(activeRuleMode)}>
-                            {String(activeRuleMode || "eod").toUpperCase()}
-                        </div>
-                    </div>
+                <div
+                    style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        padding: "6px 10px",
+                        borderRadius: 999,
+                        border: `1px solid ${COLORS.borderStrong}`,
+                        background: "rgba(255,255,255,0.04)",
+                        color: COLORS.cyan,
+                        fontSize: 11,
+                        fontWeight: 800,
+                        whiteSpace: "nowrap",
+                    }}
+                >
+                    {formatDateInTimezone(now, userTimeZone)}
                 </div>
             </div>
 
-            <div style={sessionGridStyle}>
-                {sessionCards.map((session) => (
-                    <div key={session.key} style={getSessionCardStyle(session.isActive)}>
-                        <div style={sessionLabelStyle}>{session.label}</div>
-                        <div style={timeStyle}>
-                            {session.start} - {session.end}
+            <div
+                style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                    gap: 10,
+                    width: "100%",
+                    alignItems: "stretch",
+                }}
+            >
+                {items.map((item) => {
+                    const ui = getSessionCardStyle(item.label);
+
+                    return (
+                        <div
+                            key={item.label}
+                            style={{
+                                minHeight: 62,
+                                borderRadius: 12,
+                                border: `1px solid ${ui.border}`,
+                                background: ui.background,
+                                padding: "8px 10px",
+                                display: "flex",
+                                flexDirection: "column",
+                                justifyContent: "center",
+                                gap: 3,
+                                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)",
+                            }}
+                        >
+                            <div
+                                style={{
+                                    color: "rgba(148, 163, 184, 0.95)",
+                                    fontSize: 10,
+                                    fontWeight: 700,
+                                    lineHeight: 1.1,
+                                }}
+                            >
+                                {item.label}
+                            </div>
+
+                            <div
+                                style={{
+                                    color: ui.valueColor,
+                                    fontSize: 13,
+                                    fontWeight: 800,
+                                    lineHeight: 1.15,
+                                    letterSpacing: "0.01em",
+                                }}
+                            >
+                                {item.value}
+                            </div>
                         </div>
-                        <div style={getStatusBadgeStyle(session.isActive)}>
-                            {session.isActive ? "ACTIVE" : "INACTIVE"}
-                        </div>
-                    </div>
-                ))}
+                    );
+                })}
             </div>
         </div>
     );

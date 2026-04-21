@@ -210,25 +210,47 @@ function toTimestamp(value) {
 }
 
 function normalizeSide(rawSide, rawQuantity = 0) {
-    const side = cleanString(rawSide).toLowerCase();
+    const sideText = cleanString(rawSide).toLowerCase();
+    const compactSide = sideText.replace(/[^a-z0-9+-]/g, "");
+    const numericSide = parseNumber(rawSide, NaN);
 
     if (
-        side === "buy" ||
-        side === "b" ||
-        side === "long" ||
-        side === "bot"
+        compactSide === "buy" ||
+        compactSide === "b" ||
+        compactSide === "long" ||
+        compactSide === "bot" ||
+        compactSide === "bought" ||
+        compactSide === "openbuy" ||
+        compactSide === "+1"
     ) {
         return "buy";
     }
 
     if (
-        side === "sell" ||
-        side === "s" ||
-        side === "short" ||
-        side === "sl" ||
-        side === "sold"
+        compactSide === "sell" ||
+        compactSide === "s" ||
+        compactSide === "short" ||
+        compactSide === "sl" ||
+        compactSide === "sold" ||
+        compactSide === "sld" ||
+        compactSide === "sellshort" ||
+        compactSide === "shortsell" ||
+        compactSide === "opensell" ||
+        compactSide === "-1"
     ) {
         return "sell";
+    }
+
+    if (Number.isFinite(numericSide)) {
+        if (numericSide === 0) {
+            return "buy";
+        }
+
+        if (numericSide === 1) {
+            return "sell";
+        }
+
+        return numericSide < 0 ? "sell" : "buy";
     }
 
     return rawQuantity < 0 ? "sell" : "buy";
@@ -347,19 +369,22 @@ function normalizeFill(fill, index, fallbackAccountId = "") {
         0
     );
 
-    const side = normalizeSide(
-        pickFirst(source, [
-            "side",
-            "action",
-            "direction",
-            "buySell",
-            "buy/sell",
-            "tradeSide",
-            "bs",
-        ]),
-        rawQuantity
-    );
+    const rawSideValue = pickFirst(source, [
+        "side",
+        "buySell",
+        "buy/sell",
+        "buy_sell",
+        "b/s",
+        "bs",
+        "tradeSide",
+        "sideLabel",
+        "sideCode",
+        "positionSide",
+        "direction",
+        "action",
+    ]);
 
+    const side = normalizeSide(rawSideValue, rawQuantity);
     const quantity = Math.abs(rawQuantity);
 
     const symbol = cleanString(

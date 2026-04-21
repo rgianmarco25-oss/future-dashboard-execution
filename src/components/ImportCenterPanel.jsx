@@ -1,11 +1,26 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+    useCallback,
+    useMemo,
+    useState,
+    useSyncExternalStore,
+} from "react";
 import { formatDateTime } from "../utils/dateFormat";
-import { buildFillAnalytics } from "../utils/fillAnalytics";
 import * as csvImportUtils from "../utils/csvImportUtils";
+import {
+    getActiveProvider,
+    getStrictProviderDisplayName,
+    shouldUseAtasZeroState,
+} from "../utils/providerDisplay";
 import {
     clearCashHistory,
     clearImportedFills,
     clearImportedOrders,
+    clearParsedCsvImport,
+    getAccounts,
+    getActiveAccountId,
+    getCsvImports,
+    saveParsedCsvImport,
+    subscribeStorage,
     syncImportedCashHistory,
     syncImportedFills,
     syncImportedOrders,
@@ -23,40 +38,171 @@ const COLORS = {
     positive: "#22c55e",
     warning: "#f59e0b",
     danger: "#ef4444",
-    cardBg: "rgba(15, 23, 42, 0.72)",
-    headBg: "rgba(15, 23, 42, 0.92)",
-    buttonBg: "#7dd3fc",
-    buttonText: "#04111d",
+    cyan: "#22d3ee",
+    purple: "#a78bfa",
+    cardBg: "rgba(255, 255, 255, 0.04)",
+    cardBgStrong: "rgba(255, 255, 255, 0.06)",
+    buttonBg: "rgba(14, 116, 144, 0.22)",
+    buttonBorder: "rgba(125, 211, 252, 0.35)",
 };
 
-const IMPORT_SECTIONS = [
-    {
+const PREVIEW_LIMIT = 5;
+
+const IMPORT_TYPE_META = {
+    orders: {
         key: "orders",
-        title: "Orders CSV",
-        description: "Nutze hier deine Orders.csv.",
+        label: "Orders",
     },
-    {
+    trades: {
         key: "trades",
-        title: "Fills CSV",
-        description: "Nutze hier deine Fills.csv.",
+        label: "Fills",
     },
-    {
+    cashHistory: {
         key: "cashHistory",
-        title: "Account Balance History CSV",
-        description:
-            "Nutze hier deine Account Balance History.csv oder Cash History.csv.",
+        label: "Cash History",
     },
-    {
+    performance: {
         key: "performance",
-        title: "Performance CSV optional",
-        description: "Zusatzquelle für PnL Kontrolle und Abgleich.",
+        label: "Performance",
     },
-    {
+    positionHistory: {
         key: "positionHistory",
-        title: "Position History CSV optional",
-        description: "Zusatzquelle für Positions Historie und PnL Abgleich.",
+        label: "Position History",
     },
+    unknown: {
+        key: "unknown",
+        label: "Unbekannt",
+    },
+};
+
+const GENERAL_ACCOUNT_KEYS = [
+    "Account",
+    "Account Name",
+    "Account Number",
+    "Account ID",
+    "Account Id",
+    "Trading Account",
+    "Trading Account Name",
+    "Trading Account ID",
+    "Acct",
+    "account",
+    "accountName",
+    "accountId",
+    "accountNumber",
+    "account_id",
+    "account_name",
 ];
+
+const TYPE_ACCOUNT_KEYS = {
+    orders: [
+        "Account",
+        "Account Name",
+        "Account ID",
+        "Account Id",
+        "Trading Account",
+        "Trading Account Name",
+        "Trading Account ID",
+        "account",
+        "accountName",
+        "accountId",
+    ],
+    trades: [
+        "Account",
+        "Account Name",
+        "Account ID",
+        "Account Id",
+        "Trading Account",
+        "Trading Account Name",
+        "Trading Account ID",
+        "account",
+        "accountName",
+        "accountId",
+    ],
+    cashHistory: [
+        "Account",
+        "Account Name",
+        "Account ID",
+        "Account Id",
+        "account",
+        "accountName",
+        "accountId",
+    ],
+    performance: [
+        "Account",
+        "Account Name",
+        "Account ID",
+        "Account Id",
+        "account",
+        "accountName",
+        "accountId",
+    ],
+    positionHistory: [
+        "Account",
+        "Account Name",
+        "Account ID",
+        "Account Id",
+        "account",
+        "accountName",
+        "accountId",
+    ],
+};
+
+const TRADING_ACCOUNT_ID_KEYS = [
+    "Trading Account ID",
+    "Account ID",
+    "Account Id",
+    "Account Number",
+    "accountId",
+    "account_id",
+    "accountNumber",
+];
+
+const TRADING_ACCOUNT_NAME_KEYS = [
+    "Trading Account Name",
+    "Trading Account",
+    "Account Name",
+    "accountName",
+    "account_name",
+];
+
+const GENERIC_NON_ACCOUNT_VALUES = new Set([
+    "orders",
+    "order",
+    "fills",
+    "fill",
+    "trades",
+    "trade",
+    "performance",
+    "positionhistory",
+    "positionhistorycsv",
+    "position history",
+    "cashhistory",
+    "cash history",
+    "dailysummary",
+    "daily summary",
+    "accountbalancehistory",
+    "account balance history",
+    "unknown",
+]);
+
+const MATCH_PRIORITY = {
+    tradingAccountId: 5,
+    tradingAccountName: 4,
+    tradingAccountKey: 3,
+    displayName: 2,
+    appAccountId: 1,
+    activeAccountFallback: 0,
+};
+
+const EMPTY_IMPORT_CENTER_SNAPSHOT = Object.freeze({
+    accounts: [],
+    activeAccountId: "",
+    activeAccount: null,
+    activeImports: null,
+});
+
+let cachedImportCenterSnapshotSignature = "";
+let cachedImportCenterSnapshotValue = EMPTY_IMPORT_CENTER_SNAPSHOT;
 
 function cleanString(value) {
     if (value === null || value === undefined) {
@@ -66,481 +212,1633 @@ function cleanString(value) {
     return String(value).trim();
 }
 
-function toFiniteNumber(value, fallback = 0) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
+function normalizeProvider(value) {
+    const lower = cleanString(value).toLowerCase();
+
+    if (!lower) {
+        return "";
+    }
+
+    if (lower.includes("atas")) {
+        return "atas";
+    }
+
+    if (lower.includes("trado")) {
+        return "tradovate";
+    }
+
+    return lower;
 }
 
-function readFileAsText(file) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
+function formatProviderLabel(value) {
+    const provider = normalizeProvider(value);
 
-        reader.onload = () => resolve(String(reader.result || ""));
-        reader.onerror = () => reject(new Error("Datei konnte nicht gelesen werden."));
+    if (provider === "atas") {
+        return "ATAS";
+    }
 
-        reader.readAsText(file);
-    });
+    if (provider === "tradovate") {
+        return "Tradovate";
+    }
+
+    return provider ? provider.toUpperCase() : "Tradovate";
 }
 
-function formatCount(value) {
-    return new Intl.NumberFormat("de-CH").format(Number(value || 0));
+function resolvePanelProvider(props, activeAccount) {
+    const candidates = [
+        props?.provider,
+        props?.activeProvider,
+        props?.dataProvider,
+        props?.sourceProvider,
+        activeAccount?.provider,
+        activeAccount?.activeProvider,
+        activeAccount?.dataProvider,
+        activeAccount?.sourceProvider,
+        activeAccount?.platform,
+        activeAccount?.broker,
+    ];
+
+    for (const candidate of candidates) {
+        const normalized = normalizeProvider(candidate);
+
+        if (normalized) {
+            return normalized;
+        }
+    }
+
+    return "tradovate";
 }
 
-function formatWholeNumber(value) {
-    return new Intl.NumberFormat("de-CH", {
-        maximumFractionDigits: 0,
-    }).format(Number(value || 0));
+function looksLikeImportCollection(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return false;
+    }
+
+    return (
+        Object.prototype.hasOwnProperty.call(value, "orders") ||
+        Object.prototype.hasOwnProperty.call(value, "trades") ||
+        Object.prototype.hasOwnProperty.call(value, "cashHistory") ||
+        Object.prototype.hasOwnProperty.call(value, "dailySummary") ||
+        Object.prototype.hasOwnProperty.call(value, "performance") ||
+        Object.prototype.hasOwnProperty.call(value, "positionHistory")
+    );
 }
 
-function formatMoney(value) {
-    return new Intl.NumberFormat("de-CH", {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-    }).format(toFiniteNumber(value, 0));
+function hasImportRows(importEntry) {
+    if (!importEntry || typeof importEntry !== "object") {
+        return false;
+    }
+
+    if (Array.isArray(importEntry.rows) && importEntry.rows.length > 0) {
+        return true;
+    }
+
+    if (Array.isArray(importEntry.previewRows) && importEntry.previewRows.length > 0) {
+        return true;
+    }
+
+    if (Array.isArray(importEntry.headers) && importEntry.headers.length > 0) {
+        return true;
+    }
+
+    if (cleanString(importEntry.rawText)) {
+        return true;
+    }
+
+    return false;
 }
 
-function getStatusMeta(hasData) {
-    if (hasData) {
+function getImportEntryProvider(importEntry) {
+    return normalizeProvider(
+        importEntry?.provider ||
+        importEntry?.dataProvider ||
+        importEntry?.providerLabel
+    );
+}
+
+function entryMatchesProvider(importEntry, provider) {
+    if (!hasImportRows(importEntry)) {
+        return false;
+    }
+
+    const normalizedProvider = normalizeProvider(provider);
+    const entryProvider = getImportEntryProvider(importEntry);
+
+    if (!entryProvider) {
+        return normalizedProvider === "tradovate";
+    }
+
+    return entryProvider === normalizedProvider;
+}
+
+function hasImportCollectionContent(value) {
+    if (!looksLikeImportCollection(value)) {
+        return false;
+    }
+
+    return ["orders", "trades", "cashHistory", "performance", "positionHistory"].some((key) =>
+        hasImportRows(value?.[key])
+    );
+}
+
+function hasProviderCollectionContent(value, provider) {
+    if (!looksLikeImportCollection(value)) {
+        return false;
+    }
+
+    return ["orders", "trades", "cashHistory", "performance", "positionHistory"].some((key) =>
+        entryMatchesProvider(value?.[key], provider)
+    );
+}
+
+function resolveImportsForProvider(provider, ...sources) {
+    const normalizedProvider = normalizeProvider(provider);
+
+    for (const source of sources) {
+        if (!source || typeof source !== "object") {
+            continue;
+        }
+
+        if (
+            normalizedProvider &&
+            looksLikeImportCollection(source?.[normalizedProvider])
+        ) {
+            return source[normalizedProvider];
+        }
+
+        if (
+            normalizedProvider &&
+            looksLikeImportCollection(source?.byProvider?.[normalizedProvider])
+        ) {
+            return source.byProvider[normalizedProvider];
+        }
+
+        if (
+            normalizedProvider &&
+            looksLikeImportCollection(source?.importsByProvider?.[normalizedProvider])
+        ) {
+            return source.importsByProvider[normalizedProvider];
+        }
+
+        if (
+            normalizedProvider &&
+            looksLikeImportCollection(source?.providers?.[normalizedProvider])
+        ) {
+            return source.providers[normalizedProvider];
+        }
+
+        if (
+            normalizedProvider === "atas" &&
+            hasProviderCollectionContent(source, "atas")
+        ) {
+            return source;
+        }
+
+        if (
+            normalizedProvider !== "atas" &&
+            hasImportCollectionContent(source)
+        ) {
+            return source;
+        }
+    }
+
+    for (const source of sources) {
+        if (
+            normalizedProvider === "atas" &&
+            hasProviderCollectionContent(source, "atas")
+        ) {
+            return source;
+        }
+
+        if (
+            normalizedProvider !== "atas" &&
+            looksLikeImportCollection(source)
+        ) {
+            return source;
+        }
+    }
+
+    return {};
+}
+
+function callImportBuilder(builderName, imports, scopeTradingAccountId, provider) {
+    const builder = csvImportUtils?.[builderName];
+
+    if (typeof builder !== "function") {
+        return { entries: [] };
+    }
+
+    const attempts = [
+        () => builder(imports, scopeTradingAccountId, { provider }),
+        () => builder(imports, scopeTradingAccountId, provider),
+        () => builder(imports, scopeTradingAccountId),
+    ];
+
+    for (const attempt of attempts) {
+        try {
+            const result = attempt();
+
+            if (result && typeof result === "object") {
+                return result;
+            }
+        } catch {
+            continue;
+        }
+    }
+
+    return { entries: [] };
+}
+
+function callDeriveCashHistorySnapshot(importShape, scopeTradingAccountId, provider) {
+    if (typeof csvImportUtils.deriveCashHistorySnapshot !== "function") {
+        return null;
+    }
+
+    const attempts = [
+        () => csvImportUtils.deriveCashHistorySnapshot(
+            importShape,
+            scopeTradingAccountId,
+            { provider }
+        ),
+        () => csvImportUtils.deriveCashHistorySnapshot(
+            importShape,
+            scopeTradingAccountId,
+            provider
+        ),
+        () => csvImportUtils.deriveCashHistorySnapshot(
+            importShape,
+            scopeTradingAccountId
+        ),
+    ];
+
+    for (const attempt of attempts) {
+        try {
+            return attempt();
+        } catch {
+            continue;
+        }
+    }
+
+    return null;
+}
+
+
+function normalizeValue(value) {
+    return cleanString(value).toLowerCase();
+}
+
+function compactValue(value) {
+    return normalizeValue(value).replace(/[^a-z0-9]/g, "");
+}
+
+function splitCsvLine(line) {
+    const result = [];
+    let current = "";
+    let insideQuotes = false;
+
+    for (let index = 0; index < line.length; index += 1) {
+        const char = line[index];
+        const next = line[index + 1];
+
+        if (char === '"') {
+            if (insideQuotes && next === '"') {
+                current += '"';
+                index += 1;
+            } else {
+                insideQuotes = !insideQuotes;
+            }
+            continue;
+        }
+
+        if (char === "," && !insideQuotes) {
+            result.push(current);
+            current = "";
+            continue;
+        }
+
+        current += char;
+    }
+
+    result.push(current);
+    return result.map((value) => value.replace(/\r/g, "").trim());
+}
+
+function parseCsvText(rawText) {
+    const lines = cleanString(rawText)
+        .split(/\n/)
+        .map((line) => line.replace(/\r/g, ""))
+        .filter((line) => line.trim().length > 0);
+
+    if (lines.length === 0) {
         return {
-            label: "Importiert",
-            color: COLORS.positive,
-            border: "rgba(34, 197, 94, 0.35)",
-            background: "rgba(34, 197, 94, 0.12)",
+            headers: [],
+            rows: [],
+            previewRows: [],
+        };
+    }
+
+    const headers = splitCsvLine(lines[0]);
+    const rows = lines.slice(1).map((line) => {
+        const values = splitCsvLine(line);
+        const row = {};
+
+        headers.forEach((header, index) => {
+            row[header] = values[index] ?? "";
+        });
+
+        return row;
+    });
+
+    return {
+        headers,
+        rows,
+        previewRows: rows.slice(0, PREVIEW_LIMIT),
+    };
+}
+
+function getRowValue(row, keys) {
+    for (const key of keys) {
+        if (Object.prototype.hasOwnProperty.call(row, key)) {
+            const value = cleanString(row[key]);
+            if (value) {
+                return value;
+            }
+        }
+    }
+
+    return "";
+}
+
+function getFirstNonEmptyValue(rows, keys) {
+    for (const row of rows) {
+        const value = getRowValue(row, keys);
+        if (value) {
+            return value;
+        }
+    }
+
+    return "";
+}
+
+function isLikelyTradingAccountValue(value) {
+    const raw = cleanString(value);
+    const normalized = normalizeValue(raw);
+    const compact = compactValue(raw);
+
+    if (!raw || compact.length < 4) {
+        return false;
+    }
+
+    if (
+        GENERIC_NON_ACCOUNT_VALUES.has(normalized) ||
+        GENERIC_NON_ACCOUNT_VALUES.has(compact)
+    ) {
+        return false;
+    }
+
+    if (compact.startsWith("apex") || compact.startsWith("paapex")) {
+        return true;
+    }
+
+    if (/\d{4,}/.test(raw)) {
+        return true;
+    }
+
+    if (/^[a-z]+[a-z0-9]*\d+[a-z0-9]*$/i.test(raw)) {
+        return true;
+    }
+
+    return false;
+}
+
+function sanitizeTradingAccountValue(value) {
+    const raw = cleanString(value);
+    return isLikelyTradingAccountValue(raw) ? raw : "";
+}
+
+function extractAccountFromFileName(fileName) {
+    const raw = cleanString(fileName).replace(/\.csv$/i, "");
+
+    if (!raw) {
+        return "";
+    }
+
+    const apexMatch = raw.match(/((?:pa)?apex[a-z0-9]+)/i);
+    if (apexMatch?.[1]) {
+        return sanitizeTradingAccountValue(apexMatch[1]);
+    }
+
+    const longTokenMatch = raw.match(/([a-z]{2,}[a-z0-9]{6,})/i);
+    if (longTokenMatch?.[1]) {
+        return sanitizeTradingAccountValue(longTokenMatch[1]);
+    }
+
+    return "";
+}
+
+function hasAllHeaders(normalizedHeaders, required) {
+    return required.every((header) => normalizedHeaders.includes(header));
+}
+
+function hasAnyHeaderText(headerText, parts) {
+    return parts.some((part) => headerText.includes(part));
+}
+
+function detectImportType(fileName, headers) {
+    const normalizedFileName = normalizeValue(fileName);
+    const normalizedHeaders = headers.map((header) => normalizeValue(header));
+    const headerText = normalizedHeaders.join(" | ");
+
+    if (
+        normalizedFileName.includes("orders") ||
+        normalizedFileName.includes("order") ||
+        hasAllHeaders(normalizedHeaders, ["instrument", "action", "status"]) ||
+        (hasAnyHeaderText(headerText, ["order type", "order qty", "filled qty"]) &&
+            hasAnyHeaderText(headerText, ["status", "instrument"]))
+    ) {
+        return IMPORT_TYPE_META.orders.key;
+    }
+
+    if (
+        normalizedFileName.includes("fills") ||
+        normalizedFileName.includes("fill") ||
+        normalizedFileName.includes("trade") ||
+        hasAllHeaders(normalizedHeaders, ["instrument", "price", "buy/sell"]) ||
+        (hasAnyHeaderText(headerText, ["commission", "realized", "filled"]) &&
+            hasAnyHeaderText(headerText, ["instrument", "price"]))
+    ) {
+        return IMPORT_TYPE_META.trades.key;
+    }
+
+    if (
+        normalizedFileName.includes("cash") ||
+        normalizedFileName.includes("balance") ||
+        normalizedFileName.includes("daily summary") ||
+        hasAnyHeaderText(headerText, [
+            "end of day balance",
+            "cash balance",
+            "net liq",
+            "total amount",
+        ]) ||
+        (hasAnyHeaderText(headerText, ["starting balance", "ending balance"]) &&
+            hasAnyHeaderText(headerText, ["date"]))
+    ) {
+        return IMPORT_TYPE_META.cashHistory.key;
+    }
+
+    if (
+        normalizedFileName.includes("performance") ||
+        hasAnyHeaderText(headerText, ["gross pnl", "net profit", "winning trades", "losing trades"]) ||
+        hasAnyHeaderText(headerText, ["profit factor", "avg win", "avg loss"])
+    ) {
+        return IMPORT_TYPE_META.performance.key;
+    }
+
+    if (
+        normalizedFileName.includes("position history") ||
+        normalizedFileName.includes("positionhistory") ||
+        hasAnyHeaderText(headerText, ["entry price", "exit price", "entry time", "exit time"]) ||
+        (hasAnyHeaderText(headerText, ["position", "realized pnl"]) &&
+            hasAnyHeaderText(headerText, ["entry", "exit"]))
+    ) {
+        return IMPORT_TYPE_META.positionHistory.key;
+    }
+
+    return IMPORT_TYPE_META.unknown.key;
+}
+
+function buildUniqueValues(values) {
+    return Array.from(new Set(values.map((value) => cleanString(value)).filter(Boolean)));
+}
+
+function buildTextVariants(value) {
+    const raw = cleanString(value);
+    const normalized = normalizeValue(raw);
+    const compact = compactValue(raw);
+    const digitGroups = raw.match(/\d{4,}/g) ?? [];
+
+    return buildUniqueValues([raw, normalized, compact, ...digitGroups]);
+}
+
+function mergeVariantLists(...lists) {
+    const merged = [];
+
+    lists.forEach((list) => {
+        if (!Array.isArray(list)) {
+            return;
+        }
+
+        list.forEach((value) => {
+            const safeValue = cleanString(value);
+            if (safeValue) {
+                merged.push(safeValue);
+            }
+        });
+    });
+
+    return buildUniqueValues(merged);
+}
+
+function detectTradingAccount(rows, headers, fileName, type) {
+    const accountIdFromRows = sanitizeTradingAccountValue(
+        getFirstNonEmptyValue(rows, TRADING_ACCOUNT_ID_KEYS)
+    );
+
+    const accountNameFromRows = sanitizeTradingAccountValue(
+        getFirstNonEmptyValue(rows, TRADING_ACCOUNT_NAME_KEYS)
+    );
+
+    const genericAccountFromRows = sanitizeTradingAccountValue(
+        getFirstNonEmptyValue(rows, TYPE_ACCOUNT_KEYS[type] ?? GENERAL_ACCOUNT_KEYS)
+    );
+
+    let fallbackFromHeader = "";
+    const headerNames = headers.map((header) => cleanString(header));
+
+    for (const header of headerNames) {
+        const normalizedHeader = normalizeValue(header);
+
+        if (normalizedHeader.includes("account")) {
+            const value = sanitizeTradingAccountValue(
+                getFirstNonEmptyValue(rows, [header])
+            );
+
+            if (value) {
+                fallbackFromHeader = value;
+                break;
+            }
+        }
+    }
+
+    const accountFromFileName = extractAccountFromFileName(fileName);
+
+    const accountId = accountIdFromRows || "";
+    let accountName = accountNameFromRows || "";
+
+    if (!accountName && genericAccountFromRows && genericAccountFromRows !== accountId) {
+        accountName = genericAccountFromRows;
+    }
+
+    if (!accountName && fallbackFromHeader && fallbackFromHeader !== accountId) {
+        accountName = fallbackFromHeader;
+    }
+
+    const accountKey =
+        accountId ||
+        accountName ||
+        genericAccountFromRows ||
+        fallbackFromHeader ||
+        accountFromFileName ||
+        "";
+
+    const displayValue = accountName || accountId || accountKey || "";
+
+    let source = "none";
+
+    if (accountIdFromRows) {
+        source = "csv-row:account-id";
+    } else if (accountNameFromRows) {
+        source = "csv-row:account-name";
+    } else if (genericAccountFromRows || fallbackFromHeader) {
+        source = "csv-row";
+    } else if (accountFromFileName) {
+        source = "file-name";
+    }
+
+    return {
+        value: displayValue,
+        source,
+        variants: mergeVariantLists(
+            buildTextVariants(accountId),
+            buildTextVariants(accountName),
+            buildTextVariants(accountKey),
+            buildTextVariants(displayValue)
+        ),
+        accountId,
+        accountName,
+        accountKey,
+    };
+}
+
+function buildAccountMatchIndex(account) {
+    const tradingAccountId = cleanString(account?.tradingAccountId);
+    const tradingAccountName = cleanString(account?.tradingAccountName);
+    const tradingAccountKey = cleanString(account?.tradingAccountKey);
+    const displayName = cleanString(account?.displayName);
+    const id = cleanString(account?.id);
+
+    return {
+        tradingAccountId,
+        tradingAccountName,
+        tradingAccountKey,
+        displayName,
+        id,
+        tradingAccountIdVariants: buildTextVariants(tradingAccountId),
+        tradingAccountNameVariants: buildTextVariants(tradingAccountName),
+        tradingAccountKeyVariants: buildTextVariants(tradingAccountKey),
+        displayNameVariants: buildTextVariants(displayName),
+        idVariants: buildTextVariants(id),
+    };
+}
+
+function scoreVariantMatch(sourceVariants, targetVariants) {
+    if (!sourceVariants.length || !targetVariants.length) {
+        return 0;
+    }
+
+    for (const source of sourceVariants) {
+        for (const target of targetVariants) {
+            if (!source || !target) {
+                continue;
+            }
+
+            if (source === target) {
+                return 100;
+            }
+        }
+    }
+
+    for (const source of sourceVariants) {
+        for (const target of targetVariants) {
+            if (!source || !target) {
+                continue;
+            }
+
+            if (source.length >= 6 && target.includes(source)) {
+                return 80;
+            }
+
+            if (target.length >= 6 && source.includes(target)) {
+                return 80;
+            }
+        }
+    }
+
+    return 0;
+}
+
+function getPriorityByReason(reason) {
+    return MATCH_PRIORITY[reason] ?? -1;
+}
+
+function createMatchEntry(account, score, reason, confidence) {
+    return {
+        account,
+        score,
+        reason,
+        confidence,
+        priority: getPriorityByReason(reason),
+    };
+}
+
+function compareMatchEntries(left, right) {
+    if (right.priority !== left.priority) {
+        return right.priority - left.priority;
+    }
+
+    if (right.score !== left.score) {
+        return right.score - left.score;
+    }
+
+    const leftName = cleanString(left?.account?.displayName);
+    const rightName = cleanString(right?.account?.displayName);
+
+    return leftName.localeCompare(rightName);
+}
+
+function scoreAccountMatch(account, detection, activeAccountId) {
+    const index = buildAccountMatchIndex(account);
+    const sourceVariants = detection.variants ?? [];
+    const candidates = [];
+
+    const idScore = scoreVariantMatch(sourceVariants, index.tradingAccountIdVariants);
+    if (idScore > 0) {
+        candidates.push(
+            createMatchEntry(
+                account,
+                idScore + 20,
+                "tradingAccountId",
+                idScore >= 100 ? "high" : "medium"
+            )
+        );
+    }
+
+    const nameScore = scoreVariantMatch(sourceVariants, index.tradingAccountNameVariants);
+    if (nameScore > 0) {
+        candidates.push(
+            createMatchEntry(
+                account,
+                nameScore + 10,
+                "tradingAccountName",
+                nameScore >= 100 ? "high" : "medium"
+            )
+        );
+    }
+
+    const keyScore = scoreVariantMatch(sourceVariants, index.tradingAccountKeyVariants);
+    if (keyScore > 0) {
+        candidates.push(
+            createMatchEntry(
+                account,
+                keyScore + 5,
+                "tradingAccountKey",
+                keyScore >= 100 ? "medium" : "low"
+            )
+        );
+    }
+
+    const displayNameScore = scoreVariantMatch(sourceVariants, index.displayNameVariants);
+    if (displayNameScore > 0) {
+        candidates.push(
+            createMatchEntry(
+                account,
+                displayNameScore,
+                "displayName",
+                displayNameScore >= 100 ? "medium" : "low"
+            )
+        );
+    }
+
+    const internalIdScore = scoreVariantMatch(sourceVariants, index.idVariants);
+    if (internalIdScore > 0) {
+        candidates.push(
+            createMatchEntry(
+                account,
+                internalIdScore,
+                "appAccountId",
+                "low"
+            )
+        );
+    }
+
+    if (
+        candidates.length === 0 &&
+        !detection.value &&
+        cleanString(activeAccountId) === cleanString(account?.id)
+    ) {
+        candidates.push(
+            createMatchEntry(
+                account,
+                15,
+                "activeAccountFallback",
+                "low"
+            )
+        );
+    }
+
+    if (candidates.length === 0) {
+        return {
+            account,
+            score: 0,
+            reason: "",
+            confidence: "none",
+            priority: -1,
+        };
+    }
+
+    candidates.sort(compareMatchEntries);
+    return candidates[0];
+}
+
+function matchAccountsByTradingAccount(accounts, detection, activeAccountId) {
+    const matches = accounts
+        .map((account) => scoreAccountMatch(account, detection, activeAccountId))
+        .filter((entry) => entry.score > 0)
+        .sort(compareMatchEntries);
+
+    const topMatch = matches[0] ?? null;
+    const secondMatch = matches[1] ?? null;
+
+    const hasConflict =
+        Boolean(topMatch) &&
+        Boolean(secondMatch) &&
+        topMatch.priority === secondMatch.priority &&
+        topMatch.score >= 70 &&
+        secondMatch.score >= 70 &&
+        Math.abs(topMatch.score - secondMatch.score) <= 5;
+
+    let suggestedTargetAccountId = "";
+    if (topMatch && !hasConflict) {
+        suggestedTargetAccountId = cleanString(topMatch.account?.id);
+    }
+
+    return {
+        matches,
+        topMatch,
+        hasConflict,
+        suggestedTargetAccountId,
+    };
+}
+
+function getStatusMeta(item) {
+    if (item.type === IMPORT_TYPE_META.unknown.key) {
+        return {
+            key: "unknown-type",
+            label: "Typ offen",
+            color: COLORS.warning,
+        };
+    }
+
+    if (item.accountConflict) {
+        return {
+            key: "conflict",
+            label: "Konflikt",
+            color: COLORS.danger,
+        };
+    }
+
+    if (!item.targetAccountId) {
+        return {
+            key: "target-open",
+            label: "Ziel offen",
+            color: COLORS.warning,
         };
     }
 
     return {
-        label: "Leer",
-        color: COLORS.warning,
-        border: "rgba(245, 158, 11, 0.35)",
-        background: "rgba(245, 158, 11, 0.12)",
+        key: "ready",
+        label: "Bereit",
+        color: COLORS.positive,
     };
 }
 
-function getNumberTone(value) {
-    const safeValue = toFiniteNumber(value, 0);
+function buildParsedImportPayload(item, targetAccount, provider) {
+    const normalizedProvider = normalizeProvider(provider);
+    const appAccountId = cleanString(targetAccount?.id || item.targetAccountId);
+    const appAccountName = cleanString(
+        targetAccount?.displayName ||
+        targetAccount?.name ||
+        targetAccount?.accountName ||
+        appAccountId
+    );
 
-    if (safeValue > 0) {
-        return COLORS.positive;
+    if (normalizedProvider === "atas") {
+        const atasAccountId = cleanString(
+            item?.tradingAccountId ||
+            item?.tradingAccount ||
+            ""
+        );
+
+        const atasAccountName = cleanString(
+            item?.tradingAccountName ||
+            item?.tradingAccount ||
+            atasAccountId
+        );
+
+        return {
+            type: item.type,
+            provider: normalizedProvider,
+            dataProvider: normalizedProvider,
+            providerLabel: formatProviderLabel(normalizedProvider),
+            fileName: item.file.name,
+            importedAt: new Date().toISOString(),
+            headers: item.headers,
+            rows: item.rows,
+            previewRows: item.previewRows,
+            rawText: item.file.rawText,
+            appAccountId,
+            appAccountName,
+            tradingAccountId: "",
+            tradingAccountName: "",
+            tradingAccountKey: "",
+            dataProviderAccountId: atasAccountId,
+            dataProviderAccountName: atasAccountName,
+            atasAccountId,
+            atasAccountName,
+            csvAccountRaw: cleanString(
+                item?.tradingAccount ||
+                item?.tradingAccountId ||
+                item?.tradingAccountName
+            ),
+        };
     }
 
-    if (safeValue < 0) {
-        return COLORS.danger;
-    }
+    const tradingAccountId = cleanString(
+        item?.tradingAccountId ||
+        targetAccount?.tradingAccountId ||
+        targetAccount?.apexId ||
+        targetAccount?.accountId ||
+        item?.tradingAccount ||
+        targetAccount?.displayName
+    );
 
-    return COLORS.text;
-}
+    const tradingAccountName = cleanString(
+        item?.tradingAccountName ||
+        targetAccount?.tradingAccountName ||
+        item?.tradingAccount ||
+        tradingAccountId ||
+        targetAccount?.displayName
+    );
 
-function resolveImportEntry(imports, sectionKey) {
-    if (!imports || typeof imports !== "object") {
-        return null;
-    }
+    const tradingAccountKey = cleanString(
+        targetAccount?.tradingAccountKey ||
+        compactValue(tradingAccountId || tradingAccountName)
+    );
 
-    if (sectionKey === "cashHistory") {
-        return imports.cashHistory || imports.dailySummary || null;
-    }
-
-    return imports[sectionKey] || null;
-}
-
-function buildScopedSectionData(imports, accountId) {
-    const buildOrdersData =
-        typeof csvImportUtils.buildOrdersData === "function"
-            ? csvImportUtils.buildOrdersData(imports, accountId)
-            : { entries: [] };
-
-    const buildFillsData =
-        typeof csvImportUtils.buildFillsData === "function"
-            ? csvImportUtils.buildFillsData(imports, accountId)
-            : { entries: [] };
-
-    const buildCashHistoryData =
-        typeof csvImportUtils.buildCashHistoryData === "function"
-            ? csvImportUtils.buildCashHistoryData(imports, accountId)
-            : typeof csvImportUtils.buildDailySummaryData === "function"
-                ? csvImportUtils.buildDailySummaryData(imports, accountId)
-                : { entries: [] };
-
-    const buildPerformanceData =
-        typeof csvImportUtils.buildPerformanceData === "function"
-            ? csvImportUtils.buildPerformanceData(imports, accountId)
-            : { entries: [], stats: { total: 0, totalPnl: 0 } };
-
-    const buildPositionHistoryData =
-        typeof csvImportUtils.buildPositionHistoryData === "function"
-            ? csvImportUtils.buildPositionHistoryData(imports, accountId)
-            : { entries: [], stats: { total: 0, totalPnl: 0 } };
+    const csvAccountRaw = cleanString(
+        item?.tradingAccount ||
+        item?.tradingAccountId ||
+        item?.tradingAccountName
+    );
 
     return {
-        orders: buildOrdersData,
-        trades: buildFillsData,
-        cashHistory: buildCashHistoryData,
-        performance: buildPerformanceData,
-        positionHistory: buildPositionHistoryData,
+        type: item.type,
+        provider: normalizedProvider,
+        dataProvider: normalizedProvider,
+        providerLabel: formatProviderLabel(normalizedProvider),
+        fileName: item.file.name,
+        importedAt: new Date().toISOString(),
+        headers: item.headers,
+        rows: item.rows,
+        previewRows: item.previewRows,
+        rawText: item.file.rawText,
+        appAccountId,
+        appAccountName,
+        tradingAccountId,
+        tradingAccountName,
+        tradingAccountKey,
+        dataProviderAccountId: tradingAccountId,
+        dataProviderAccountName: tradingAccountName,
+        tradovateAccountId: tradingAccountId,
+        tradovateAccountName: tradingAccountName,
+        csvAccountRaw,
     };
 }
 
-function getEntriesSignature(entries = []) {
-    const safeEntries = Array.isArray(entries) ? entries : [];
-
-    if (!safeEntries.length) {
-        return "0";
-    }
-
-    const first = safeEntries[0] || {};
-    const last = safeEntries[safeEntries.length - 1] || {};
-
-    return [
-        String(safeEntries.length),
-        cleanString(first.fillId || first.id || first.orderId || first.date || first.timestamp),
-        cleanString(last.fillId || last.id || last.orderId || last.date || last.timestamp),
-    ].join("|");
-}
-
-function applyCashHistorySnapshotToAccount(imports, accountId) {
-    const cleanAccountId = cleanString(accountId);
-
-    if (!cleanAccountId) {
-        return null;
-    }
-
-    const snapshot =
-        typeof csvImportUtils.deriveCashHistorySnapshot === "function"
-            ? csvImportUtils.deriveCashHistorySnapshot(imports, cleanAccountId)
-            : null;
-
-    if (!snapshot?.hasValues) {
-        return null;
-    }
-
-    updateAccount(cleanAccountId, {
-        accountSize: snapshot.accountSize,
-        startingBalance: snapshot.startingBalance,
-        currentBalance: snapshot.currentBalance,
-    });
-
-    return snapshot;
-}
-
-function saveParsedImportCompat(type, fileName, text, accountId) {
-    if (typeof csvImportUtils.saveParsedImport !== "function") {
+function assignImportToShape(shape, type, payload) {
+    if (type === "orders") {
+        shape.orders = payload;
         return;
     }
 
-    try {
-        csvImportUtils.saveParsedImport(type, fileName, text, accountId);
-    } catch (error) {
-        if (type === "cashHistory") {
-            csvImportUtils.saveParsedImport("dailySummary", fileName, text, accountId);
-            return;
-        }
-
-        throw error;
-    }
-}
-
-function clearParsedImportCompat(type, accountId) {
-    if (typeof csvImportUtils.clearParsedImport !== "function") {
+    if (type === "trades") {
+        shape.trades = payload;
         return;
-    }
-
-    try {
-        csvImportUtils.clearParsedImport(type, accountId);
-    } catch (error) {
-        if (type === "cashHistory") {
-            csvImportUtils.clearParsedImport("dailySummary", accountId);
-            return;
-        }
-
-        throw error;
     }
 
     if (type === "cashHistory") {
-        try {
-            csvImportUtils.clearParsedImport("dailySummary", accountId);
-        } catch {
-            return;
-        }
+        shape.cashHistory = payload;
+        shape.dailySummary = {
+            ...payload,
+            type: "dailySummary",
+        };
+        return;
+    }
+
+    if (type === "performance") {
+        shape.performance = payload;
+        return;
+    }
+
+    if (type === "positionHistory") {
+        shape.positionHistory = payload;
     }
 }
 
-function InfoCell({ label, value, note = "" }) {
-    return (
-        <div
-            style={{
-                border: `1px solid ${COLORS.border}`,
-                borderRadius: 14,
-                padding: 12,
-                background: "rgba(255, 255, 255, 0.02)",
-            }}
-        >
-            <div
-                style={{
-                    color: COLORS.muted,
-                    fontSize: 12,
-                    marginBottom: 6,
-                }}
-            >
-                {label}
-            </div>
-            <div
-                style={{
-                    color: COLORS.text,
-                    fontSize: 14,
-                    fontWeight: 700,
-                    wordBreak: "break-word",
-                }}
-            >
-                {value || "-"}
-            </div>
+function buildImportShape(type, payload, provider) {
+    const directShape = {};
+    assignImportToShape(directShape, type, payload);
 
-            {note ? (
-                <div
-                    style={{
-                        color: COLORS.muted,
-                        fontSize: 11,
-                        marginTop: 6,
-                        lineHeight: 1.4,
-                    }}
-                >
-                    {note}
-                </div>
-            ) : null}
-        </div>
+    if (!provider) {
+        return directShape;
+    }
+
+    return {
+        ...directShape,
+        [provider]: directShape,
+        byProvider: {
+            [provider]: directShape,
+        },
+        providers: {
+            [provider]: directShape,
+        },
+        importsByProvider: {
+            [provider]: directShape,
+        },
+    };
+}
+
+function getImportSummary(imports) {
+    const sections = [
+        { key: "orders", label: "Orders" },
+        { key: "trades", label: "Fills" },
+        { key: "cashHistory", label: "Cash History" },
+        { key: "performance", label: "Performance" },
+        { key: "positionHistory", label: "Position History" },
+    ];
+
+    return sections.map((section) => {
+        const entry = imports?.[section.key];
+        const rows = Array.isArray(entry?.rows) ? entry.rows.length : 0;
+
+        return {
+            ...section,
+            fileName: cleanString(entry?.fileName),
+            importedAt: cleanString(entry?.importedAt),
+            rows,
+        };
+    });
+}
+
+function serializeImportsSignature(value) {
+    return JSON.stringify(
+        value ?? {},
+        (key, currentValue) => {
+            if (Array.isArray(currentValue)) {
+                return `array:${currentValue.length}`;
+            }
+
+            return currentValue;
+        }
     );
 }
 
-function MetricCell({ label, value, note = "", color = COLORS.text }) {
-    return (
-        <div
-            style={{
-                border: `1px solid ${COLORS.border}`,
-                borderRadius: 16,
-                padding: 14,
-                background: "rgba(255, 255, 255, 0.02)",
-            }}
-        >
-            <div
-                style={{
-                    color: COLORS.muted,
-                    fontSize: 12,
-                    marginBottom: 8,
-                }}
-            >
-                {label}
-            </div>
-            <div
-                style={{
-                    color,
-                    fontSize: 24,
-                    fontWeight: 700,
-                    lineHeight: 1.1,
-                }}
-            >
-                {value}
-            </div>
-
-            {note ? (
-                <div
-                    style={{
-                        color: COLORS.muted,
-                        fontSize: 11,
-                        marginTop: 8,
-                        lineHeight: 1.4,
-                    }}
-                >
-                    {note}
-                </div>
-            ) : null}
-        </div>
-    );
+function buildAccountsSignature(accounts) {
+    return accounts
+        .map((account) =>
+            [
+                cleanString(account?.id),
+                cleanString(account?.displayName),
+                cleanString(account?.tradingAccountId),
+                cleanString(account?.tradingAccountName),
+                cleanString(account?.tradingAccountKey),
+                cleanString(account?.provider),
+                cleanString(account?.accountPhase),
+                cleanString(account?.productType),
+                cleanString(account?.accountSize),
+                cleanString(account?.startingBalance),
+                cleanString(account?.currentBalance),
+                cleanString(account?.dataProvider),
+                cleanString(account?.dataProviderAccountId),
+                cleanString(account?.dataProviderAccountName),
+                cleanString(account?.atasAccountId),
+                cleanString(account?.atasAccountName),
+            ].join("|")
+        )
+        .join("||");
 }
 
-function PerformanceControlBlock({
-    accountId,
-    journalAnalytics,
-    performanceData,
-    positionHistoryData,
+function getImportCenterSnapshot() {
+    const accounts = Array.isArray(getAccounts()) ? getAccounts() : [];
+    const activeAccountId = cleanString(getActiveAccountId());
+    const activeAccount =
+        accounts.find((account) => cleanString(account.id) === activeAccountId) ?? null;
+    const activeImports = activeAccountId ? getCsvImports(activeAccountId) : null;
+
+    const signature = [
+        activeAccountId,
+        buildAccountsSignature(accounts),
+        serializeImportsSignature(activeImports),
+    ].join("###");
+
+    if (signature === cachedImportCenterSnapshotSignature) {
+        return cachedImportCenterSnapshotValue;
+    }
+
+    cachedImportCenterSnapshotSignature = signature;
+    cachedImportCenterSnapshotValue = {
+        accounts,
+        activeAccountId,
+        activeAccount,
+        activeImports,
+    };
+
+    return cachedImportCenterSnapshotValue;
+}
+
+function resolveImportCenterAccountLabel(account, provider) {
+    if (!account) {
+        return "Keiner gewählt";
+    }
+
+    if (shouldUseAtasZeroState(account, null, provider)) {
+        return "Kein ATAS Account";
+    }
+
+    return cleanString(
+        getStrictProviderDisplayName(account, null, provider)
+    ) || cleanString(account?.displayName) || "Keiner gewählt";
+}
+
+async function readFileAsText(file) {
+    return file.text();
+}
+
+export default function ImportCenterPanel({
+    account = null,
+    activeAccount: activeAccountProp = null,
+    provider: providerProp = "",
+    activeProvider = "",
+    localImports = null,
+    parentImports = null,
+    effectiveImports = null,
 }) {
-    const cleanAccountId = cleanString(accountId);
-
-    const journalGrossPnl = toFiniteNumber(journalAnalytics?.summary?.grossPnl, 0);
-    const journalNetPnl = toFiniteNumber(journalAnalytics?.summary?.netPnl, 0);
-    const journalCommission = toFiniteNumber(journalAnalytics?.summary?.commissions, 0);
-    const journalTradeCount = toFiniteNumber(
-        journalAnalytics?.summary?.closedTradeCount,
-        0
+    const storageSnapshot = useSyncExternalStore(
+        subscribeStorage,
+        getImportCenterSnapshot,
+        () => EMPTY_IMPORT_CENTER_SNAPSHOT
     );
 
-    const performanceRowCount = toFiniteNumber(performanceData?.stats?.total, 0);
-    const performanceTotalPnl = toFiniteNumber(performanceData?.stats?.totalPnl, 0);
+    const {
+        accounts,
+        activeAccountId: storageActiveAccountId,
+        activeAccount: storageActiveAccount,
+        activeImports,
+    } = storageSnapshot;
 
-    const positionHistoryRowCount = toFiniteNumber(
-        positionHistoryData?.stats?.total,
-        0
+    const resolvedActiveAccount =
+        activeAccountProp ||
+        account ||
+        storageActiveAccount ||
+        null;
+
+    const resolvedActiveAccountId = cleanString(
+        resolvedActiveAccount?.id || storageActiveAccountId
     );
-    const positionHistoryTotalPnl = toFiniteNumber(
-        positionHistoryData?.stats?.totalPnl,
-        0
+
+    const provider = useMemo(() => {
+        return resolvePanelProvider(
+            {
+                provider: providerProp,
+                activeProvider,
+            },
+            resolvedActiveAccount
+        );
+    }, [providerProp, activeProvider, resolvedActiveAccount]);
+
+    const providerLabel = useMemo(() => {
+        return formatProviderLabel(provider);
+    }, [provider]);
+
+    const isAtasZeroState = useMemo(() => {
+        return shouldUseAtasZeroState(
+            resolvedActiveAccount,
+            null,
+            getActiveProvider(resolvedActiveAccount, null, provider)
+        );
+    }, [resolvedActiveAccount, provider]);
+
+    const activeProviderAccountLabel = useMemo(() => {
+        return resolveImportCenterAccountLabel(resolvedActiveAccount, provider);
+    }, [resolvedActiveAccount, provider]);
+
+    const scopedActiveImports = useMemo(() => {
+        if (isAtasZeroState) {
+            return {};
+        }
+
+        return resolveImportsForProvider(
+            provider,
+            effectiveImports,
+            localImports,
+            resolvedActiveAccount?.imports,
+            activeImports,
+            parentImports
+        );
+    }, [
+        provider,
+        effectiveImports,
+        localImports,
+        resolvedActiveAccount?.imports,
+        activeImports,
+        parentImports,
+        isAtasZeroState,
+    ]);
+
+    const [batchItems, setBatchItems] = useState([]);
+    const [selectedBatchId, setSelectedBatchId] = useState("");
+    const [statusBanner, setStatusBanner] = useState(null);
+    const [isReadingFiles, setIsReadingFiles] = useState(false);
+    const [isImporting, setIsImporting] = useState(false);
+
+    const activeImportSummary = useMemo(() => {
+        return getImportSummary(scopedActiveImports);
+    }, [scopedActiveImports]);
+
+    const selectedItem = useMemo(() => {
+        if (!selectedBatchId) {
+            return batchItems[0] ?? null;
+        }
+
+        return batchItems.find((item) => item.id === selectedBatchId) ?? batchItems[0] ?? null;
+    }, [batchItems, selectedBatchId]);
+
+    const readyCount = useMemo(() => {
+        return batchItems.filter((item) => getStatusMeta(item).key === "ready").length;
+    }, [batchItems]);
+
+    const applyImportItems = useCallback(
+        (items) => {
+            let importedCount = 0;
+            const normalizedProvider = normalizeProvider(provider);
+
+            items.forEach((item) => {
+                const existingAccount =
+                    accounts.find(
+                        (entry) => cleanString(entry.id) === cleanString(item.targetAccountId)
+                    ) ?? null;
+
+                if (!existingAccount) {
+                    return;
+                }
+
+                const payload = buildParsedImportPayload(item, existingAccount, normalizedProvider);
+                const importShape = buildImportShape(item.type, payload, normalizedProvider);
+
+                const scopeTradingAccountId =
+                    normalizedProvider === "atas"
+                        ? cleanString(
+                            payload.dataProviderAccountId ||
+                            payload.dataProviderAccountName ||
+                            item.tradingAccountId ||
+                            item.tradingAccountName ||
+                            item.tradingAccount
+                        )
+                        : cleanString(
+                            payload.tradingAccountId ||
+                            payload.tradingAccountName ||
+                            existingAccount.tradingAccountId ||
+                            existingAccount.displayName
+                        );
+
+                saveParsedCsvImport(item.targetAccountId, item.type, payload, normalizedProvider);
+
+                if (item.type === "orders") {
+                    const ordersData = callImportBuilder(
+                        "buildOrdersData",
+                        importShape,
+                        scopeTradingAccountId,
+                        normalizedProvider
+                    );
+                    syncImportedOrders(item.targetAccountId, ordersData.entries);
+                }
+
+                if (item.type === "trades") {
+                    const fillsData = callImportBuilder(
+                        "buildFillsData",
+                        importShape,
+                        scopeTradingAccountId,
+                        normalizedProvider
+                    );
+                    syncImportedFills(item.targetAccountId, fillsData.entries);
+                }
+
+                const nextAccountPatch = {
+                    dataProvider: normalizedProvider,
+                };
+
+                if (normalizedProvider === "atas") {
+                    const nextAtasAccountId = cleanString(
+                        payload.dataProviderAccountId || payload.atasAccountId
+                    );
+                    const nextAtasAccountName = cleanString(
+                        payload.dataProviderAccountName || payload.atasAccountName
+                    );
+
+                    if (
+                        nextAtasAccountId &&
+                        nextAtasAccountId !== cleanString(existingAccount.atasAccountId)
+                    ) {
+                        nextAccountPatch.atasAccountId = nextAtasAccountId;
+                        nextAccountPatch.dataProviderAccountId = nextAtasAccountId;
+                    }
+
+                    if (
+                        nextAtasAccountName &&
+                        nextAtasAccountName !== cleanString(existingAccount.atasAccountName)
+                    ) {
+                        nextAccountPatch.atasAccountName = nextAtasAccountName;
+                        nextAccountPatch.dataProviderAccountName = nextAtasAccountName;
+                    }
+                } else {
+                    if (
+                        payload.tradingAccountId &&
+                        payload.tradingAccountId !== cleanString(existingAccount.tradingAccountId)
+                    ) {
+                        nextAccountPatch.tradingAccountId = payload.tradingAccountId;
+                        nextAccountPatch.dataProviderAccountId = payload.tradingAccountId;
+                    }
+
+                    if (
+                        payload.tradingAccountName &&
+                        payload.tradingAccountName !== cleanString(existingAccount.tradingAccountName)
+                    ) {
+                        nextAccountPatch.tradingAccountName = payload.tradingAccountName;
+                        nextAccountPatch.dataProviderAccountName = payload.tradingAccountName;
+                    }
+
+                    if (
+                        payload.tradingAccountKey &&
+                        payload.tradingAccountKey !== cleanString(existingAccount.tradingAccountKey)
+                    ) {
+                        nextAccountPatch.tradingAccountKey = payload.tradingAccountKey;
+                    }
+                }
+
+                if (item.type === "cashHistory") {
+                    const cashHistoryData = callImportBuilder(
+                        "buildCashHistoryData",
+                        importShape,
+                        scopeTradingAccountId,
+                        normalizedProvider
+                    );
+                    syncImportedCashHistory(item.targetAccountId, cashHistoryData.entries);
+
+                    const snapshot = callDeriveCashHistorySnapshot(
+                        importShape,
+                        scopeTradingAccountId,
+                        normalizedProvider
+                    );
+
+                    if (snapshot && snapshot.hasValues) {
+                        const nextStartingBalance =
+                            snapshot.startingBalance > 0
+                                ? snapshot.startingBalance
+                                : Number(existingAccount.startingBalance || 0);
+
+                        const nextCurrentBalance =
+                            snapshot.currentBalance > 0
+                                ? snapshot.currentBalance
+                                : Number(existingAccount.currentBalance || 0);
+
+                        const nextAccountSize =
+                            snapshot.accountSize > 0
+                                ? snapshot.accountSize
+                                : Number(existingAccount.accountSize || 0);
+
+                        nextAccountPatch.startingBalance = nextStartingBalance;
+                        nextAccountPatch.currentBalance = nextCurrentBalance;
+                        nextAccountPatch.accountSize = nextAccountSize;
+                    }
+                }
+
+                if (existingAccount && Object.keys(nextAccountPatch).length > 0) {
+                    updateAccount(item.targetAccountId, nextAccountPatch);
+                }
+
+                importedCount += 1;
+            });
+
+            return {
+                importedCount,
+            };
+        },
+        [accounts, provider]
     );
 
-    const deltaPerformanceToGross = performanceTotalPnl - journalGrossPnl;
-    const deltaPerformanceToNet = performanceTotalPnl - journalNetPnl;
-    const deltaPositionHistoryToGross = positionHistoryTotalPnl - journalGrossPnl;
+    const addFilesToBatch = useCallback(
+        async (fileList) => {
+            const incomingFiles = Array.from(fileList ?? []).filter(
+                (file) => file && file.name.toLowerCase().endsWith(".csv")
+            );
 
-    const hasComparisonData =
-        journalTradeCount > 0 || performanceRowCount > 0 || positionHistoryRowCount > 0;
+            if (incomingFiles.length === 0) {
+                setStatusBanner({
+                    type: "warning",
+                    title: "Keine CSV erkannt",
+                    text: "Bitte wähle eine oder mehrere CSV Dateien.",
+                });
+                return;
+            }
+
+            setIsReadingFiles(true);
+            setStatusBanner(null);
+
+            try {
+                const nextItems = await Promise.all(
+                    incomingFiles.map(async (file, index) => {
+                        const rawText = await readFileAsText(file);
+                        const parsed = parseCsvText(rawText);
+                        const type = detectImportType(file.name, parsed.headers);
+                        const detection = detectTradingAccount(
+                            parsed.rows,
+                            parsed.headers,
+                            file.name,
+                            type
+                        );
+                        const matchResult = matchAccountsByTradingAccount(
+                            accounts,
+                            detection,
+                            resolvedActiveAccountId
+                        );
+
+                        const fallbackTarget =
+                            matchResult.suggestedTargetAccountId || resolvedActiveAccountId || "";
+
+                        return {
+                            id: `${Date.now()}-${index}-${file.name}`,
+                            provider,
+                            providerLabel,
+                            file: {
+                                name: file.name,
+                                size: file.size,
+                                rawText,
+                            },
+                            type,
+                            headers: parsed.headers,
+                            rows: parsed.rows,
+                            previewRows: parsed.previewRows,
+                            tradingAccount: detection.value,
+                            tradingAccountSource: detection.source,
+                            tradingAccountId: detection.accountId,
+                            tradingAccountName: detection.accountName,
+                            tradingAccountKey: detection.accountKey,
+                            matchedAccounts: matchResult.matches,
+                            accountConflict: matchResult.hasConflict,
+                            targetAccountId: fallbackTarget,
+                            importedAt: new Date().toISOString(),
+                        };
+                    })
+                );
+
+                const autoImportItems = nextItems.filter((item) => {
+                    return (
+                        Boolean(resolvedActiveAccountId) &&
+                        getStatusMeta(item).key === "ready" &&
+                        cleanString(item.targetAccountId) === cleanString(resolvedActiveAccountId)
+                    );
+                });
+
+                const reviewItems = nextItems.filter((item) => {
+                    return !autoImportItems.some((autoItem) => autoItem.id === item.id);
+                });
+
+                let autoImportResult = {
+                    importedCount: 0,
+                };
+
+                if (autoImportItems.length > 0) {
+                    autoImportResult = applyImportItems(autoImportItems);
+                }
+
+                setBatchItems((current) => [...current, ...reviewItems]);
+                setSelectedBatchId((current) => {
+                    if (current) {
+                        return current;
+                    }
+
+                    return reviewItems[0]?.id || "";
+                });
+
+                if (autoImportResult.importedCount > 0 && reviewItems.length === 0) {
+                    setStatusBanner({
+                        type: "success",
+                        title: "Schnellimport fertig",
+                        text: `${autoImportResult.importedCount} Datei(en) direkt in den aktiven Account importiert.`,
+                    });
+                } else if (autoImportResult.importedCount > 0 && reviewItems.length > 0) {
+                    setStatusBanner({
+                        type: "success",
+                        title: "Schnellimport teilweise fertig",
+                        text: `${autoImportResult.importedCount} Datei(en) direkt importiert. ${reviewItems.length} Datei(en) bleiben in der Prüfliste.`,
+                    });
+                } else {
+                    setStatusBanner({
+                        type: "success",
+                        title: "Dateien geprüft",
+                        text: `${reviewItems.length} Datei(en) zur Prüfliste hinzugefügt.`,
+                    });
+                }
+            } catch (error) {
+                setStatusBanner({
+                    type: "error",
+                    title: "Lesefehler",
+                    text: cleanString(error?.message) || "Dateien konnten nicht gelesen werden.",
+                });
+            } finally {
+                setIsReadingFiles(false);
+            }
+        },
+        [accounts, resolvedActiveAccountId, applyImportItems, provider, providerLabel]
+    );
+
+    const handleFileSelection = useCallback(
+        async (event) => {
+            const files = event.target.files;
+            await addFilesToBatch(files);
+            event.target.value = "";
+        },
+        [addFilesToBatch]
+    );
+
+    const handleDrop = useCallback(
+        async (event) => {
+            event.preventDefault();
+            await addFilesToBatch(event.dataTransfer?.files);
+        },
+        [addFilesToBatch]
+    );
+
+    const handleDragOver = useCallback((event) => {
+        event.preventDefault();
+    }, []);
+
+    const updateBatchTarget = useCallback((itemId, targetAccountId) => {
+        setBatchItems((current) =>
+            current.map((item) =>
+                item.id === itemId
+                    ? {
+                        ...item,
+                        targetAccountId,
+                        accountConflict: false,
+                    }
+                    : item
+            )
+        );
+    }, []);
+
+    const removeBatchItem = useCallback((itemId) => {
+        setBatchItems((current) => current.filter((item) => item.id !== itemId));
+        setSelectedBatchId((current) => (current === itemId ? "" : current));
+    }, []);
+
+    const clearBatch = useCallback(() => {
+        setBatchItems([]);
+        setSelectedBatchId("");
+        setStatusBanner({
+            type: "success",
+            title: "Prüfliste geleert",
+            text: "Alle offenen Dateien wurden entfernt.",
+        });
+    }, []);
+
+    const resetActiveAccountImports = useCallback(() => {
+        if (!resolvedActiveAccountId) {
+            setStatusBanner({
+                type: "warning",
+                title: "Kein aktiver Account",
+                text: "Wähle zuerst einen App Account.",
+            });
+            return;
+        }
+
+        clearImportedOrders(resolvedActiveAccountId);
+        clearImportedFills(resolvedActiveAccountId);
+        clearCashHistory(resolvedActiveAccountId);
+        clearParsedCsvImport(resolvedActiveAccountId, "orders", provider);
+        clearParsedCsvImport(resolvedActiveAccountId, "trades", provider);
+        clearParsedCsvImport(resolvedActiveAccountId, "cashHistory", provider);
+        clearParsedCsvImport(resolvedActiveAccountId, "performance", provider);
+        clearParsedCsvImport(resolvedActiveAccountId, "positionHistory", provider);
+
+        setStatusBanner({
+            type: "success",
+            title: "Imports gelöscht",
+            text: `Der aktive ${providerLabel} Import wurde zurückgesetzt.`,
+        });
+    }, [resolvedActiveAccountId, provider, providerLabel]);
+
+    const importBatch = useCallback(async () => {
+        const readyItems = batchItems.filter((item) => getStatusMeta(item).key === "ready");
+
+        if (readyItems.length === 0) {
+            setStatusBanner({
+                type: "warning",
+                title: "Nichts importierbar",
+                text: "Prüfe Typ und Ziel Account in der Liste.",
+            });
+            return;
+        }
+
+        setIsImporting(true);
+        setStatusBanner(null);
+
+        try {
+            const result = applyImportItems(readyItems);
+            const skippedCount = batchItems.length - readyItems.length;
+
+            setBatchItems((current) =>
+                current.filter((item) => getStatusMeta(item).key !== "ready")
+            );
+            setSelectedBatchId("");
+
+            setStatusBanner({
+                type: "success",
+                title: "Offene Imports fertig",
+                text:
+                    skippedCount > 0
+                        ? `${result.importedCount} Datei(en) importiert. ${skippedCount} Datei(en) bleiben offen.`
+                        : `${result.importedCount} Datei(en) importiert.`,
+            });
+        } catch (error) {
+            setStatusBanner({
+                type: "error",
+                title: "Importfehler",
+                text: cleanString(error?.message) || "Der Import ist fehlgeschlagen.",
+            });
+        } finally {
+            setIsImporting(false);
+        }
+    }, [applyImportItems, batchItems]);
 
     return (
-        <div
+        <section
             style={{
+                background: COLORS.panelBg,
                 border: `1px solid ${COLORS.border}`,
                 borderRadius: 18,
-                padding: 16,
-                background: "rgba(125, 211, 252, 0.05)",
-                display: "grid",
-                gap: 14,
-            }}
-        >
-            <div>
-                <div
-                    style={{
-                        color: COLORS.title,
-                        fontSize: 16,
-                        fontWeight: 700,
-                        marginBottom: 6,
-                    }}
-                >
-                    Performance Kontrollblock
-                </div>
-                <div
-                    style={{
-                        color: COLORS.muted,
-                        fontSize: 13,
-                        lineHeight: 1.45,
-                    }}
-                >
-                    Abgleich für Account {cleanAccountId || "kein Account gewählt"}.
-                    Journal Gross und Net kommen aus den Fills. Performance und Position History kommen direkt aus der CSV.
-                </div>
-            </div>
-
-            {!hasComparisonData ? (
-                <div
-                    style={{
-                        border: `1px dashed ${COLORS.borderStrong}`,
-                        borderRadius: 14,
-                        padding: 14,
-                        color: COLORS.muted,
-                        fontSize: 13,
-                    }}
-                >
-                    Noch keine Daten für den Performance Abgleich vorhanden.
-                </div>
-            ) : (
-                <>
-                    <div
-                        style={{
-                            display: "grid",
-                            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                            gap: 10,
-                        }}
-                    >
-                        <MetricCell
-                            label="Journal Gross PnL"
-                            value={formatMoney(journalGrossPnl)}
-                            color={getNumberTone(journalGrossPnl)}
-                            note="Aus Fills berechnet"
-                        />
-                        <MetricCell
-                            label="Journal Commission"
-                            value={formatMoney(journalCommission)}
-                            color={getNumberTone(-Math.abs(journalCommission))}
-                            note="Gebühren aus Fills"
-                        />
-                        <MetricCell
-                            label="Journal Net PnL"
-                            value={formatMoney(journalNetPnl)}
-                            color={getNumberTone(journalNetPnl)}
-                            note="Gross minus Commission"
-                        />
-                        <MetricCell
-                            label="Performance CSV P/L"
-                            value={formatMoney(performanceTotalPnl)}
-                            color={getNumberTone(performanceTotalPnl)}
-                            note={`Rows: ${formatCount(performanceRowCount)}`}
-                        />
-                        <MetricCell
-                            label="Position History P/L"
-                            value={formatMoney(positionHistoryTotalPnl)}
-                            color={getNumberTone(positionHistoryTotalPnl)}
-                            note={`Rows: ${formatCount(positionHistoryRowCount)}`}
-                        />
-                        <MetricCell
-                            label="Journal Closed Trades"
-                            value={formatCount(journalTradeCount)}
-                            color={COLORS.text}
-                            note="Anzahl geschlossener Trades"
-                        />
-                    </div>
-
-                    <div
-                        style={{
-                            display: "grid",
-                            gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-                            gap: 10,
-                        }}
-                    >
-                        <InfoCell
-                            label="Delta Performance zu Journal Gross"
-                            value={formatMoney(deltaPerformanceToGross)}
-                            note="0.00 bedeutet gleicher Wert"
-                        />
-                        <InfoCell
-                            label="Delta Performance zu Journal Net"
-                            value={formatMoney(deltaPerformanceToNet)}
-                            note="Hilft bei Brutto oder Netto Vergleich"
-                        />
-                        <InfoCell
-                            label="Delta Position History zu Journal Gross"
-                            value={formatMoney(deltaPositionHistoryToGross)}
-                            note="0.00 bedeutet gleicher Gross Wert"
-                        />
-                    </div>
-                </>
-            )}
-        </div>
-    );
-}
-
-function SectionCard({
-    section,
-    accountId,
-    importEntry,
-    accountScopedCount,
-    onUpload,
-    onReset,
-    snapshot,
-    extraContent = null,
-}) {
-    const hasData = Array.isArray(importEntry?.rows) && importEntry.rows.length > 0;
-    const status = getStatusMeta(hasData);
-    const headers = Array.isArray(importEntry?.headers) ? importEntry.headers.slice(0, 6) : [];
-    const previewRows = Array.isArray(importEntry?.previewRows)
-        ? importEntry.previewRows.slice(0, 5)
-        : [];
-
-    const isCashHistory = section.key === "cashHistory";
-
-    return (
-        <div
-            style={{
-                background: COLORS.cardBg,
-                border: `1px solid ${COLORS.border}`,
-                borderRadius: 20,
                 padding: 18,
-                display: "grid",
-                gap: 14,
+                boxShadow: COLORS.shadow,
             }}
         >
             <div
@@ -550,6 +1848,7 @@ function SectionCard({
                     alignItems: "flex-start",
                     gap: 12,
                     flexWrap: "wrap",
+                    marginBottom: 16,
                 }}
             >
                 <div>
@@ -561,530 +1860,878 @@ function SectionCard({
                             marginBottom: 6,
                         }}
                     >
-                        {section.title}
+                        Import Center
                     </div>
                     <div
                         style={{
                             color: COLORS.muted,
                             fontSize: 13,
-                            lineHeight: 1.45,
+                            lineHeight: 1.5,
                         }}
                     >
-                        {section.description}
+                        Mehrfach Import mit starker Account Zuordnung pro Provider.
+                    </div>
+                    <div
+                        style={{
+                            color: COLORS.text,
+                            fontSize: 13,
+                            marginTop: 8,
+                        }}
+                    >
+                        Aktiver Provider Account:{" "}
+                        <span style={{ color: COLORS.title, fontWeight: 600 }}>
+                            {activeProviderAccountLabel}
+                        </span>
+                    </div>
+                    <div
+                        style={{
+                            color: COLORS.text,
+                            fontSize: 13,
+                            marginTop: 6,
+                        }}
+                    >
+                        Provider:{" "}
+                        <span
+                            style={{
+                                color: normalizeProvider(provider) === "atas"
+                                    ? COLORS.purple
+                                    : COLORS.cyan,
+                                fontWeight: 700,
+                            }}
+                        >
+                            {providerLabel}
+                        </span>
                     </div>
                 </div>
 
                 <div
                     style={{
-                        border: `1px solid ${status.border}`,
-                        background: status.background,
-                        color: status.color,
-                        borderRadius: 999,
-                        padding: "6px 12px",
-                        fontSize: 12,
-                        fontWeight: 700,
-                        whiteSpace: "nowrap",
+                        display: "flex",
+                        gap: 10,
+                        flexWrap: "wrap",
                     }}
                 >
-                    {status.label}
+                    <label
+                        style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            padding: "10px 14px",
+                            borderRadius: 12,
+                            border: `1px solid ${COLORS.buttonBorder}`,
+                            background: COLORS.buttonBg,
+                            color: COLORS.text,
+                            cursor: "pointer",
+                            fontSize: 13,
+                            fontWeight: 600,
+                        }}
+                    >
+                        CSV wählen
+                        <input
+                            type="file"
+                            accept=".csv"
+                            multiple
+                            onChange={handleFileSelection}
+                            style={{ display: "none" }}
+                        />
+                    </label>
+
+                    <button
+                        type="button"
+                        onClick={importBatch}
+                        disabled={isImporting || readyCount === 0}
+                        style={{
+                            padding: "10px 14px",
+                            borderRadius: 12,
+                            border: `1px solid ${COLORS.buttonBorder}`,
+                            background:
+                                isImporting || readyCount === 0
+                                    ? "rgba(148, 163, 184, 0.12)"
+                                    : "rgba(34, 197, 94, 0.18)",
+                            color: COLORS.text,
+                            cursor: isImporting || readyCount === 0 ? "not-allowed" : "pointer",
+                            fontSize: 13,
+                            fontWeight: 600,
+                        }}
+                    >
+                        {isImporting ? "Import läuft..." : `Offene Imports ${readyCount}`}
+                    </button>
+
+                    <button
+                        type="button"
+                        onClick={clearBatch}
+                        disabled={batchItems.length === 0}
+                        style={{
+                            padding: "10px 14px",
+                            borderRadius: 12,
+                            border: `1px solid ${COLORS.buttonBorder}`,
+                            background: COLORS.buttonBg,
+                            color: COLORS.text,
+                            cursor: batchItems.length === 0 ? "not-allowed" : "pointer",
+                            fontSize: 13,
+                            fontWeight: 600,
+                        }}
+                    >
+                        Prüfliste leeren
+                    </button>
+
+                    <button
+                        type="button"
+                        onClick={resetActiveAccountImports}
+                        disabled={!resolvedActiveAccountId}
+                        style={{
+                            padding: "10px 14px",
+                            borderRadius: 12,
+                            border: `1px solid ${COLORS.buttonBorder}`,
+                            background: "rgba(239, 68, 68, 0.12)",
+                            color: COLORS.text,
+                            cursor: !resolvedActiveAccountId ? "not-allowed" : "pointer",
+                            fontSize: 13,
+                            fontWeight: 600,
+                        }}
+                    >
+                        Aktiven Import löschen
+                    </button>
                 </div>
             </div>
 
-            <div
-                style={{
-                    display: "grid",
-                    gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
-                    gap: 10,
-                }}
-            >
-                <InfoCell label="Datei" value={importEntry?.fileName || "-"} />
-                <InfoCell
-                    label="Import Zeit"
-                    value={formatDateTime(importEntry?.importedAt)}
-                />
-                <InfoCell
-                    label="Aktiver App Account"
-                    value={cleanString(accountId) || "kein Account gewählt"}
-                    note="CSV Import geht in diesen Account"
-                />
-                <InfoCell
-                    label="Datensätze gesamt"
-                    value={formatCount(importEntry?.rows?.length || 0)}
-                />
-                <InfoCell
-                    label="Datensätze Account"
-                    value={
-                        cleanString(accountId)
-                            ? formatCount(accountScopedCount)
-                            : formatCount(importEntry?.rows?.length || 0)
-                    }
-                />
-            </div>
-
-            {isCashHistory && snapshot?.hasValues ? (
+            {statusBanner ? (
                 <div
                     style={{
-                        display: "grid",
-                        gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
-                        gap: 10,
+                        marginBottom: 16,
+                        borderRadius: 14,
+                        padding: 12,
+                        border: `1px solid ${statusBanner.type === "error"
+                            ? "rgba(239, 68, 68, 0.28)"
+                            : statusBanner.type === "warning"
+                                ? "rgba(245, 158, 11, 0.28)"
+                                : "rgba(34, 197, 94, 0.28)"
+                            }`,
+                        background:
+                            statusBanner.type === "error"
+                                ? "rgba(239, 68, 68, 0.08)"
+                                : statusBanner.type === "warning"
+                                    ? "rgba(245, 158, 11, 0.08)"
+                                    : "rgba(34, 197, 94, 0.08)",
                     }}
                 >
-                    <InfoCell
-                        label="Account Size"
-                        value={formatWholeNumber(snapshot.accountSize)}
-                    />
-                    <InfoCell
-                        label="Start Balance"
-                        value={formatWholeNumber(snapshot.startingBalance)}
-                    />
-                    <InfoCell
-                        label="Current Balance"
-                        value={formatWholeNumber(snapshot.currentBalance)}
-                    />
-                    <InfoCell
-                        label="Erste Zeile"
-                        value={snapshot.firstDate || "-"}
-                    />
-                    <InfoCell
-                        label="Letzte Zeile"
-                        value={snapshot.lastDate || "-"}
-                    />
+                    <div
+                        style={{
+                            color: COLORS.text,
+                            fontWeight: 700,
+                            marginBottom: 4,
+                        }}
+                    >
+                        {statusBanner.title}
+                    </div>
+                    <div
+                        style={{
+                            color: COLORS.muted,
+                            fontSize: 13,
+                        }}
+                    >
+                        {statusBanner.text}
+                    </div>
                 </div>
             ) : null}
 
-            {extraContent}
-
             <div
+                onDrop={handleDrop}
+                onDragOver={handleDragOver}
                 style={{
-                    display: "flex",
-                    gap: 10,
-                    flexWrap: "wrap",
+                    border: `1px dashed ${COLORS.borderStrong}`,
+                    borderRadius: 16,
+                    padding: 18,
+                    textAlign: "center",
+                    color: COLORS.muted,
+                    background: COLORS.cardBg,
+                    marginBottom: 16,
                 }}
             >
-                <label
-                    style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        minWidth: 160,
-                        background: COLORS.buttonBg,
-                        color: COLORS.buttonText,
-                        borderRadius: 14,
-                        padding: "12px 16px",
-                        fontWeight: 700,
-                        cursor: "pointer",
-                    }}
-                >
-                    CSV wählen
-                    <input
-                        type="file"
-                        accept=".csv,text/csv"
-                        style={{ display: "none" }}
-                        onChange={(event) => {
-                            const file = event.target.files?.[0] || null;
-                            onUpload(section.key, file);
-                            event.target.value = "";
-                        }}
-                    />
-                </label>
-
-                <button
-                    type="button"
-                    onClick={() => onReset(section.key)}
-                    style={{
-                        minWidth: 140,
-                        background: "transparent",
-                        color: COLORS.danger,
-                        border: `1px solid rgba(239, 68, 68, 0.35)`,
-                        borderRadius: 14,
-                        padding: "12px 16px",
-                        fontWeight: 700,
-                        cursor: "pointer",
-                    }}
-                >
-                    Reset
-                </button>
-            </div>
-
-            <div>
-                <div
-                    style={{
-                        color: COLORS.muted,
-                        fontSize: 12,
-                        marginBottom: 8,
-                    }}
-                >
-                    Vorschau
-                </div>
-
-                {headers.length === 0 || previewRows.length === 0 ? (
-                    <div
-                        style={{
-                            border: `1px dashed ${COLORS.borderStrong}`,
-                            borderRadius: 16,
-                            padding: 16,
-                            color: COLORS.muted,
-                            fontSize: 13,
-                        }}
-                    >
-                        Keine Vorschau vorhanden.
-                    </div>
-                ) : (
-                    <div
-                        style={{
-                            overflowX: "auto",
-                            border: `1px solid ${COLORS.border}`,
-                            borderRadius: 16,
-                        }}
-                    >
-                        <table
-                            style={{
-                                width: "100%",
-                                borderCollapse: "collapse",
-                                minWidth: 640,
-                            }}
-                        >
-                            <thead
-                                style={{
-                                    background: COLORS.headBg,
-                                }}
-                            >
-                                <tr>
-                                    {headers.map((header) => (
-                                        <th
-                                            key={header}
-                                            style={{
-                                                textAlign: "left",
-                                                padding: "12px 12px",
-                                                color: COLORS.muted,
-                                                fontSize: 12,
-                                                fontWeight: 700,
-                                                borderBottom: `1px solid ${COLORS.borderStrong}`,
-                                                whiteSpace: "nowrap",
-                                            }}
-                                        >
-                                            {header}
-                                        </th>
-                                    ))}
-                                </tr>
-                            </thead>
-
-                            <tbody>
-                                {previewRows.map((row, rowIndex) => (
-                                    <tr
-                                        key={`${section.key}-${rowIndex}`}
-                                        style={{
-                                            background:
-                                                rowIndex % 2 === 0
-                                                    ? "transparent"
-                                                    : "rgba(255, 255, 255, 0.03)",
-                                        }}
-                                    >
-                                        {headers.map((header) => (
-                                            <td
-                                                key={`${section.key}-${rowIndex}-${header}`}
-                                                style={{
-                                                    padding: "12px 12px",
-                                                    color: COLORS.text,
-                                                    fontSize: 13,
-                                                    borderBottom: `1px solid ${COLORS.border}`,
-                                                    verticalAlign: "top",
-                                                    wordBreak: "break-word",
-                                                }}
-                                            >
-                                                {cleanString(row?.[header]) || "-"}
-                                            </td>
-                                        ))}
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                    </div>
-                )}
-            </div>
-        </div>
-    );
-}
-
-export default function ImportCenterPanel({ accountId = "" }) {
-    const [imports, setImports] = useState(() => {
-        return typeof csvImportUtils.getAllParsedImports === "function"
-            ? csvImportUtils.getAllParsedImports(accountId)
-            : {};
-    });
-
-    const syncRef = useRef({
-        fills: "",
-        cashHistory: "",
-        orders: "",
-    });
-
-    useEffect(() => {
-        syncRef.current = {
-            fills: "",
-            cashHistory: "",
-            orders: "",
-        };
-    }, [accountId]);
-
-    useEffect(() => {
-        const eventName =
-            typeof csvImportUtils.getCsvImportEventName === "function"
-                ? csvImportUtils.getCsvImportEventName()
-                : "tradovate-csv-imports-updated";
-
-        const loadImports = () => {
-            const nextImports =
-                typeof csvImportUtils.getAllParsedImports === "function"
-                    ? csvImportUtils.getAllParsedImports(accountId)
-                    : {};
-
-            setImports(nextImports);
-        };
-
-        loadImports();
-
-        window.addEventListener(eventName, loadImports);
-        window.addEventListener("storage", loadImports);
-        window.addEventListener("focus", loadImports);
-
-        return () => {
-            window.removeEventListener(eventName, loadImports);
-            window.removeEventListener("storage", loadImports);
-            window.removeEventListener("focus", loadImports);
-        };
-    }, [accountId]);
-
-    const scopedData = useMemo(() => {
-        return buildScopedSectionData(imports, accountId);
-    }, [imports, accountId]);
-
-    const cashHistorySnapshot = useMemo(() => {
-        if (!cleanString(accountId)) {
-            return null;
-        }
-
-        if (typeof csvImportUtils.deriveCashHistorySnapshot !== "function") {
-            return null;
-        }
-
-        return csvImportUtils.deriveCashHistorySnapshot(imports, accountId);
-    }, [imports, accountId]);
-
-    const journalAnalytics = useMemo(() => {
-        const fillsEntries = Array.isArray(scopedData?.trades?.entries)
-            ? scopedData.trades.entries
-            : [];
-
-        return buildFillAnalytics({
-            fills: fillsEntries,
-            accountId,
-        });
-    }, [scopedData, accountId]);
-
-    useEffect(() => {
-        const cleanAccountId = cleanString(accountId);
-
-        if (!cleanAccountId) {
-            return;
-        }
-
-        const fillsEntry = resolveImportEntry(imports, "trades");
-        const fillsEntries = Array.isArray(scopedData?.trades?.entries)
-            ? scopedData.trades.entries
-            : [];
-        const fillsSignature = [
-            cleanAccountId,
-            cleanString(fillsEntry?.importedAt),
-            cleanString(fillsEntry?.fileName),
-            getEntriesSignature(fillsEntries),
-        ].join("|");
-
-        if (syncRef.current.fills !== fillsSignature) {
-            syncImportedFills(cleanAccountId, fillsEntries);
-            syncRef.current.fills = fillsSignature;
-        }
-
-        const ordersEntry = resolveImportEntry(imports, "orders");
-        const ordersEntries = Array.isArray(scopedData?.orders?.entries)
-            ? scopedData.orders.entries
-            : [];
-        const ordersSignature = [
-            cleanAccountId,
-            cleanString(ordersEntry?.importedAt),
-            cleanString(ordersEntry?.fileName),
-            getEntriesSignature(ordersEntries),
-        ].join("|");
-
-        if (syncRef.current.orders !== ordersSignature) {
-            syncImportedOrders(cleanAccountId, ordersEntries);
-            syncRef.current.orders = ordersSignature;
-        }
-
-        const cashEntry = resolveImportEntry(imports, "cashHistory");
-        const cashEntries = Array.isArray(scopedData?.cashHistory?.entries)
-            ? scopedData.cashHistory.entries
-            : [];
-        const cashSignature = [
-            cleanAccountId,
-            cleanString(cashEntry?.importedAt),
-            cleanString(cashEntry?.fileName),
-            getEntriesSignature(cashEntries),
-            String(cashHistorySnapshot?.accountSize || 0),
-            String(cashHistorySnapshot?.currentBalance || 0),
-        ].join("|");
-
-        if (syncRef.current.cashHistory !== cashSignature) {
-            syncImportedCashHistory(cleanAccountId, cashEntries);
-
-            if (cashHistorySnapshot?.hasValues) {
-                applyCashHistorySnapshotToAccount(imports, cleanAccountId);
-            }
-
-            syncRef.current.cashHistory = cashSignature;
-        }
-    }, [imports, scopedData, cashHistorySnapshot, accountId]);
-
-    async function handleUpload(type, file) {
-        if (!file) {
-            return;
-        }
-
-        const cleanAccountId = cleanString(accountId);
-
-        if (!cleanAccountId) {
-            return;
-        }
-
-        const text = await readFileAsText(file);
-        saveParsedImportCompat(type, file.name, text, cleanAccountId);
-
-        const nextImports =
-            typeof csvImportUtils.getAllParsedImports === "function"
-                ? csvImportUtils.getAllParsedImports(cleanAccountId)
-                : {};
-
-        setImports(nextImports);
-    }
-
-    function handleReset(type) {
-        const cleanAccountId = cleanString(accountId);
-
-        clearParsedImportCompat(type, cleanAccountId);
-
-        if (type === "cashHistory" && cleanAccountId) {
-            clearCashHistory(cleanAccountId);
-            syncRef.current.cashHistory = "";
-        }
-
-        if (type === "trades" && cleanAccountId) {
-            clearImportedFills(cleanAccountId);
-            syncRef.current.fills = "";
-        }
-
-        if (type === "orders" && cleanAccountId) {
-            clearImportedOrders(cleanAccountId);
-            syncRef.current.orders = "";
-        }
-
-        const nextImports =
-            typeof csvImportUtils.getAllParsedImports === "function"
-                ? csvImportUtils.getAllParsedImports(cleanAccountId)
-                : {};
-
-        setImports(nextImports);
-    }
-
-    const activeImportCount = IMPORT_SECTIONS.filter((section) => {
-        const importEntry = resolveImportEntry(imports, section.key);
-        return Array.isArray(importEntry?.rows) && importEntry.rows.length > 0;
-    }).length;
-
-    return (
-        <section
-            style={{
-                background: COLORS.panelBg,
-                border: `1px solid ${COLORS.border}`,
-                borderRadius: 24,
-                padding: 24,
-                boxShadow: COLORS.shadow,
-                color: COLORS.text,
-                width: "100%",
-            }}
-        >
-            <div
-                style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "flex-start",
-                    gap: 16,
-                    flexWrap: "wrap",
-                    marginBottom: 20,
-                }}
-            >
-                <div>
-                    <h2
-                        style={{
-                            margin: 0,
-                            color: COLORS.title,
-                            fontSize: 22,
-                            fontWeight: 700,
-                        }}
-                    >
-                        Import Center
-                    </h2>
-                    <div
-                        style={{
-                            color: COLORS.muted,
-                            marginTop: 8,
-                            fontSize: 13,
-                        }}
-                    >
-                        Dein echtes CSV Setup mit Orders, Fills, Account Balance History, Performance und Position History.
-                    </div>
-                </div>
-
-                <div
-                    style={{
-                        color: COLORS.muted,
-                        fontSize: 13,
-                        textAlign: "right",
-                    }}
-                >
-                    <div>Aktiver App Account: {cleanString(accountId) || "kein Account gewählt"}</div>
-                    <div>CSV Import geht in diesen Account</div>
-                    <div>Aktive Imports: {activeImportCount}</div>
-                </div>
+                {isReadingFiles
+                    ? "CSV Dateien werden gelesen..."
+                    : `Ziehe mehrere ${providerLabel} CSV Dateien hier hinein oder wähle sie oben aus.`}
             </div>
 
             <div
                 style={{
                     display: "grid",
+                    gridTemplateColumns: "1.35fr 1fr",
                     gap: 16,
                 }}
             >
-                {IMPORT_SECTIONS.map((section) => (
-                    <SectionCard
-                        key={section.key}
-                        section={section}
-                        accountId={accountId}
-                        importEntry={resolveImportEntry(imports, section.key)}
-                        accountScopedCount={scopedData?.[section.key]?.entries?.length || 0}
-                        onUpload={handleUpload}
-                        onReset={handleReset}
-                        snapshot={section.key === "cashHistory" ? cashHistorySnapshot : null}
-                        extraContent={
-                            section.key === "performance" ? (
-                                <PerformanceControlBlock
-                                    accountId={accountId}
-                                    journalAnalytics={journalAnalytics}
-                                    performanceData={scopedData?.performance}
-                                    positionHistoryData={scopedData?.positionHistory}
-                                />
-                            ) : null
-                        }
-                    />
-                ))}
+                <div
+                    style={{
+                        background: COLORS.cardBg,
+                        border: `1px solid ${COLORS.border}`,
+                        borderRadius: 16,
+                        padding: 14,
+                        minHeight: 320,
+                    }}
+                >
+                    <div
+                        style={{
+                            color: COLORS.title,
+                            fontSize: 14,
+                            fontWeight: 700,
+                            marginBottom: 12,
+                        }}
+                    >
+                        Prüfliste
+                    </div>
+
+                    {batchItems.length === 0 ? (
+                        <div
+                            style={{
+                                color: COLORS.muted,
+                                fontSize: 13,
+                            }}
+                        >
+                            Keine offenen Dateien in der Prüfliste.
+                        </div>
+                    ) : (
+                        <div
+                            style={{
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: 10,
+                            }}
+                        >
+                            {batchItems.map((item) => {
+                                const status = getStatusMeta(item);
+                                const bestMatch = item.matchedAccounts[0] ?? null;
+
+                                return (
+                                    <button
+                                        key={item.id}
+                                        type="button"
+                                        onClick={() => setSelectedBatchId(item.id)}
+                                        style={{
+                                            textAlign: "left",
+                                            background:
+                                                selectedItem?.id === item.id
+                                                    ? COLORS.cardBgStrong
+                                                    : COLORS.cardBg,
+                                            border: `1px solid ${COLORS.border}`,
+                                            borderRadius: 14,
+                                            padding: 12,
+                                            cursor: "pointer",
+                                        }}
+                                    >
+                                        <div
+                                            style={{
+                                                display: "flex",
+                                                justifyContent: "space-between",
+                                                alignItems: "center",
+                                                gap: 10,
+                                                marginBottom: 6,
+                                            }}
+                                        >
+                                            <div
+                                                style={{
+                                                    color: COLORS.text,
+                                                    fontSize: 13,
+                                                    fontWeight: 700,
+                                                    overflow: "hidden",
+                                                    textOverflow: "ellipsis",
+                                                    whiteSpace: "nowrap",
+                                                }}
+                                            >
+                                                {item.file.name}
+                                            </div>
+                                            <div
+                                                style={{
+                                                    color: status.color,
+                                                    fontSize: 12,
+                                                    fontWeight: 700,
+                                                    flexShrink: 0,
+                                                }}
+                                            >
+                                                {status.label}
+                                            </div>
+                                        </div>
+
+                                        <div
+                                            style={{
+                                                display: "grid",
+                                                gridTemplateColumns: "1fr 1fr",
+                                                gap: 8,
+                                                marginBottom: 10,
+                                            }}
+                                        >
+                                            <div
+                                                style={{
+                                                    color: COLORS.muted,
+                                                    fontSize: 12,
+                                                }}
+                                            >
+                                                Typ
+                                                <div
+                                                    style={{
+                                                        color: COLORS.text,
+                                                        fontSize: 13,
+                                                        marginTop: 2,
+                                                    }}
+                                                >
+                                                    {IMPORT_TYPE_META[item.type]?.label ||
+                                                        IMPORT_TYPE_META.unknown.label}
+                                                </div>
+                                            </div>
+
+                                            <div
+                                                style={{
+                                                    color: COLORS.muted,
+                                                    fontSize: 12,
+                                                }}
+                                            >
+                                                Provider
+                                                <div
+                                                    style={{
+                                                        color: normalizeProvider(item.provider) === "atas"
+                                                            ? COLORS.purple
+                                                            : COLORS.cyan,
+                                                        fontSize: 13,
+                                                        marginTop: 2,
+                                                        fontWeight: 700,
+                                                    }}
+                                                >
+                                                    {item.providerLabel || providerLabel}
+                                                </div>
+                                            </div>
+
+                                            <div
+                                                style={{
+                                                    color: COLORS.muted,
+                                                    fontSize: 12,
+                                                }}
+                                            >
+                                                Trading Account
+                                                <div
+                                                    style={{
+                                                        color: COLORS.text,
+                                                        fontSize: 13,
+                                                        marginTop: 2,
+                                                        overflow: "hidden",
+                                                        textOverflow: "ellipsis",
+                                                        whiteSpace: "nowrap",
+                                                    }}
+                                                >
+                                                    {item.tradingAccount || "Nicht erkannt"}
+                                                </div>
+                                            </div>
+
+                                            <div
+                                                style={{
+                                                    color: COLORS.muted,
+                                                    fontSize: 12,
+                                                }}
+                                            >
+                                                Quelle
+                                                <div
+                                                    style={{
+                                                        color: COLORS.text,
+                                                        fontSize: 13,
+                                                        marginTop: 2,
+                                                    }}
+                                                >
+                                                    {item.tradingAccountSource || "—"}
+                                                </div>
+                                            </div>
+
+                                            <div
+                                                style={{
+                                                    color: COLORS.muted,
+                                                    fontSize: 12,
+                                                    gridColumn: "1 / -1",
+                                                }}
+                                            >
+                                                Bester Match
+                                                <div
+                                                    style={{
+                                                        color: COLORS.text,
+                                                        fontSize: 13,
+                                                        marginTop: 2,
+                                                        overflow: "hidden",
+                                                        textOverflow: "ellipsis",
+                                                        whiteSpace: "nowrap",
+                                                    }}
+                                                >
+                                                    {bestMatch
+                                                        ? `${bestMatch.account.displayName} · ${bestMatch.reason} · ${bestMatch.score}`
+                                                        : "Kein Treffer"}
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <div
+                                            style={{
+                                                display: "grid",
+                                                gridTemplateColumns: "1fr auto",
+                                                gap: 10,
+                                                alignItems: "center",
+                                            }}
+                                        >
+                                            <select
+                                                value={item.targetAccountId}
+                                                onChange={(event) =>
+                                                    updateBatchTarget(item.id, event.target.value)
+                                                }
+                                                style={{
+                                                    width: "100%",
+                                                    borderRadius: 10,
+                                                    border: `1px solid ${COLORS.borderStrong}`,
+                                                    background: "rgba(15, 23, 42, 0.9)",
+                                                    color: COLORS.text,
+                                                    padding: "9px 10px",
+                                                    fontSize: 13,
+                                                }}
+                                            >
+                                                <option value="">Ziel App Account wählen</option>
+                                                {accounts.map((entry) => (
+                                                    <option key={entry.id} value={entry.id}>
+                                                        {entry.displayName}
+                                                    </option>
+                                                ))}
+                                            </select>
+
+                                            <button
+                                                type="button"
+                                                onClick={(event) => {
+                                                    event.stopPropagation();
+                                                    removeBatchItem(item.id);
+                                                }}
+                                                style={{
+                                                    borderRadius: 10,
+                                                    border: `1px solid ${COLORS.borderStrong}`,
+                                                    background: "rgba(239, 68, 68, 0.12)",
+                                                    color: COLORS.text,
+                                                    padding: "9px 10px",
+                                                    fontSize: 12,
+                                                    cursor: "pointer",
+                                                }}
+                                            >
+                                                Entfernen
+                                            </button>
+                                        </div>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    )}
+                </div>
+
+                <div
+                    style={{
+                        background: COLORS.cardBg,
+                        border: `1px solid ${COLORS.border}`,
+                        borderRadius: 16,
+                        padding: 14,
+                        minHeight: 320,
+                    }}
+                >
+                    <div
+                        style={{
+                            color: COLORS.title,
+                            fontSize: 14,
+                            fontWeight: 700,
+                            marginBottom: 12,
+                        }}
+                    >
+                        Dateivorschau
+                    </div>
+
+                    {!selectedItem ? (
+                        <div
+                            style={{
+                                color: COLORS.muted,
+                                fontSize: 13,
+                            }}
+                        >
+                            Keine offene Datei ausgewählt.
+                        </div>
+                    ) : (
+                        <div>
+                            <div
+                                style={{
+                                    color: COLORS.text,
+                                    fontSize: 13,
+                                    fontWeight: 700,
+                                    marginBottom: 10,
+                                }}
+                            >
+                                {selectedItem.file.name}
+                            </div>
+
+                            <div
+                                style={{
+                                    display: "grid",
+                                    gridTemplateColumns: "1fr 1fr",
+                                    gap: 10,
+                                    marginBottom: 12,
+                                }}
+                            >
+                                <div
+                                    style={{
+                                        background: COLORS.cardBgStrong,
+                                        border: `1px solid ${COLORS.border}`,
+                                        borderRadius: 12,
+                                        padding: 10,
+                                    }}
+                                >
+                                    <div style={{ color: COLORS.muted, fontSize: 12 }}>Typ</div>
+                                    <div style={{ color: COLORS.text, fontSize: 13, marginTop: 4 }}>
+                                        {IMPORT_TYPE_META[selectedItem.type]?.label ||
+                                            IMPORT_TYPE_META.unknown.label}
+                                    </div>
+                                </div>
+
+                                <div
+                                    style={{
+                                        background: COLORS.cardBgStrong,
+                                        border: `1px solid ${COLORS.border}`,
+                                        borderRadius: 12,
+                                        padding: 10,
+                                    }}
+                                >
+                                    <div style={{ color: COLORS.muted, fontSize: 12 }}>Zeilen</div>
+                                    <div style={{ color: COLORS.text, fontSize: 13, marginTop: 4 }}>
+                                        {selectedItem.rows.length}
+                                    </div>
+                                </div>
+
+                                <div
+                                    style={{
+                                        background: COLORS.cardBgStrong,
+                                        border: `1px solid ${COLORS.border}`,
+                                        borderRadius: 12,
+                                        padding: 10,
+                                    }}
+                                >
+                                    <div style={{ color: COLORS.muted, fontSize: 12 }}>
+                                        Provider
+                                    </div>
+                                    <div
+                                        style={{
+                                            color: normalizeProvider(selectedItem.provider) === "atas"
+                                                ? COLORS.purple
+                                                : COLORS.cyan,
+                                            fontSize: 13,
+                                            fontWeight: 700,
+                                            marginTop: 4,
+                                        }}
+                                    >
+                                        {selectedItem.providerLabel || providerLabel}
+                                    </div>
+                                </div>
+
+                                <div
+                                    style={{
+                                        background: COLORS.cardBgStrong,
+                                        border: `1px solid ${COLORS.border}`,
+                                        borderRadius: 12,
+                                        padding: 10,
+                                    }}
+                                >
+                                    <div style={{ color: COLORS.muted, fontSize: 12 }}>
+                                        Trading Account
+                                    </div>
+                                    <div style={{ color: COLORS.text, fontSize: 13, marginTop: 4 }}>
+                                        {selectedItem.tradingAccount || "Nicht erkannt"}
+                                    </div>
+                                </div>
+
+                                <div
+                                    style={{
+                                        background: COLORS.cardBgStrong,
+                                        border: `1px solid ${COLORS.border}`,
+                                        borderRadius: 12,
+                                        padding: 10,
+                                        gridColumn: "1 / -1",
+                                    }}
+                                >
+                                    <div style={{ color: COLORS.muted, fontSize: 12 }}>
+                                        Quelle
+                                    </div>
+                                    <div style={{ color: COLORS.text, fontSize: 13, marginTop: 4 }}>
+                                        {selectedItem.tradingAccountSource || "—"}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div
+                                style={{
+                                    marginBottom: 12,
+                                    background: COLORS.cardBgStrong,
+                                    border: `1px solid ${COLORS.border}`,
+                                    borderRadius: 12,
+                                    padding: 10,
+                                }}
+                            >
+                                <div
+                                    style={{
+                                        color: COLORS.muted,
+                                        fontSize: 12,
+                                        marginBottom: 6,
+                                    }}
+                                >
+                                    Match Kandidaten
+                                </div>
+
+                                {selectedItem.matchedAccounts.length === 0 ? (
+                                    <div
+                                        style={{
+                                            color: COLORS.text,
+                                            fontSize: 13,
+                                        }}
+                                    >
+                                        Kein Treffer.
+                                    </div>
+                                ) : (
+                                    selectedItem.matchedAccounts.slice(0, 3).map((match) => (
+                                        <div
+                                            key={`${selectedItem.id}-${match.account.id}`}
+                                            style={{
+                                                color: COLORS.text,
+                                                fontSize: 13,
+                                                marginBottom: 4,
+                                            }}
+                                        >
+                                            {match.account.displayName} · {match.reason} · Score {match.score}
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+
+                            <div
+                                style={{
+                                    color: COLORS.muted,
+                                    fontSize: 12,
+                                    marginBottom: 8,
+                                }}
+                            >
+                                Header
+                            </div>
+                            <div
+                                style={{
+                                    color: COLORS.text,
+                                    fontSize: 12,
+                                    lineHeight: 1.5,
+                                    background: "rgba(15, 23, 42, 0.75)",
+                                    border: `1px solid ${COLORS.border}`,
+                                    borderRadius: 12,
+                                    padding: 10,
+                                    marginBottom: 12,
+                                    wordBreak: "break-word",
+                                }}
+                            >
+                                {selectedItem.headers.join(" | ") || "Keine Header"}
+                            </div>
+
+                            <div
+                                style={{
+                                    color: COLORS.muted,
+                                    fontSize: 12,
+                                    marginBottom: 8,
+                                }}
+                            >
+                                Vorschau
+                            </div>
+
+                            <div
+                                style={{
+                                    display: "flex",
+                                    flexDirection: "column",
+                                    gap: 8,
+                                    maxHeight: 260,
+                                    overflowY: "auto",
+                                }}
+                            >
+                                {selectedItem.previewRows.length === 0 ? (
+                                    <div
+                                        style={{
+                                            color: COLORS.muted,
+                                            fontSize: 13,
+                                        }}
+                                    >
+                                        Keine Datenzeilen gefunden.
+                                    </div>
+                                ) : (
+                                    selectedItem.previewRows.map((row, rowIndex) => (
+                                        <div
+                                            key={`${selectedItem.id}-row-${rowIndex}`}
+                                            style={{
+                                                background: COLORS.cardBgStrong,
+                                                border: `1px solid ${COLORS.border}`,
+                                                borderRadius: 12,
+                                                padding: 10,
+                                            }}
+                                        >
+                                            {selectedItem.headers.slice(0, 6).map((header) => (
+                                                <div
+                                                    key={`${selectedItem.id}-${rowIndex}-${header}`}
+                                                    style={{
+                                                        display: "grid",
+                                                        gridTemplateColumns: "120px 1fr",
+                                                        gap: 8,
+                                                        marginBottom: 4,
+                                                        fontSize: 12,
+                                                    }}
+                                                >
+                                                    <div style={{ color: COLORS.muted }}>
+                                                        {header}
+                                                    </div>
+                                                    <div
+                                                        style={{
+                                                            color: COLORS.text,
+                                                            overflow: "hidden",
+                                                            textOverflow: "ellipsis",
+                                                            whiteSpace: "nowrap",
+                                                        }}
+                                                    >
+                                                        {cleanString(row[header]) || "—"}
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            </div>
+
+            <div
+                style={{
+                    marginTop: 16,
+                    background: COLORS.cardBg,
+                    border: `1px solid ${COLORS.border}`,
+                    borderRadius: 16,
+                    padding: 14,
+                }}
+            >
+                <div
+                    style={{
+                        color: COLORS.title,
+                        fontSize: 14,
+                        fontWeight: 700,
+                        marginBottom: 12,
+                    }}
+                >
+                    Aktueller Importstand des aktiven Accounts
+                </div>
+
+                <div
+                    style={{
+                        color: normalizeProvider(provider) === "atas"
+                            ? COLORS.purple
+                            : COLORS.cyan,
+                        fontSize: 13,
+                        fontWeight: 700,
+                        marginBottom: 12,
+                    }}
+                >
+                    Provider {providerLabel}
+                </div>
+
+                <div
+                    style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                        gap: 10,
+                    }}
+                >
+                    {activeImportSummary.map((entry) => (
+                        <div
+                            key={entry.key}
+                            style={{
+                                background: COLORS.cardBgStrong,
+                                border: `1px solid ${COLORS.border}`,
+                                borderRadius: 12,
+                                padding: 12,
+                                minWidth: 0,
+                                display: "grid",
+                                gap: 8,
+                                alignContent: "start",
+                            }}
+                        >
+                            <div
+                                style={{
+                                    color: COLORS.text,
+                                    fontSize: 13,
+                                    fontWeight: 700,
+                                }}
+                            >
+                                {entry.label}
+                            </div>
+
+                            <div
+                                style={{
+                                    display: "grid",
+                                    gap: 6,
+                                    color: COLORS.muted,
+                                    fontSize: 12,
+                                    lineHeight: 1.5,
+                                    minWidth: 0,
+                                }}
+                            >
+                                <div
+                                    style={{
+                                        display: "grid",
+                                        gap: 2,
+                                        minWidth: 0,
+                                    }}
+                                >
+                                    <div>Datei</div>
+                                    <div
+                                        style={{
+                                            color: COLORS.text,
+                                            wordBreak: "break-word",
+                                            overflowWrap: "anywhere",
+                                            whiteSpace: "normal",
+                                            lineHeight: 1.45,
+                                        }}
+                                    >
+                                        {entry.fileName || "Keine"}
+                                    </div>
+                                </div>
+
+                                <div
+                                    style={{
+                                        display: "grid",
+                                        gap: 2,
+                                    }}
+                                >
+                                    <div>Zeilen</div>
+                                    <div style={{ color: COLORS.text }}>
+                                        {entry.rows}
+                                    </div>
+                                </div>
+
+                                <div
+                                    style={{
+                                        display: "grid",
+                                        gap: 2,
+                                        minWidth: 0,
+                                    }}
+                                >
+                                    <div>Import</div>
+                                    <div
+                                        style={{
+                                            color: COLORS.text,
+                                            wordBreak: "break-word",
+                                            overflowWrap: "anywhere",
+                                            whiteSpace: "normal",
+                                            lineHeight: 1.45,
+                                        }}
+                                    >
+                                        {entry.importedAt ? formatDateTime(entry.importedAt) : "—"}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    ))}
+                </div>
             </div>
         </section>
     );

@@ -1,5 +1,6 @@
 import {
     getActiveAccountId,
+    getAccountById,
     getCsvImports,
     saveParsedCsvImport,
     clearParsedCsvImport,
@@ -14,6 +15,8 @@ const IMPORT_KEYS = [
     "positionHistory",
 ];
 
+const DEFAULT_PROVIDER = "tradovate";
+
 function cleanString(value) {
     if (value === null || value === undefined) {
         return "";
@@ -22,50 +25,87 @@ function cleanString(value) {
     return String(value).trim();
 }
 
-function createEmptyImport(type) {
+function normalizeProvider(value) {
+    return cleanString(value).toLowerCase() === "atas" ? "atas" : DEFAULT_PROVIDER;
+}
+
+function looksLikeUuid(value) {
+    const text = cleanString(value);
+
+    if (!text) {
+        return false;
+    }
+
+    return (
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text) ||
+        /^acc-\d+-[a-z0-9]+$/i.test(text)
+    );
+}
+
+function createEmptyImport(type, provider = DEFAULT_PROVIDER) {
     return {
-        type,
+        type: cleanString(type),
+        provider: normalizeProvider(provider),
         fileName: "",
         importedAt: "",
         headers: [],
         rows: [],
         previewRows: [],
         rawText: "",
+        appAccountId: "",
+        appAccountName: "",
+        tradingAccountId: "",
+        tradingAccountName: "",
+        tradingAccountKey: "",
+        csvAccountRaw: "",
     };
 }
 
-function getEmptyImports() {
-    const cashHistory = createEmptyImport("cashHistory");
+function getEmptyImports(provider = DEFAULT_PROVIDER) {
+    const normalizedProvider = normalizeProvider(provider);
+    const cashHistory = createEmptyImport("cashHistory", normalizedProvider);
 
     return {
-        orders: createEmptyImport("orders"),
-        trades: createEmptyImport("trades"),
+        provider: normalizedProvider,
+        dataProvider: normalizedProvider,
+        orders: createEmptyImport("orders", normalizedProvider),
+        trades: createEmptyImport("trades", normalizedProvider),
         cashHistory,
         dailySummary: {
             ...cashHistory,
             type: "dailySummary",
         },
-        performance: createEmptyImport("performance"),
-        positionHistory: createEmptyImport("positionHistory"),
+        performance: createEmptyImport("performance", normalizedProvider),
+        positionHistory: createEmptyImport("positionHistory", normalizedProvider),
     };
 }
 
-function cloneImportEntry(type, source = {}) {
+function cloneImportEntry(type, source = {}, provider = DEFAULT_PROVIDER) {
     return {
-        ...createEmptyImport(type),
+        ...createEmptyImport(type, provider),
         ...source,
         type,
+        provider: normalizeProvider(source.provider || provider),
         fileName: cleanString(source.fileName),
         importedAt: cleanString(source.importedAt),
         headers: Array.isArray(source.headers) ? source.headers : [],
         rows: Array.isArray(source.rows) ? source.rows : [],
         previewRows: Array.isArray(source.previewRows) ? source.previewRows : [],
         rawText: String(source.rawText || ""),
+        appAccountId: cleanString(source.appAccountId),
+        appAccountName: cleanString(source.appAccountName),
+        tradingAccountId: cleanString(source.tradingAccountId),
+        tradingAccountName: cleanString(source.tradingAccountName),
+        tradingAccountKey: cleanString(source.tradingAccountKey),
+        csvAccountRaw: cleanString(source.csvAccountRaw),
     };
 }
 
-function normalizeImportsShape(value) {
-    const base = getEmptyImports();
+function normalizeImportsShape(value, provider = DEFAULT_PROVIDER) {
+    const normalizedProvider = normalizeProvider(
+        value?.provider || value?.dataProvider || provider
+    );
+    const base = getEmptyImports(normalizedProvider);
 
     if (!value || typeof value !== "object") {
         return base;
@@ -74,16 +114,27 @@ function normalizeImportsShape(value) {
     const sourceCashHistory =
         value.cashHistory ||
         value.dailySummary ||
-        createEmptyImport("cashHistory");
+        createEmptyImport("cashHistory", normalizedProvider);
 
     const normalized = {
-        orders: cloneImportEntry("orders", value.orders || {}),
-        trades: cloneImportEntry("trades", value.trades || {}),
-        cashHistory: cloneImportEntry("cashHistory", sourceCashHistory),
-        performance: cloneImportEntry("performance", value.performance || {}),
+        provider: normalizedProvider,
+        dataProvider: normalizedProvider,
+        orders: cloneImportEntry("orders", value.orders || {}, normalizedProvider),
+        trades: cloneImportEntry("trades", value.trades || {}, normalizedProvider),
+        cashHistory: cloneImportEntry(
+            "cashHistory",
+            sourceCashHistory,
+            normalizedProvider
+        ),
+        performance: cloneImportEntry(
+            "performance",
+            value.performance || {},
+            normalizedProvider
+        ),
         positionHistory: cloneImportEntry(
             "positionHistory",
-            value.positionHistory || {}
+            value.positionHistory || {},
+            normalizedProvider
         ),
     };
 
@@ -96,14 +147,17 @@ function normalizeImportsShape(value) {
     };
 }
 
-function attachLegacyImportAliases(imports, accountId = "") {
+function attachLegacyImportAliases(imports, accountId = "", provider = DEFAULT_PROVIDER) {
     const resolvedAccountId = cleanString(accountId);
+    const normalizedProvider = normalizeProvider(provider);
     const cashRows = Array.isArray(imports?.cashHistory?.rows)
         ? imports.cashHistory.rows
         : [];
 
     return {
         ...imports,
+        provider: normalizedProvider,
+        dataProvider: normalizedProvider,
         accountBalanceHistory: {
             byAccount: resolvedAccountId
                 ? {
@@ -113,6 +167,7 @@ function attachLegacyImportAliases(imports, accountId = "") {
             rows: cashRows,
             fileName: imports?.cashHistory?.fileName || "",
             importedAt: imports?.cashHistory?.importedAt || "",
+            provider: normalizedProvider,
         },
     };
 }
@@ -133,6 +188,94 @@ function resolveAccountId(accountId = "") {
     }
 
     return cleanString(getActiveAccountId());
+}
+
+function resolveAccountContext(accountId = "") {
+    const resolvedAccountId = resolveAccountId(accountId);
+    const account = resolvedAccountId ? getAccountById(resolvedAccountId) : null;
+    const provider = normalizeProvider(
+        account?.dataProvider ||
+        account?.source?.provider ||
+        DEFAULT_PROVIDER
+    );
+
+    return {
+        resolvedAccountId,
+        account,
+        provider,
+    };
+}
+
+function getProviderAccountValues(account, provider) {
+    if (!account || typeof account !== "object") {
+        return {
+            preferredValues: [],
+            explicitTradingId: "",
+            explicitTradingName: "",
+        };
+    }
+
+    if (provider === "atas") {
+        const preferredValues = [
+            account?.atasAccountId,
+            account?.atasAccountName,
+            account?.dataProvider === "atas" ? account?.dataProviderAccountId : "",
+            account?.dataProvider === "atas" ? account?.dataProviderAccountName : "",
+            account?.displayName,
+            account?.name,
+            account?.accountName,
+            account?.label,
+            account?.id,
+        ]
+            .map(cleanString)
+            .filter(Boolean);
+
+        return {
+            preferredValues,
+            explicitTradingId: cleanString(
+                account?.atasAccountId ||
+                (account?.dataProvider === "atas" ? account?.dataProviderAccountId : "")
+            ),
+            explicitTradingName: cleanString(
+                account?.atasAccountName ||
+                (account?.dataProvider === "atas" ? account?.dataProviderAccountName : "") ||
+                account?.displayName
+            ),
+        };
+    }
+
+    const preferredValues = [
+        account?.tradovateAccountId,
+        account?.tradovateAccountName,
+        account?.tradingAccountId,
+        account?.tradingAccountName,
+        account?.apexId,
+        account?.accountId,
+        account?.displayName,
+        account?.name,
+        account?.accountName,
+        account?.label,
+        account?.id,
+    ]
+        .map(cleanString)
+        .filter(Boolean);
+
+    return {
+        preferredValues,
+        explicitTradingId: cleanString(
+            account?.tradovateAccountId ||
+            account?.tradingAccountId ||
+            account?.apexId ||
+            account?.accountId
+        ),
+        explicitTradingName: cleanString(
+            account?.tradovateAccountName ||
+            account?.tradingAccountName ||
+            account?.displayName ||
+            account?.name ||
+            account?.accountName
+        ),
+    };
 }
 
 function normalizeHeader(value) {
@@ -346,6 +489,12 @@ function getAccountCandidates(row) {
             "accountname",
             "_accountId",
             "_accountid",
+            "_account",
+            "_accountName",
+            "_accountname",
+            "_accountSpec",
+            "account spec",
+            "accountspec",
             "account number",
             "accountnumber",
             "acct",
@@ -353,6 +502,10 @@ function getAccountCandidates(row) {
         ]),
         row?._accountId,
         row?._accountid,
+        row?._account,
+        row?._accountName,
+        row?._accountname,
+        row?._accountSpec,
     ];
 
     return values
@@ -362,6 +515,114 @@ function getAccountCandidates(row) {
             digits: normalizeAccountDigits(value),
         }))
         .filter((entry) => entry.raw || entry.key || entry.digits);
+}
+
+function matchAccountCandidate(candidate, value) {
+    const safeValue = cleanString(value);
+
+    if (!safeValue) {
+        return false;
+    }
+
+    const safeKey = normalizeAccountLookup(safeValue);
+    const safeDigits = normalizeAccountDigits(safeValue);
+
+    const keyMatch =
+        Boolean(candidate?.key) &&
+        Boolean(safeKey) &&
+        (
+            candidate.key === safeKey ||
+            candidate.key.includes(safeKey) ||
+            safeKey.includes(candidate.key)
+        );
+
+    const digitMatch =
+        Boolean(candidate?.digits) &&
+        Boolean(safeDigits) &&
+        (
+            candidate.digits === safeDigits ||
+            candidate.digits.includes(safeDigits) ||
+            safeDigits.includes(candidate.digits)
+        );
+
+    return keyMatch || digitMatch;
+}
+
+function getUniqueRowAccountCandidates(rows = []) {
+    const uniqueMap = new Map();
+
+    rows.forEach((row) => {
+        getAccountCandidates(row).forEach((candidate) => {
+            const key = cleanString(candidate.raw || candidate.key || candidate.digits);
+
+            if (!key) {
+                return;
+            }
+
+            if (!uniqueMap.has(key)) {
+                uniqueMap.set(key, candidate);
+            }
+        });
+    });
+
+    return Array.from(uniqueMap.values());
+}
+
+function buildImportMeta(rows = [], resolvedAccountId = "", provider = DEFAULT_PROVIDER) {
+    const appAccountId = cleanString(resolvedAccountId);
+    const appAccount = appAccountId ? getAccountById(appAccountId) : null;
+    const normalizedProvider = normalizeProvider(provider);
+
+    const uniqueRowCandidates = getUniqueRowAccountCandidates(rows);
+    const providerValues = getProviderAccountValues(appAccount, normalizedProvider);
+
+    const matchedCandidate =
+        uniqueRowCandidates.find((candidate) =>
+            providerValues.preferredValues.some((value) =>
+                matchAccountCandidate(candidate, value)
+            )
+        ) || null;
+
+    const firstUsableCsvCandidate =
+        uniqueRowCandidates.find((candidate) => !looksLikeUuid(candidate.raw)) ||
+        uniqueRowCandidates[0] ||
+        null;
+
+    const csvPrimaryCandidate = matchedCandidate || firstUsableCsvCandidate || null;
+
+    const tradingAccountId = cleanString(
+        csvPrimaryCandidate?.raw ||
+        (!looksLikeUuid(providerValues.explicitTradingId)
+            ? providerValues.explicitTradingId
+            : "") ||
+        ""
+    );
+
+    const tradingAccountName = cleanString(
+        csvPrimaryCandidate?.raw ||
+        providerValues.explicitTradingName ||
+        tradingAccountId ||
+        appAccount?.id
+    );
+
+    const csvAccountRaw = cleanString(csvPrimaryCandidate?.raw || "");
+
+    return {
+        provider: normalizedProvider,
+        appAccountId,
+        appAccountName: cleanString(
+            appAccount?.displayName ||
+            appAccount?.name ||
+            appAccount?.accountName ||
+            appAccountId
+        ),
+        tradingAccountId,
+        tradingAccountName,
+        tradingAccountKey: normalizeAccountLookup(
+            tradingAccountId || tradingAccountName || csvAccountRaw
+        ),
+        csvAccountRaw,
+    };
 }
 
 function matchesAccount(row, accountId) {
@@ -443,18 +704,52 @@ function filterEntriesForAccount(entries = [], accountId = "") {
     return matched;
 }
 
-function applyResolvedAccount(entries = [], accountId = "") {
-    const resolved = cleanString(accountId);
+function applyResolvedAccount(entries = [], scope = {}) {
+    const safeScope =
+        typeof scope === "string"
+            ? {
+                provider: DEFAULT_PROVIDER,
+                tradingAccountId: scope,
+                tradingAccountName: scope,
+                appAccountId: "",
+                appAccountName: "",
+            }
+            : scope || {};
 
-    if (!resolved) {
-        return entries;
-    }
+    const provider = normalizeProvider(safeScope.provider);
+    const appAccountId = cleanString(safeScope.appAccountId);
+    const appAccountName = cleanString(safeScope.appAccountName);
+    const tradingAccountId = cleanString(safeScope.tradingAccountId);
+    const tradingAccountName = cleanString(
+        safeScope.tradingAccountName || tradingAccountId
+    );
 
-    return entries.map((entry) => ({
-        ...entry,
-        accountId: cleanString(entry.accountId || resolved),
-        accountName: cleanString(entry.accountName || entry.account || resolved),
-    }));
+    return entries.map((entry) => {
+        const resolvedTradingAccountId = cleanString(
+            entry.tradingAccountId ||
+            entry.accountId ||
+            tradingAccountId
+        );
+
+        const resolvedTradingAccountName = cleanString(
+            entry.tradingAccountName ||
+            entry.accountName ||
+            tradingAccountName ||
+            resolvedTradingAccountId
+        );
+
+        return {
+            ...entry,
+            provider,
+            storageAccountId: appAccountId,
+            appAccountId,
+            appAccountName,
+            tradingAccountId: resolvedTradingAccountId,
+            tradingAccountName: resolvedTradingAccountName,
+            accountId: resolvedTradingAccountId,
+            accountName: resolvedTradingAccountName,
+        };
+    });
 }
 
 function normalizeImportKey(type) {
@@ -475,11 +770,91 @@ function getCashHistorySource(importData) {
     return (
         importData?.cashHistory ||
         importData?.dailySummary ||
-        createEmptyImport("cashHistory")
+        createEmptyImport("cashHistory", importData?.provider || DEFAULT_PROVIDER)
     );
 }
 
-function mapOrdersRows(rows = []) {
+function buildImportScope(source, accountId = "", providerOverride = "") {
+    const {
+        resolvedAccountId,
+        account,
+        provider: accountProvider,
+    } = resolveAccountContext(accountId);
+
+    const provider = normalizeProvider(
+        providerOverride ||
+        source?.provider ||
+        importDataProvider(source) ||
+        accountProvider
+    );
+
+    const fallbackTradingAccountId = cleanString(
+        provider === "atas"
+            ? (
+                account?.atasAccountId ||
+                (account?.dataProvider === "atas" ? account?.dataProviderAccountId : "") ||
+                resolvedAccountId
+            )
+            : (
+                account?.tradovateAccountId ||
+                account?.tradingAccountId ||
+                resolvedAccountId
+            )
+    );
+
+    const fallbackTradingAccountName = cleanString(
+        provider === "atas"
+            ? (
+                account?.atasAccountName ||
+                (account?.dataProvider === "atas" ? account?.dataProviderAccountName : "") ||
+                account?.displayName ||
+                fallbackTradingAccountId
+            )
+            : (
+                account?.tradovateAccountName ||
+                account?.tradingAccountName ||
+                account?.displayName ||
+                fallbackTradingAccountId
+            )
+    );
+
+    return {
+        provider,
+        appAccountId: cleanString(source?.appAccountId || resolvedAccountId),
+        appAccountName: cleanString(
+            source?.appAccountName ||
+            account?.displayName ||
+            account?.name ||
+            account?.accountName ||
+            resolvedAccountId
+        ),
+        tradingAccountId: cleanString(
+            source?.tradingAccountId ||
+            source?.csvAccountRaw ||
+            fallbackTradingAccountId
+        ),
+        tradingAccountName: cleanString(
+            source?.tradingAccountName ||
+            source?.tradingAccountId ||
+            source?.csvAccountRaw ||
+            fallbackTradingAccountName
+        ),
+        tradingAccountKey: cleanString(source?.tradingAccountKey),
+        csvAccountRaw: cleanString(source?.csvAccountRaw),
+    };
+}
+
+function importDataProvider(source) {
+    return normalizeProvider(
+        source?.provider ||
+        source?.dataProvider ||
+        ""
+    );
+}
+
+function mapOrdersRows(rows = [], provider = DEFAULT_PROVIDER) {
+    const normalizedProvider = normalizeProvider(provider);
+
     return rows.map((row, index) => {
         const orderIdVal =
             getValue(row, ["Order ID", "orderId", "order_id", "id"]) ||
@@ -501,6 +876,7 @@ function mapOrdersRows(rows = []) {
         const statusVal = getValue(row, ["Status"]);
 
         return {
+            provider: normalizedProvider,
             id: orderIdVal,
             orderId: orderIdVal,
             instrument: instrumentVal,
@@ -524,14 +900,22 @@ function mapOrdersRows(rows = []) {
             submittedAt: timestampVal,
             time: timestampVal,
             date: timestampVal,
-            accountId: getValue(row, ["Account ID", "_accountId", "Account"]),
-            accountName: getValue(row, ["Account", "Account Name"]),
+            accountId: getValue(row, [
+                "Account ID",
+                "_accountId",
+                "_account",
+                "_accountSpec",
+                "Account",
+            ]),
+            accountName: getValue(row, ["Account", "Account Name", "_accountName"]),
             raw: row,
         };
     });
 }
 
-function mapTradesRows(rows = []) {
+function mapTradesRows(rows = [], provider = DEFAULT_PROVIDER) {
+    const normalizedProvider = normalizeProvider(provider);
+
     return rows.map((row, index) => {
         const quantityValue =
             getValue(row, ["Quantity", "_qty", "qty", "contracts"]) || "0";
@@ -539,107 +923,189 @@ function mapTradesRows(rows = []) {
         const timestampIso = buildDateTimeValue(row, {
             dateTimeAliases: ["_timestamp", "Timestamp"],
             dateAliases: ["Date", "_tradeDate", "Trade Date"],
-            timeAliases: ["Timestamp"],
+            timeAliases: ["Time", "Timestamp"],
         });
 
+        const pnlValue = getValue(row, [
+            "Realized PnL",
+            "Realized P/L",
+            "Net PnL",
+            "Net P/L",
+            "P&L",
+            "P/L",
+            "pnl",
+            "PnL",
+            "profit",
+            "realizedPnl",
+        ]);
+
         return {
+            provider: normalizedProvider,
             fillId:
                 getValue(row, ["Fill ID", "_id", "id"]) ||
                 `csv-fill-${index + 1}`,
             orderId: getValue(row, ["Order ID", "_orderId"]),
-            tradeId: "",
+            tradeId: getValue(row, ["Trade ID", "tradeId", "_tradeId"]),
             symbol: getValue(row, ["Contract", "Product", "Instrument", "Symbol"]),
             side: getValue(row, ["B/S", "Side", "_action"]),
             quantity: quantityValue,
             contracts: quantityValue,
+            qty: quantityValue,
             price: getValue(row, ["Price", "_price"]),
             commission: getValue(row, ["commission", "Commission"]),
+            pnl: pnlValue,
+            PnL: pnlValue,
+            realizedPnl: pnlValue,
+            netPnl: pnlValue,
+            profit: pnlValue,
             timestampIso,
             timestamp: timestampIso,
+            time: timestampIso,
             date: timestampIso,
             tradeDate: timestampIso,
-            accountId: getValue(row, ["_accountId", "Account ID", "Account"]),
-            accountName: getValue(row, ["Account", "Account Name"]),
+            accountId: getValue(row, [
+                "_accountId",
+                "_account",
+                "_accountSpec",
+                "Account ID",
+                "Account",
+            ]),
+            accountName: getValue(row, ["Account", "Account Name", "_accountName"]),
             raw: row,
             source: "csv",
         };
     });
 }
 
-function mapCashHistoryRows(rows = []) {
-    return rows.map((row, index) => ({
-        id: `cash-history-${index + 1}`,
-        date: buildDateTimeValue(row, {
+function mapCashHistoryRows(rows = [], provider = DEFAULT_PROVIDER) {
+    const normalizedProvider = normalizeProvider(provider);
+
+    return rows.map((row, index) => {
+        const tradeDate = buildDateTimeValue(row, {
             dateTimeAliases: ["Trade Date", "Date", "Timestamp", "Transaction Date"],
             dateAliases: ["Trade Date", "Date", "Transaction Date"],
             timeAliases: ["Time"],
-        }),
-        transactionType: getValue(row, [
-            "Transaction Type",
-            "Type",
-            "Activity Type",
-            "Event Type",
-        ]),
-        description: getValue(row, [
-            "Description",
-            "Details",
-            "Memo",
-            "Comment",
-        ]),
-        amount:
+        });
+
+        const accountBalanceValue =
             getValue(row, [
+                "Account Balance",
+                "AccountBalance",
+                "Ending Balance",
+                "End Balance",
+                "End of Day Balance",
+                "End Of Day Balance",
+                "Balance",
+                "Net Liq",
+                "Net Liquidating Value",
+                "Net Liquidity",
+                "Cash Balance",
+                "Total Amount",
+            ]) || "0";
+
+        const dailyPnlValue =
+            getValue(row, [
+                "Closed P&L",
+                "Closed P/L",
+                "Net P&L",
+                "Net P/L",
+                "Daily P&L",
+                "Daily P/L",
+                "P&L",
+                "P/L",
                 "Amount",
                 "Net Amount",
                 "Transaction Amount",
                 "Cash Change",
-            ]) || "0",
-        totalAmount:
-            getValue(row, [
-                "Total Amount",
-                "Balance",
-                "Ending Balance",
-                "End Balance",
-                "End Of Day Balance",
-                "Net Liq",
-                "Net Liquidating Value",
-                "Net Liquidity",
-                "Account Balance",
-                "Cash Balance",
-            ]) || "0",
-        startingBalance:
-            getValue(row, [
-                "Starting Balance",
-                "Start Balance",
-                "Beginning Balance",
-                "Start Of Day Balance",
-                "Starting Account Balance",
-                "Initial Balance",
-            ]) || "",
-        accountSize:
-            getValue(row, [
-                "Account Size",
-                "Starting Account Size",
-                "Initial Balance",
-                "Starting Balance",
-            ]) || "",
-        accountId: getValue(row, [
-            "Account ID",
-            "Account",
-            "_accountId",
-            "Acct",
-            "Acct ID",
-        ]),
-        accountName: getValue(row, ["Account Name", "Account"]),
-        raw: row,
-    }));
+            ]) || "0";
+
+        const explicitStartingBalance = getValue(row, [
+            "Starting Balance",
+            "Start Balance",
+            "Beginning Balance",
+            "Start Of Day Balance",
+            "Starting Account Balance",
+            "Initial Balance",
+        ]);
+
+        const parsedBalance = parseFlexibleNumber(accountBalanceValue);
+        const parsedDailyPnl = parseFlexibleNumber(dailyPnlValue);
+        const parsedStartingBalance = parseFlexibleNumber(explicitStartingBalance);
+
+        let derivedStartingBalance = explicitStartingBalance;
+
+        if (
+            (parsedStartingBalance === null || parsedStartingBalance === undefined) &&
+            parsedBalance !== null &&
+            parsedDailyPnl !== null
+        ) {
+            derivedStartingBalance = String(parsedBalance - parsedDailyPnl);
+        }
+
+        return {
+            provider: normalizedProvider,
+            id: `cash-history-${index + 1}`,
+            date: tradeDate,
+            tradeDate,
+            timestamp: tradeDate,
+            transactionType: getValue(row, [
+                "Transaction Type",
+                "Type",
+                "Activity Type",
+                "Event Type",
+            ]),
+            description: getValue(row, [
+                "Description",
+                "Details",
+                "Memo",
+                "Comment",
+            ]),
+            amount: dailyPnlValue,
+            pnl: dailyPnlValue,
+            PnL: dailyPnlValue,
+            dailyPnl: dailyPnlValue,
+            netPnl: dailyPnlValue,
+            closedPnl: dailyPnlValue,
+            totalAmount: accountBalanceValue,
+            balance: accountBalanceValue,
+            currentBalance: accountBalanceValue,
+            endingBalance: accountBalanceValue,
+            accountBalance: accountBalanceValue,
+            cashBalance: accountBalanceValue,
+            netLiq: accountBalanceValue,
+            startingBalance: derivedStartingBalance || "",
+            startBalance: derivedStartingBalance || "",
+            accountSize:
+                getValue(row, [
+                    "Account Size",
+                    "Starting Account Size",
+                    "Initial Balance",
+                    "Starting Balance",
+                ]) || "",
+            accountId: getValue(row, [
+                "Account ID",
+                "Account",
+                "_accountId",
+                "_account",
+                "_accountSpec",
+                "Acct",
+                "Acct ID",
+            ]),
+            accountName: getValue(row, ["Account Name", "Account", "_accountName"]),
+            raw: row,
+        };
+    });
 }
 
-function mapPerformanceRows(rows = []) {
+function mapPerformanceRows(rows = [], provider = DEFAULT_PROVIDER) {
+    const normalizedProvider = normalizeProvider(provider);
+
     return rows.map((row, index) => ({
+        provider: normalizedProvider,
         id: `performance-${index + 1}`,
         symbol: getValue(row, ["symbol", "Symbol"]),
         quantity: getValue(row, ["qty", "Qty"]) || "0",
-        pnl: getValue(row, ["pnl", "P/L"]) || "0",
+        pnl: getValue(row, ["pnl", "P/L", "P&L", "Net P/L", "Net P&L"]) || "0",
         buyPrice: getValue(row, ["buyPrice", "Buy Price"]) || "",
         sellPrice: getValue(row, ["sellPrice", "Sell Price"]) || "",
         boughtTimestamp: buildDateTimeValue(row, {
@@ -655,12 +1121,23 @@ function mapPerformanceRows(rows = []) {
         duration: getValue(row, ["duration", "Duration"]) || "",
         buyFillId: getValue(row, ["buyFillId", "Buy Fill ID"]) || "",
         sellFillId: getValue(row, ["sellFillId", "Sell Fill ID"]) || "",
+        accountId: getValue(row, [
+            "Account ID",
+            "Account",
+            "_accountId",
+            "_account",
+            "_accountSpec",
+        ]),
+        accountName: getValue(row, ["Account", "Account Name", "_accountName"]),
         raw: row,
     }));
 }
 
-function mapPositionHistoryRows(rows = []) {
+function mapPositionHistoryRows(rows = [], provider = DEFAULT_PROVIDER) {
+    const normalizedProvider = normalizeProvider(provider);
+
     return rows.map((row, index) => ({
+        provider: normalizedProvider,
         id:
             getValue(row, ["Position ID", "Pair ID"]) ||
             `position-history-${index + 1}`,
@@ -672,8 +1149,15 @@ function mapPositionHistoryRows(rows = []) {
             timeAliases: [],
         }),
         tradeDate: getValue(row, ["Trade Date"]) || "",
-        accountId: getValue(row, ["Account ID", "Account", "_accountId"]) || "",
+        accountId: getValue(row, [
+            "Account ID",
+            "Account",
+            "_accountId",
+            "_account",
+            "_accountSpec",
+        ]) || "",
         account: getValue(row, ["Account"]) || "",
+        accountName: getValue(row, ["Account Name", "Account", "_accountName"]) || "",
         contract: getValue(row, ["Contract"]) || "",
         product: getValue(row, ["Product"]) || "",
         netPos: getValue(row, ["Net Pos"]) || "0",
@@ -685,7 +1169,7 @@ function mapPositionHistoryRows(rows = []) {
         pairedQty: getValue(row, ["Paired Qty"]) || "0",
         buyPrice: getValue(row, ["Buy Price"]) || "",
         sellPrice: getValue(row, ["Sell Price"]) || "",
-        pnl: getValue(row, ["P/L"]) || "0",
+        pnl: getValue(row, ["P/L", "P&L"]) || "0",
         buyFillId: getValue(row, ["Buy Fill ID"]) || "",
         sellFillId: getValue(row, ["Sell Fill ID"]) || "",
         boughtTimestamp: buildDateTimeValue(row, {
@@ -868,82 +1352,123 @@ export function getCsvImportEventName() {
 }
 
 export function getAllParsedImports(accountId = "") {
-    const resolvedAccountId = resolveAccountId(accountId);
+    const { resolvedAccountId, provider } = resolveAccountContext(accountId);
 
     if (!resolvedAccountId) {
-        return attachLegacyImportAliases(getEmptyImports(), "");
+        return attachLegacyImportAliases(getEmptyImports(DEFAULT_PROVIDER), "", DEFAULT_PROVIDER);
     }
 
-    const normalizedImports = normalizeImportsShape(getCsvImports(resolvedAccountId));
-    return attachLegacyImportAliases(normalizedImports, resolvedAccountId);
+    if (provider !== DEFAULT_PROVIDER) {
+        return attachLegacyImportAliases(
+            getEmptyImports(provider),
+            resolvedAccountId,
+            provider
+        );
+    }
+
+    const normalizedImports = normalizeImportsShape(
+        getCsvImports(resolvedAccountId),
+        provider
+    );
+
+    return attachLegacyImportAliases(
+        normalizedImports,
+        resolvedAccountId,
+        provider
+    );
 }
 
 export function getParsedImport(type, accountId = "") {
     const key = normalizeImportKey(type);
+    const { provider } = resolveAccountContext(accountId);
 
     if (!key) {
-        return createEmptyImport("");
+        return createEmptyImport("", provider);
     }
 
     const imports = getAllParsedImports(accountId);
 
     if (key === "cashHistory") {
-        return imports.cashHistory || createEmptyImport("cashHistory");
+        return imports.cashHistory || createEmptyImport("cashHistory", provider);
     }
 
-    return imports[key] || createEmptyImport(key);
+    return imports[key] || createEmptyImport(key, provider);
 }
 
 export function clearParsedImport(type, accountId = "") {
     const key = normalizeImportKey(type);
-    const resolvedAccountId = resolveAccountId(accountId);
+    const { resolvedAccountId, provider } = resolveAccountContext(accountId);
 
     if (!key || !resolvedAccountId) {
         return;
     }
 
-    clearParsedCsvImport(resolvedAccountId, key);
+    if (provider !== DEFAULT_PROVIDER) {
+        emitImportsUpdated();
+        return;
+    }
+
+    clearParsedCsvImport(resolvedAccountId, key, provider);
     emitImportsUpdated();
 }
 
 export function saveParsedImport(type, fileName, text, accountId = "") {
     const key = normalizeImportKey(type);
-    const resolvedAccountId = resolveAccountId(accountId);
+    const { resolvedAccountId, provider } = resolveAccountContext(accountId);
 
     if (!key || !resolvedAccountId) {
-        return createEmptyImport("");
+        return createEmptyImport("", provider);
+    }
+
+    if (provider !== DEFAULT_PROVIDER) {
+        return createEmptyImport(key, provider);
     }
 
     const parsed = parseCsvText(text);
+    const meta = buildImportMeta(parsed.rows, resolvedAccountId, provider);
 
     const entry = {
         type: key,
+        provider,
         fileName: cleanString(fileName),
         importedAt: new Date().toISOString(),
         headers: parsed.headers,
         rows: parsed.rows,
         previewRows: parsed.previewRows,
         rawText: String(text || ""),
+        ...meta,
     };
 
-    const savedEntry = saveParsedCsvImport(resolvedAccountId, key, entry);
+    const savedEntry = saveParsedCsvImport(resolvedAccountId, key, entry, provider);
     emitImportsUpdated();
 
-    return cloneImportEntry(key, savedEntry);
+    return cloneImportEntry(key, savedEntry, provider);
 }
 
 export function buildOrdersData(importData, accountId = "") {
-    const source = importData?.orders || createEmptyImport("orders");
-    const mappedEntries = mapOrdersRows(source.rows || []);
+    const provider = normalizeProvider(
+        importData?.provider ||
+        importData?.dataProvider ||
+        resolveAccountContext(accountId).provider
+    );
+    const source = importData?.orders || createEmptyImport("orders", provider);
+    const scope = buildImportScope(source, accountId, provider);
+    const mappedEntries = mapOrdersRows(source.rows || [], provider);
     const scopedEntries = applyResolvedAccount(
-        filterEntriesForAccount(mappedEntries, accountId),
-        accountId
+        filterEntriesForAccount(mappedEntries, scope.tradingAccountId),
+        scope
     );
 
     return {
+        provider,
         readOnly: scopedEntries.length > 0,
         fileName: source.fileName || "",
         importedAt: source.importedAt || "",
+        appAccountId: scope.appAccountId,
+        appAccountName: scope.appAccountName,
+        tradingAccountId: scope.tradingAccountId,
+        tradingAccountName: scope.tradingAccountName,
+        csvAccountRaw: scope.csvAccountRaw,
         stats: buildStatsForOrders(scopedEntries),
         entries: scopedEntries,
         previewRows: source.previewRows || [],
@@ -952,11 +1477,17 @@ export function buildOrdersData(importData, accountId = "") {
 }
 
 export function buildFillsData(importData, accountId = "") {
-    const source = importData?.trades || createEmptyImport("trades");
-    const mappedEntries = mapTradesRows(source.rows || []);
+    const provider = normalizeProvider(
+        importData?.provider ||
+        importData?.dataProvider ||
+        resolveAccountContext(accountId).provider
+    );
+    const source = importData?.trades || createEmptyImport("trades", provider);
+    const scope = buildImportScope(source, accountId, provider);
+    const mappedEntries = mapTradesRows(source.rows || [], provider);
     const scopedEntries = applyResolvedAccount(
-        filterEntriesForAccount(mappedEntries, accountId),
-        accountId
+        filterEntriesForAccount(mappedEntries, scope.tradingAccountId),
+        scope
     );
 
     const totalCommission = scopedEntries.reduce((sum, row) => {
@@ -964,9 +1495,15 @@ export function buildFillsData(importData, accountId = "") {
     }, 0);
 
     return {
+        provider,
         readOnly: scopedEntries.length > 0,
         fileName: source.fileName || "",
         importedAt: source.importedAt || "",
+        appAccountId: scope.appAccountId,
+        appAccountName: scope.appAccountName,
+        tradingAccountId: scope.tradingAccountId,
+        tradingAccountName: scope.tradingAccountName,
+        csvAccountRaw: scope.csvAccountRaw,
         stats: {
             total: scopedEntries.length,
             totalCommission,
@@ -978,21 +1515,41 @@ export function buildFillsData(importData, accountId = "") {
 }
 
 export function buildCashHistoryData(importData, accountId = "") {
-    const source = getCashHistorySource(importData);
-    const mappedEntries = mapCashHistoryRows(source.rows || []);
+    const provider = normalizeProvider(
+        importData?.provider ||
+        importData?.dataProvider ||
+        resolveAccountContext(accountId).provider
+    );
+    const source = getCashHistorySource({
+        ...importData,
+        provider,
+    });
+    const scope = buildImportScope(source, accountId, provider);
+    const mappedEntries = mapCashHistoryRows(source.rows || [], provider);
     const scopedEntries = applyResolvedAccount(
-        filterEntriesForAccount(mappedEntries, accountId),
-        accountId
+        filterEntriesForAccount(mappedEntries, scope.tradingAccountId),
+        scope
     );
 
     const totalAmount = scopedEntries.reduce((sum, row) => {
-        return sum + toNumber(row.amount, 0);
+        const currentBalance =
+            parseFlexibleNumber(row.currentBalance) ??
+            parseFlexibleNumber(row.totalAmount) ??
+            0;
+
+        return sum + currentBalance;
     }, 0);
 
     return {
+        provider,
         readOnly: scopedEntries.length > 0,
         fileName: source.fileName || "",
         importedAt: source.importedAt || "",
+        appAccountId: scope.appAccountId,
+        appAccountName: scope.appAccountName,
+        tradingAccountId: scope.tradingAccountId,
+        tradingAccountName: scope.tradingAccountName,
+        csvAccountRaw: scope.csvAccountRaw,
         stats: {
             total: scopedEntries.length,
             totalAmount,
@@ -1012,14 +1569,32 @@ export function deriveCashHistorySnapshot(importData, accountId = "") {
     const sortedEntries = sortEntriesByDate(cashHistoryData.entries || []);
 
     const startingValue = pickFirstMeaningfulNumber(sortedEntries, [
-        (entry) => entry.accountSize,
         (entry) => entry.startingBalance,
+        (entry) => entry.startBalance,
+        (entry) => entry.accountSize,
+        (entry) => entry.currentBalance,
+        (entry) => {
+            const balance = parseFlexibleNumber(entry.currentBalance ?? entry.totalAmount);
+            const pnl = parseFlexibleNumber(
+                entry.dailyPnl ?? entry.netPnl ?? entry.closedPnl ?? entry.amount
+            );
+
+            if (balance === null || pnl === null) {
+                return null;
+            }
+
+            return balance - pnl;
+        },
         (entry) => entry.totalAmount,
         (entry) => entry.amount,
     ]);
 
     const currentValue = pickLastMeaningfulNumber(sortedEntries, [
+        (entry) => entry.currentBalance,
+        (entry) => entry.endingBalance,
+        (entry) => entry.accountBalance,
         (entry) => entry.totalAmount,
+        (entry) => entry.balance,
         (entry) => entry.amount,
         (entry) => entry.startingBalance,
         (entry) => entry.accountSize,
@@ -1038,6 +1613,7 @@ export function deriveCashHistorySnapshot(importData, accountId = "") {
                 : 0;
 
     return {
+        provider: cashHistoryData.provider,
         hasValues: startingValue !== null || currentValue !== null,
         rowCount: sortedEntries.length,
         firstDate: cleanString(firstEntry?.date || firstEntry?.timestamp || ""),
@@ -1047,15 +1623,26 @@ export function deriveCashHistorySnapshot(importData, accountId = "") {
         currentBalance,
         sourceFileName: cashHistoryData.fileName || "",
         importedAt: cashHistoryData.importedAt || "",
+        appAccountId: cashHistoryData.appAccountId || "",
+        appAccountName: cashHistoryData.appAccountName || "",
+        tradingAccountId: cashHistoryData.tradingAccountId || "",
+        tradingAccountName: cashHistoryData.tradingAccountName || "",
+        csvAccountRaw: cashHistoryData.csvAccountRaw || "",
     };
 }
 
 export function buildPerformanceData(importData, accountId = "") {
-    const source = importData?.performance || createEmptyImport("performance");
-    const mappedEntries = mapPerformanceRows(source.rows || []);
+    const provider = normalizeProvider(
+        importData?.provider ||
+        importData?.dataProvider ||
+        resolveAccountContext(accountId).provider
+    );
+    const source = importData?.performance || createEmptyImport("performance", provider);
+    const scope = buildImportScope(source, accountId, provider);
+    const mappedEntries = mapPerformanceRows(source.rows || [], provider);
     const scopedEntries = applyResolvedAccount(
-        filterEntriesForAccount(mappedEntries, accountId),
-        accountId
+        filterEntriesForAccount(mappedEntries, scope.tradingAccountId),
+        scope
     );
 
     const totalPnl = scopedEntries.reduce((sum, row) => {
@@ -1063,9 +1650,15 @@ export function buildPerformanceData(importData, accountId = "") {
     }, 0);
 
     return {
+        provider,
         readOnly: scopedEntries.length > 0,
         fileName: source.fileName || "",
         importedAt: source.importedAt || "",
+        appAccountId: scope.appAccountId,
+        appAccountName: scope.appAccountName,
+        tradingAccountId: scope.tradingAccountId,
+        tradingAccountName: scope.tradingAccountName,
+        csvAccountRaw: scope.csvAccountRaw,
         stats: {
             total: scopedEntries.length,
             totalPnl,
@@ -1077,11 +1670,17 @@ export function buildPerformanceData(importData, accountId = "") {
 }
 
 export function buildPositionHistoryData(importData, accountId = "") {
-    const source = importData?.positionHistory || createEmptyImport("positionHistory");
-    const mappedEntries = mapPositionHistoryRows(source.rows || []);
+    const provider = normalizeProvider(
+        importData?.provider ||
+        importData?.dataProvider ||
+        resolveAccountContext(accountId).provider
+    );
+    const source = importData?.positionHistory || createEmptyImport("positionHistory", provider);
+    const scope = buildImportScope(source, accountId, provider);
+    const mappedEntries = mapPositionHistoryRows(source.rows || [], provider);
     const scopedEntries = applyResolvedAccount(
-        filterEntriesForAccount(mappedEntries, accountId),
-        accountId
+        filterEntriesForAccount(mappedEntries, scope.tradingAccountId),
+        scope
     );
 
     const totalPnl = scopedEntries.reduce((sum, row) => {
@@ -1089,9 +1688,15 @@ export function buildPositionHistoryData(importData, accountId = "") {
     }, 0);
 
     return {
+        provider,
         readOnly: scopedEntries.length > 0,
         fileName: source.fileName || "",
         importedAt: source.importedAt || "",
+        appAccountId: scope.appAccountId,
+        appAccountName: scope.appAccountName,
+        tradingAccountId: scope.tradingAccountId,
+        tradingAccountName: scope.tradingAccountName,
+        csvAccountRaw: scope.csvAccountRaw,
         stats: {
             total: scopedEntries.length,
             totalPnl,
@@ -1108,19 +1713,41 @@ export function buildAccountReportData(importData, accountId = "") {
 
 export function buildLiveCardData(importData, accountId = "", account = {}) {
     const resolvedAccountId = cleanString(accountId);
-    const cashHistoryData = buildCashHistoryData(importData, resolvedAccountId);
-    const cashHistorySnapshot = deriveCashHistorySnapshot(importData, resolvedAccountId);
+    const provider = normalizeProvider(
+        importData?.provider ||
+        importData?.dataProvider ||
+        account?.dataProvider ||
+        account?.source?.provider ||
+        DEFAULT_PROVIDER
+    );
+    const cashHistoryData = buildCashHistoryData(
+        {
+            ...importData,
+            provider,
+        },
+        resolvedAccountId
+    );
+    const cashHistorySnapshot = deriveCashHistorySnapshot(
+        {
+            ...importData,
+            provider,
+        },
+        resolvedAccountId
+    );
     const sortedEntries = sortEntriesByDate(cashHistoryData.entries || []);
 
-    const importedAccountLabel = pickFirstMeaningfulText(sortedEntries, [
-        (entry) => entry.accountName,
-        (entry) => entry.accountId,
-        (entry) => entry.raw?.accountName,
-        (entry) => entry.raw?.accountId,
-        (entry) => entry.raw?.Account,
-        (entry) => entry.raw?.["Account Name"],
-        (entry) => entry.raw?.["Account ID"],
-    ]);
+    const importedAccountLabel =
+        cleanString(cashHistoryData.tradingAccountName) ||
+        cleanString(cashHistoryData.tradingAccountId) ||
+        pickFirstMeaningfulText(sortedEntries, [
+            (entry) => entry.accountName,
+            (entry) => entry.accountId,
+            (entry) => entry.raw?.accountName,
+            (entry) => entry.raw?.accountId,
+            (entry) => entry.raw?.Account,
+            (entry) => entry.raw?.["Account Name"],
+            (entry) => entry.raw?.["Account ID"],
+        ]);
 
     const fallbackAccountSize = toNumber(account?.accountSize, 0);
     const fallbackCurrentBalance = toNumber(account?.currentBalance, fallbackAccountSize);
@@ -1144,12 +1771,24 @@ export function buildLiveCardData(importData, accountId = "", account = {}) {
     const realizedPnL = realizedBalance - startBalance;
 
     return {
+        provider,
         accountId:
             importedAccountLabel ||
             resolvedAccountId ||
             cleanString(account?.id) ||
             cleanString(account?.accountId),
-        platform: cleanString(account?.platform) || "Tradovate",
+        tradingAccountId:
+            cleanString(cashHistoryData.tradingAccountId) ||
+            importedAccountLabel,
+        tradingAccountName:
+            cleanString(cashHistoryData.tradingAccountName) ||
+            importedAccountLabel,
+        appAccountId: cleanString(cashHistoryData.appAccountId) || resolvedAccountId,
+        appAccountName: cleanString(cashHistoryData.appAccountName),
+        platform:
+            provider === "atas"
+                ? "ATAS"
+                : cleanString(account?.platform) || "Tradovate",
         product: cleanString(account?.productType) || "EOD",
         phase: cleanString(account?.accountPhase) || "EVAL",
         accountSize,

@@ -1,0 +1,1 @@
+export const RISK_ALERT_EVENT_NAME = "future-dashboard-risk-alert";

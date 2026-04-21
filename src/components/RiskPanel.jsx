@@ -1,19 +1,22 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { buildFillAnalytics } from "../utils/fillAnalytics";
 import { formatDateTime } from "../utils/dateFormat";
 import { buildApexRiskSnapshot } from "../utils/apexRiskSnapshot";
-import { buildRiskLimitState, getRiskStatusColors } from "../utils/riskLimitState";
-import { detectAccountSize } from "../utils/storage";
-import RiskTestRunner from "../components/RiskTestRunner";
-
-const SHOW_INTERNAL_TEST_UI = import.meta.env.DEV;
+import { saveRiskStatusForAccount } from "../utils/accountRiskStatus";
+import { resolveAccountImportsFromSources } from "../utils/accountImports";
+import * as csvImportUtils from "../utils/csvImportUtils";
+import {
+    detectAccountSize,
+    saveDailyState,
+    saveLiveAccountSnapshot,
+} from "../utils/storage";
+import { RISK_ALERT_EVENT_NAME } from "../utils/riskAlertEvents";
 
 const COLORS = {
     panelBg: "rgba(255, 255, 255, 0.04)",
-    panelBgStrong: "rgba(255, 255, 255, 0.06)",
-    border: "rgba(125, 211, 252, 0.18)",
-    borderStrong: "rgba(125, 211, 252, 0.28)",
-    shadow: "0 0 30px rgba(0, 0, 0, 0.25)",
+    border: "rgba(125, 211, 252, 0.16)",
+    borderStrong: "rgba(125, 211, 252, 0.24)",
+    shadow: "0 0 14px rgba(0, 0, 0, 0.16)",
     title: "#e0f2fe",
     text: "#dbeafe",
     textSoft: "#94a3b8",
@@ -25,42 +28,38 @@ const COLORS = {
     yellow: "#facc15",
 };
 
-const DEFAULT_SIMULATION_DRAFT = {
-    instrument: "MNQ",
-    side: "long",
-    qty: 1,
-    pnl: 0,
-};
-
-const EMPTY_SIMULATION = {
-    trades: [],
-    updatedAt: null,
-};
-
 const INSTRUMENT_CONFIG = {
     MNQ: {
         label: "MNQ",
         tickSize: 0.25,
         tickValue: 0.5,
         pointValue: 2,
+        apexUnit: 0.1,
+        family: "NQ",
     },
     NQ: {
         label: "NQ",
         tickSize: 0.25,
         tickValue: 5,
         pointValue: 20,
+        apexUnit: 1,
+        family: "NQ",
     },
     MES: {
         label: "MES",
         tickSize: 0.25,
         tickValue: 1.25,
         pointValue: 5,
+        apexUnit: 0.1,
+        family: "ES",
     },
     ES: {
         label: "ES",
         tickSize: 0.25,
         tickValue: 12.5,
         pointValue: 50,
+        apexUnit: 1,
+        family: "ES",
     },
 };
 
@@ -73,14 +72,26 @@ const APEX_MODE_OPTIONS = [
 
 const APEX_ACCOUNT_SIZE_OPTIONS = [25000, 50000, 100000, 150000];
 const TRADING_TIMEZONE = "America/New_York";
+
 const ACCOUNT_MATCH_KEYS = [
+    "_accountId",
+    "_accountid",
     "account",
     "accountId",
     "account_id",
+    "accountNumber",
+    "account_name",
+    "accountName",
     "Account",
     "Account ID",
-    "accountName",
-    "account_name",
+    "Account Id",
+    "Account Name",
+    "Account Number",
+    "Trading Account",
+    "Trading Account ID",
+    "Trading Account Name",
+    "tradingAccountId",
+    "tradingAccountName",
 ];
 
 function cleanString(value) {
@@ -91,14 +102,397 @@ function cleanString(value) {
     return String(value).trim();
 }
 
-function toNumber(value, fallback = 0) {
-    if (typeof value === "number") {
-        return Number.isFinite(value) ? value : fallback;
+function normalizeProvider(value) {
+    const lower = cleanString(value).toLowerCase();
+
+    if (!lower) {
+        return "";
     }
 
-    const safeValue = cleanString(value).replace(",", ".");
-    const parsed = Number(safeValue);
-    return Number.isFinite(parsed) ? parsed : fallback;
+    if (lower.includes("atas")) {
+        return "atas";
+    }
+
+    if (lower.includes("trado")) {
+        return "tradovate";
+    }
+
+    return lower;
+}
+
+function formatProviderLabel(value) {
+    const provider = normalizeProvider(value);
+
+    if (provider === "atas") {
+        return "ATAS";
+    }
+
+    if (provider === "tradovate") {
+        return "Tradovate";
+    }
+
+    return provider ? provider.toUpperCase() : "Tradovate";
+}
+
+function resolvePanelProvider(props, resolvedAccount) {
+    const candidates = [
+        props?.dataProvider,
+        props?.activeProvider,
+        props?.provider,
+        props?.sourceProvider,
+        resolvedAccount?.dataProvider,
+        resolvedAccount?.activeProvider,
+        resolvedAccount?.sourceProvider,
+        resolvedAccount?.source?.provider,
+    ];
+
+    for (const candidate of candidates) {
+        const normalized = normalizeProvider(candidate);
+
+        if (normalized === "atas" || normalized === "tradovate") {
+            return normalized;
+        }
+    }
+
+    return "tradovate";
+}
+
+function hasImportRows(importEntry) {
+    if (!importEntry || typeof importEntry !== "object") {
+        return false;
+    }
+
+    if (Array.isArray(importEntry.rows) && importEntry.rows.length) {
+        return true;
+    }
+
+    if (Array.isArray(importEntry.previewRows) && importEntry.previewRows.length) {
+        return true;
+    }
+
+    if (Array.isArray(importEntry.headers) && importEntry.headers.length) {
+        return true;
+    }
+
+    if (cleanString(importEntry.rawText)) {
+        return true;
+    }
+
+    return false;
+}
+
+function looksLikeImportCollection(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return false;
+    }
+
+    return (
+        Object.prototype.hasOwnProperty.call(value, "orders") ||
+        Object.prototype.hasOwnProperty.call(value, "trades") ||
+        Object.prototype.hasOwnProperty.call(value, "cashHistory") ||
+        Object.prototype.hasOwnProperty.call(value, "dailySummary") ||
+        Object.prototype.hasOwnProperty.call(value, "performance") ||
+        Object.prototype.hasOwnProperty.call(value, "positionHistory")
+    );
+}
+
+function hasImportCollectionContent(value) {
+    if (!looksLikeImportCollection(value)) {
+        return false;
+    }
+
+    const keys = [
+        "orders",
+        "trades",
+        "cashHistory",
+        "dailySummary",
+        "performance",
+        "positionHistory",
+    ];
+
+    return keys.some((key) => hasImportRows(value?.[key]));
+}
+
+function resolveImportsForProvider(provider, ...sources) {
+    const normalizedProvider = normalizeProvider(provider);
+
+    for (const source of sources) {
+        if (!source || typeof source !== "object") {
+            continue;
+        }
+
+        if (
+            normalizedProvider &&
+            looksLikeImportCollection(source?.[normalizedProvider])
+        ) {
+            return source[normalizedProvider];
+        }
+
+        if (
+            normalizedProvider &&
+            looksLikeImportCollection(source?.byProvider?.[normalizedProvider])
+        ) {
+            return source.byProvider[normalizedProvider];
+        }
+
+        if (
+            normalizedProvider &&
+            looksLikeImportCollection(source?.importsByProvider?.[normalizedProvider])
+        ) {
+            return source.importsByProvider[normalizedProvider];
+        }
+
+        if (
+            normalizedProvider &&
+            looksLikeImportCollection(source?.providers?.[normalizedProvider])
+        ) {
+            return source.providers[normalizedProvider];
+        }
+
+        if (hasImportCollectionContent(source)) {
+            return source;
+        }
+    }
+
+    for (const source of sources) {
+        if (looksLikeImportCollection(source)) {
+            return source;
+        }
+    }
+
+    return {};
+}
+
+function loadParsedImportsForProvider(accountId, provider) {
+    if (typeof csvImportUtils.getAllParsedImports !== "function") {
+        return {};
+    }
+
+    const attempts = [
+        () => csvImportUtils.getAllParsedImports(accountId, { provider }),
+        () => csvImportUtils.getAllParsedImports(accountId, provider),
+        () => csvImportUtils.getAllParsedImports(accountId),
+    ];
+
+    let fallback = {};
+
+    for (const attempt of attempts) {
+        try {
+            const result = attempt();
+
+            if (!result || typeof result !== "object") {
+                continue;
+            }
+
+            const scoped = resolveImportsForProvider(provider, result);
+
+            if (hasImportCollectionContent(scoped)) {
+                return scoped;
+            }
+
+            if (hasImportCollectionContent(result)) {
+                return result;
+            }
+
+            if (!Array.isArray(result) && Object.keys(result).length) {
+                fallback = result;
+            }
+        } catch {
+            continue;
+        }
+    }
+
+    return fallback;
+}
+
+function getImportEventNames(provider) {
+    const names = new Set([
+        "tradovate-csv-imports-updated",
+        "csv-imports-updated",
+    ]);
+
+    const normalizedProvider = normalizeProvider(provider);
+
+    if (normalizedProvider) {
+        names.add(`${normalizedProvider}-csv-imports-updated`);
+    }
+
+    if (typeof csvImportUtils.getCsvImportEventName === "function") {
+        const attempts = [
+            () => csvImportUtils.getCsvImportEventName({ provider: normalizedProvider }),
+            () => csvImportUtils.getCsvImportEventName(normalizedProvider),
+            () => csvImportUtils.getCsvImportEventName(),
+        ];
+
+        attempts.forEach((attempt) => {
+            try {
+                const value = cleanString(attempt());
+                if (value) {
+                    names.add(value);
+                }
+            } catch {
+                return;
+            }
+        });
+    }
+
+    return Array.from(names);
+}
+
+function callImportBuilder(builderName, imports, accountId, provider) {
+    const builder = csvImportUtils?.[builderName];
+
+    if (typeof builder !== "function") {
+        return { entries: [] };
+    }
+
+    const attempts = [
+        () => builder(imports, accountId, { provider }),
+        () => builder(imports, accountId, provider),
+        () => builder(imports, accountId),
+    ];
+
+    for (const attempt of attempts) {
+        try {
+            const result = attempt();
+
+            if (result && typeof result === "object") {
+                return result;
+            }
+        } catch {
+            continue;
+        }
+    }
+
+    return { entries: [] };
+}
+
+function looksLikeInternalAccountId(value) {
+    const text = cleanString(value);
+
+    if (!text) {
+        return false;
+    }
+
+    return (
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text) ||
+        /^acc-\d+-[a-z0-9]+$/i.test(text)
+    );
+}
+
+function normalizeString(value) {
+    return cleanString(value).toLowerCase();
+}
+
+function normalizeDigits(value) {
+    return cleanString(value).replace(/\D/g, "");
+}
+
+function buildFlexibleSource(source) {
+    const map = {};
+
+    if (!source || typeof source !== "object") {
+        return map;
+    }
+
+    Object.keys(source).forEach((key) => {
+        const normalizedKey = cleanString(key).toLowerCase().replace(/[^a-z0-9]/g, "");
+
+        if (!normalizedKey) {
+            return;
+        }
+
+        if (map[normalizedKey] === undefined) {
+            map[normalizedKey] = source[key];
+        }
+    });
+
+    return map;
+}
+
+function pickFlexibleValue(source, keys) {
+    for (const key of keys) {
+        const normalizedKey = cleanString(key).toLowerCase().replace(/[^a-z0-9]/g, "");
+
+        if (!normalizedKey) {
+            continue;
+        }
+
+        const value = source[normalizedKey];
+
+        if (value !== undefined && value !== null && value !== "") {
+            return value;
+        }
+    }
+
+    return "";
+}
+
+function parseFlexibleNumber(value) {
+    if (typeof value === "number") {
+        return Number.isFinite(value) ? value : null;
+    }
+
+    const textValue = cleanString(value);
+
+    if (!textValue) {
+        return null;
+    }
+
+    let text = textValue
+        .replace(/\s/g, "")
+        .replace(/[$€£]/g, "")
+        .replace(/USD|EUR|CHF/gi, "")
+        .replace(/'/g, "");
+
+    const negativeByParens = text.startsWith("(") && text.endsWith(")");
+    text = text.replace(/[()]/g, "");
+
+    if (!text) {
+        return null;
+    }
+
+    const hasComma = text.includes(",");
+    const hasDot = text.includes(".");
+
+    if (hasComma && hasDot) {
+        if (text.lastIndexOf(",") > text.lastIndexOf(".")) {
+            text = text.replace(/\./g, "").replace(/,/g, ".");
+        } else {
+            text = text.replace(/,/g, "");
+        }
+    } else if (hasComma && !hasDot) {
+        const lastPart = text.split(",").pop() || "";
+
+        if (lastPart.length === 1 || lastPart.length === 2) {
+            text = text.replace(/,/g, ".");
+        } else {
+            text = text.replace(/,/g, "");
+        }
+    }
+
+    const parsed = Number(text);
+
+    if (!Number.isFinite(parsed)) {
+        return null;
+    }
+
+    return negativeByParens ? -Math.abs(parsed) : parsed;
+}
+
+function toNumber(value, fallback = 0) {
+    const parsed = parseFlexibleNumber(value);
+    return parsed !== null ? parsed : fallback;
+}
+
+function toSafeInteger(value, fallback = 1) {
+    const parsed = Math.round(toNumber(value, fallback));
+
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return fallback;
+    }
+
+    return parsed;
 }
 
 function normalizeAccountSize(value, fallback = 0) {
@@ -134,6 +528,22 @@ function formatAccountSizeLabel(value) {
     return `${Math.round(normalized / 1000)}K`;
 }
 
+function formatAccountSizeValue(value) {
+    const label = formatAccountSizeLabel(value);
+
+    if (label) {
+        return label;
+    }
+
+    const numeric = toNumber(value, 0);
+
+    if (numeric <= 0) {
+        return "–";
+    }
+
+    return String(numeric);
+}
+
 function formatCurrency(value) {
     if (value === null || value === undefined || Number.isNaN(Number(value))) {
         return "–";
@@ -154,22 +564,6 @@ function formatSignedCurrency(value) {
     return numeric >= 0 ? `+${absolute}` : `-${absolute}`;
 }
 
-function formatAccountSizeValue(value) {
-    const label = formatAccountSizeLabel(value);
-
-    if (label) {
-        return label;
-    }
-
-    const numeric = toNumber(value, 0);
-
-    if (numeric <= 0) {
-        return "–";
-    }
-
-    return String(numeric);
-}
-
 function formatDecimal(value, digits = 2) {
     if (value === null || value === undefined || !Number.isFinite(Number(value))) {
         return "–";
@@ -181,20 +575,12 @@ function formatDecimal(value, digits = 2) {
     });
 }
 
-function formatPoints(value) {
+function formatPercent(value, digits = 2) {
     if (value === null || value === undefined || !Number.isFinite(Number(value))) {
         return "–";
     }
 
-    return `${formatDecimal(value, 2)} P`;
-}
-
-function formatTicks(value) {
-    if (value === null || value === undefined || !Number.isFinite(Number(value))) {
-        return "–";
-    }
-
-    return `${formatDecimal(value, 0)} Ticks`;
+    return `${formatDecimal(value, digits)}%`;
 }
 
 function formatRatio(value) {
@@ -205,83 +591,47 @@ function formatRatio(value) {
     return `${formatDecimal(value, 2)}R`;
 }
 
-function formatPercent(value, digits = 2) {
+function formatExposureUnits(value) {
     if (value === null || value === undefined || !Number.isFinite(Number(value))) {
         return "–";
     }
 
-    return `${formatDecimal(value, digits)}%`;
+    return `${formatDecimal(value, 2)} AE`;
 }
 
-function normalizeString(value) {
-    return cleanString(value).toLowerCase();
-}
+function formatTradingDayLabel(isoDate) {
+    const value = cleanString(isoDate);
 
-function normalizeDigits(value) {
-    return cleanString(value).replace(/\D/g, "");
-}
-
-function getSimulationStorageKey(accountId) {
-    const normalized = normalizeString(accountId) || "__unknown_account__";
-    return `trade-simulation:${normalized}`;
-}
-
-function toSafeInteger(value, fallback = 1) {
-    const parsed = Math.round(toNumber(value, fallback));
-
-    if (!Number.isFinite(parsed) || parsed <= 0) {
-        return fallback;
+    if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        return "–";
     }
 
-    return parsed;
+    const [year, month, day] = value.split("-");
+    return `${day}.${month}.${year}`;
 }
 
-function createId() {
-    return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function getTradeSimulationForAccount(accountId) {
-    if (typeof window === "undefined") {
-        return EMPTY_SIMULATION;
-    }
-
-    try {
-        const raw = window.localStorage.getItem(getSimulationStorageKey(accountId));
-
-        if (!raw) {
-            return EMPTY_SIMULATION;
-        }
-
-        const parsed = JSON.parse(raw);
-
+function getStatusUi(status) {
+    if (status === "red" || status === "danger") {
         return {
-            trades: Array.isArray(parsed?.trades)
-                ? parsed.trades.filter(Boolean).map((trade) => ({
-                    id: cleanString(trade?.id) || createId(),
-                    accountId: cleanString(trade?.accountId),
-                    instrument: cleanString(trade?.instrument) || "MNQ",
-                    side: cleanString(trade?.side) === "short" ? "short" : "long",
-                    qty: toSafeInteger(trade?.qty, 1),
-                    pnl: toNumber(trade?.pnl, 0),
-                    createdAt: cleanString(trade?.createdAt) || new Date().toISOString(),
-                }))
-                : [],
-            updatedAt: cleanString(parsed?.updatedAt) || null,
+            border: "rgba(248, 113, 113, 0.28)",
+            background: "rgba(248, 113, 113, 0.08)",
+            text: COLORS.red,
         };
-    } catch {
-        return EMPTY_SIMULATION;
-    }
-}
-
-function persistTradeSimulationForAccount(accountId, simulation) {
-    if (typeof window === "undefined") {
-        return;
     }
 
-    window.localStorage.setItem(
-        getSimulationStorageKey(accountId),
-        JSON.stringify(simulation)
-    );
+    if (status === "yellow" || status === "warning") {
+        return {
+            border: "rgba(251, 146, 60, 0.26)",
+            background: "rgba(251, 146, 60, 0.08)",
+            text: COLORS.orange,
+        };
+    }
+
+    return {
+        border: "rgba(74, 222, 128, 0.26)",
+        background: "rgba(74, 222, 128, 0.08)",
+        text: COLORS.green,
+    };
 }
 
 function firstString(row, keys) {
@@ -410,9 +760,25 @@ function getTradingDayKey(input) {
 }
 
 function getFillTimestamp(row) {
+    const flexible = buildFlexibleSource(row);
+
     return (
         toDateOrNull(
-            firstString(row, [
+            pickFlexibleValue(flexible, [
+                "timestamp",
+                "timestampIso",
+                "time",
+                "dateTime",
+                "datetime",
+                "filledAt",
+                "fillTime",
+                "executionTime",
+                "execTime",
+                "tradeDate",
+                "date",
+                "createdAt",
+                "Created At",
+            ]) || firstString(row, [
                 "timestamp",
                 "timestampIso",
                 "time",
@@ -438,18 +804,45 @@ function getFillPnl(row) {
         "realizedPnl",
         "realized_pnl",
         "profit",
+        "profitLoss",
         "netPnl",
+        "dailyPnl",
         "Realized PnL",
+        "Net PnL",
+        "P/L",
     ].reduce((result, key) => {
         if (result !== null) {
             return result;
         }
+
         const value = row?.[key];
+
         if (typeof value === "number" && Number.isFinite(value)) {
             return value;
         }
-        const parsed = toNumber(value, null);
+
+        const parsed = parseFlexibleNumber(value);
         return parsed !== null ? parsed : null;
+    }, null);
+}
+
+function getFillCommission(row) {
+    return [
+        "commission",
+        "Commission",
+    ].reduce((result, key) => {
+        if (result !== null) {
+            return result;
+        }
+
+        const value = row?.[key];
+
+        if (typeof value === "number" && Number.isFinite(value)) {
+            return Math.abs(value);
+        }
+
+        const parsed = parseFlexibleNumber(value);
+        return parsed !== null ? Math.abs(parsed) : null;
     }, null);
 }
 
@@ -477,11 +870,15 @@ function getTradeKey(row, timestamp) {
     return `${instrument}|${side}|${qty}|${timestamp.toISOString()}`;
 }
 
-function getUniqueTradesForToday(rows) {
+function getUniqueTradesForDay(rows, tradingDayKey) {
     const safeRows = Array.isArray(rows) ? rows : [];
-    const todayTradingDayKey = getTradingDayKey(new Date());
+    const targetTradingDayKey = cleanString(tradingDayKey);
     const seen = new Set();
     const result = [];
+
+    if (!targetTradingDayKey) {
+        return [];
+    }
 
     for (const row of safeRows) {
         const timestamp = getFillTimestamp(row);
@@ -490,7 +887,7 @@ function getUniqueTradesForToday(rows) {
             continue;
         }
 
-        if (getTradingDayKey(timestamp) !== todayTradingDayKey) {
+        if (getTradingDayKey(timestamp) !== targetTradingDayKey) {
             continue;
         }
 
@@ -519,7 +916,14 @@ function rowMatchesAccount(row, accountId) {
         return true;
     }
 
-    const candidates = [firstString(row, ACCOUNT_MATCH_KEYS)].filter(Boolean);
+    const candidates = ACCOUNT_MATCH_KEYS.map((key) => {
+        if (row && Object.prototype.hasOwnProperty.call(row, key)) {
+            return cleanString(row[key]);
+        }
+
+        const flexible = buildFlexibleSource(row);
+        return cleanString(pickFlexibleValue(flexible, [key]));
+    }).filter(Boolean);
 
     if (!candidates.length) {
         return false;
@@ -552,7 +956,15 @@ function rowMatchesAccount(row, accountId) {
 }
 
 function rowHasAccountReference(row) {
-    return Boolean(firstString(row, ACCOUNT_MATCH_KEYS));
+    const flexible = buildFlexibleSource(row);
+
+    return ACCOUNT_MATCH_KEYS.some((key) => {
+        if (row && Object.prototype.hasOwnProperty.call(row, key) && cleanString(row[key])) {
+            return true;
+        }
+
+        return Boolean(cleanString(pickFlexibleValue(flexible, [key])));
+    });
 }
 
 function scopeRowsByAccount(rows, accountId) {
@@ -579,15 +991,33 @@ function scopeRowsByAccount(rows, accountId) {
 }
 
 function getBalanceTimestamp(row) {
+    const flexible = buildFlexibleSource(row);
+
     return (
         toDateOrNull(
-            firstString(row, [
+            pickFlexibleValue(flexible, [
                 "timestamp",
                 "time",
                 "dateTime",
                 "datetime",
                 "tradeDate",
                 "transactionDate",
+                "businessDate",
+                "statementDate",
+                "runDate",
+                "date",
+                "createdAt",
+                "updatedAt",
+            ]) || firstString(row, [
+                "timestamp",
+                "time",
+                "dateTime",
+                "datetime",
+                "tradeDate",
+                "transactionDate",
+                "businessDate",
+                "statementDate",
+                "runDate",
                 "date",
                 "Date",
                 "createdAt",
@@ -598,30 +1028,206 @@ function getBalanceTimestamp(row) {
 }
 
 function getBalanceValue(row) {
-    const keys = [
-        "totalAmount",
-        "currentBalance",
-        "balance",
-        "Balance",
-        "accountBalance",
-        "Account Balance",
-        "endBalance",
-        "endingBalance",
-        "equity",
-        "netLiq",
-        "Net Liq",
-        "cashBalance",
-        "amount",
-    ];
+    if (!row || typeof row !== "object") {
+        return null;
+    }
 
-    for (const key of keys) {
-        const parsed = toNumber(row?.[key], null);
-        if (parsed !== null) {
-            return parsed;
+    const flexible = buildFlexibleSource(row);
+
+    const value = pickFlexibleValue(flexible, [
+        "currentBalance",
+        "endingBalance",
+        "endBalance",
+        "closingBalance",
+        "endOfDayBalance",
+        "eodBalance",
+        "balanceAfter",
+        "endingCash",
+        "cashAfter",
+        "netLiq",
+        "accountBalance",
+        "cashBalance",
+        "totalAmount",
+        "amount",
+        "balance",
+        "Current Balance",
+        "Ending Balance",
+        "End Balance",
+        "Closing Balance",
+        "End Of Day Balance",
+        "Net Liq",
+        "Account Balance",
+        "Cash Balance",
+        "Total Amount",
+        "Amount",
+        "Balance",
+    ]);
+
+    const parsed = parseFlexibleNumber(value);
+    return parsed !== null ? parsed : null;
+}
+
+function getExplicitStartingBalanceValue(row) {
+    if (!row || typeof row !== "object") {
+        return null;
+    }
+
+    const flexible = buildFlexibleSource(row);
+
+    const value = pickFlexibleValue(flexible, [
+        "startingBalance",
+        "startBalance",
+        "beginningBalance",
+        "openingBalance",
+        "initialBalance",
+        "balanceBefore",
+        "cashBefore",
+        "priorBalance",
+        "previousBalance",
+        "startOfDayBalance",
+        "Start Balance",
+        "Starting Balance",
+        "Beginning Balance",
+        "Opening Balance",
+        "Initial Balance",
+        "Previous Balance",
+        "Prior Balance",
+        "Start Of Day Balance",
+    ]);
+
+    const parsed = parseFlexibleNumber(value);
+    return parsed !== null ? parsed : null;
+}
+
+function getBalanceRealizedPnl(row) {
+    if (!row || typeof row !== "object") {
+        return null;
+    }
+
+    const flexible = buildFlexibleSource(row);
+
+    const value = pickFlexibleValue(flexible, [
+        "totalRealizedPnl",
+        "realizedPnl",
+        "netPnl",
+        "totalNetPnl",
+        "dayPnl",
+        "dailyPnl",
+        "pnl",
+        "profitLoss",
+        "Total Realized PNL",
+        "Realized PnL",
+        "Net PnL",
+        "Daily PnL",
+        "P/L",
+    ]);
+
+    const parsed = parseFlexibleNumber(value);
+    return parsed !== null ? parsed : null;
+}
+
+function getBalanceNetChange(row) {
+    if (!row || typeof row !== "object") {
+        return null;
+    }
+
+    const flexible = buildFlexibleSource(row);
+
+    const value = pickFlexibleValue(flexible, [
+        "delta",
+        "cashChange",
+        "netChange",
+        "change",
+        "dayChange",
+        "dailyPnl",
+        "dailyPnL",
+        "realizedPnl",
+        "profitLoss",
+        "profit",
+        "pnl",
+        "Delta",
+        "Cash Change",
+        "Net Change",
+        "Daily PnL",
+        "Profit Loss",
+        "P/L",
+        "PnL",
+    ]);
+
+    const parsed = parseFlexibleNumber(value);
+    return parsed !== null ? parsed : null;
+}
+
+function getBalanceDayPnlValue(row) {
+    const realized = getBalanceRealizedPnl(row);
+
+    if (realized !== null && realized !== undefined) {
+        return realized;
+    }
+
+    return getBalanceNetChange(row);
+}
+
+function buildBalanceSummary(rows) {
+    const safeRows = Array.isArray(rows) ? rows : [];
+
+    if (!safeRows.length) {
+        return {
+            startBalance: null,
+            currentBalance: null,
+            latestTradingDayKey: "",
+        };
+    }
+
+    const entries = [...safeRows]
+        .map((row) => {
+            const timestamp = getBalanceTimestamp(row);
+            const explicitStart = getExplicitStartingBalanceValue(row);
+            let end = getBalanceValue(row);
+            const change = getBalanceNetChange(row);
+
+            if ((end === null || end === undefined) && explicitStart !== null && explicitStart !== undefined && change !== null) {
+                end = explicitStart + change;
+            }
+
+            return {
+                row,
+                timestamp,
+                explicitStart,
+                end,
+                change,
+            };
+        })
+        .sort((a, b) => {
+            const aTime = (a.timestamp || new Date(0)).getTime();
+            const bTime = (b.timestamp || new Date(0)).getTime();
+            return aTime - bTime;
+        });
+
+    let startBalance = null;
+    let currentBalance = null;
+
+    for (const entry of entries) {
+        if (startBalance === null || startBalance === undefined) {
+            if (entry.explicitStart !== null && entry.explicitStart !== undefined) {
+                startBalance = entry.explicitStart;
+            }
+        }
+
+        if (entry.end !== null && entry.end !== undefined) {
+            currentBalance = entry.end;
         }
     }
 
-    return null;
+    const latestEntryWithTimestamp = [...entries].reverse().find((entry) => entry.timestamp);
+
+    return {
+        startBalance,
+        currentBalance,
+        latestTradingDayKey: latestEntryWithTimestamp
+            ? getTradingDayKey(latestEntryWithTimestamp.timestamp)
+            : "",
+    };
 }
 
 function deriveAccountSize({
@@ -638,6 +1244,8 @@ function deriveAccountSize({
     }
 
     const candidates = [
+        account?.tradingAccountId,
+        account?.tradingAccountName,
         account?.displayName,
         account?.id,
         account?.accountId,
@@ -655,7 +1263,7 @@ function deriveAccountSize({
     }
 
     const reference =
-        startBalance !== null && startBalance !== undefined
+        startBalance !== null && startBalance !== undefined && startBalance > 0
             ? startBalance
             : currentBalance;
 
@@ -667,47 +1275,110 @@ function sumNumbers(values) {
     return safeValues.reduce((sum, value) => sum + toNumber(value, 0), 0);
 }
 
-function getRiskStatus(tradeCount) {
-    if (tradeCount >= 4) {
-        return {
-            label: "Rot",
-            color: COLORS.red,
-            background: "rgba(248, 113, 113, 0.10)",
-            border: COLORS.red,
-            badgeText: "STOPP !!!",
-            subline: "Auf dem Weg dein Account zu schrotten.",
-            message: "Auf dem Weg dein Account zu schrotten.",
-        };
+function getLatestTradingDayKey(rows, getTimestamp) {
+    const safeRows = Array.isArray(rows) ? rows : [];
+    let latestTimestamp = null;
+    let latestTradingDayKey = "";
+
+    for (const row of safeRows) {
+        const timestamp = getTimestamp(row);
+
+        if (!timestamp) {
+            continue;
+        }
+
+        if (!latestTimestamp || timestamp.getTime() > latestTimestamp.getTime()) {
+            latestTimestamp = timestamp;
+            latestTradingDayKey = getTradingDayKey(timestamp);
+        }
     }
 
-    if (tradeCount === 3) {
-        return {
-            label: "Orange",
-            color: COLORS.orange,
-            background: "rgba(251, 146, 60, 0.10)",
-            border: COLORS.orange,
-            badgeText: "WARNUNG !!!",
-            subline: "FÜR HEUTE IST SCHLUSS.",
-            message:
-                "Drei Trades erreicht. Noch ein Klick bringt dich weg von sauberer Ausführung. Für heute ist Schluss.",
-        };
+    return latestTradingDayKey;
+}
+
+function getRowsForTradingDay(rows, tradingDayKey, getTimestamp) {
+    const safeRows = Array.isArray(rows) ? rows : [];
+    const targetTradingDayKey = cleanString(tradingDayKey);
+
+    if (!targetTradingDayKey) {
+        return [];
     }
 
-    return {
-        label: "Grün",
-        color: COLORS.green,
-        background: "rgba(74, 222, 128, 0.10)",
-        border: COLORS.green,
-        badgeText: "",
-        subline: "",
-        message:
-            "Im Plan. Null bis zwei Trades. Fokus auf saubere Ausführung und Regelkonformität.",
-    };
+    return safeRows.filter((row) => {
+        const timestamp = getTimestamp(row);
+
+        if (!timestamp) {
+            return false;
+        }
+
+        return getTradingDayKey(timestamp) === targetTradingDayKey;
+    });
 }
 
 function getInstrumentConfig(value) {
     const key = cleanString(value).toUpperCase();
-    return INSTRUMENT_CONFIG[key] || INSTRUMENT_CONFIG.MNQ;
+
+    if (key.startsWith("MNQ")) {
+        return INSTRUMENT_CONFIG.MNQ;
+    }
+
+    if (key.startsWith("NQ")) {
+        return INSTRUMENT_CONFIG.NQ;
+    }
+
+    if (key.startsWith("MES")) {
+        return INSTRUMENT_CONFIG.MES;
+    }
+
+    if (key.startsWith("ES")) {
+        return INSTRUMENT_CONFIG.ES;
+    }
+
+    return INSTRUMENT_CONFIG.MNQ;
+}
+
+function getPositionInstrumentKey(position) {
+    return cleanString(
+        position?.instrument ||
+        position?.symbol ||
+        position?.ticker ||
+        position?.contract ||
+        position?.name
+    ).toUpperCase();
+}
+
+function getPositionApexUnit(position) {
+    return getInstrumentConfig(getPositionInstrumentKey(position)).apexUnit;
+}
+
+function getOrderStatusValue(order) {
+    return normalizeString(
+        order?.status ||
+        order?.orderStatus ||
+        order?.state
+    );
+}
+
+function isWorkingOrder(order) {
+    const status = getOrderStatusValue(order);
+
+    if (!status) {
+        return false;
+    }
+
+    return (
+        status.includes("open") ||
+        status.includes("working") ||
+        status.includes("pending") ||
+        status.includes("submit") ||
+        status.includes("accepted") ||
+        status.includes("new")
+    );
+}
+
+function countOpenOrders(orders) {
+    const safeOrders = Array.isArray(orders) ? orders : [];
+    return safeOrders.filter((order) => isWorkingOrder(order)).length;
 }
 
 function normalizeRiskMode(value) {
@@ -799,7 +1470,67 @@ function resolveDefaultRiskMode(resolvedAccount) {
     );
 }
 
-function createDefaultRiskDraft(detectedAccountSize, resolvedAccount) {
+function hasActiveAccountContext(resolvedAccount, resolvedAccountId) {
+    if (cleanString(resolvedAccountId)) {
+        return true;
+    }
+
+    if (!resolvedAccount || typeof resolvedAccount !== "object") {
+        return false;
+    }
+
+    return Boolean(
+        cleanString(resolvedAccount.id) ||
+        cleanString(resolvedAccount.accountId) ||
+        cleanString(resolvedAccount.accountName) ||
+        cleanString(resolvedAccount.name) ||
+        cleanString(resolvedAccount.label) ||
+        cleanString(resolvedAccount.apexId) ||
+        cleanString(resolvedAccount.tradingAccountId)
+    );
+}
+
+function resolveScopeAccountId(resolvedAccount, resolvedAccountId) {
+    const candidates = [
+        resolvedAccount?.tradingAccountId,
+        resolvedAccount?.tradingAccountName,
+        resolvedAccount?.apexId,
+        resolvedAccount?.accountId,
+        resolvedAccount?.accountName,
+        resolvedAccount?.displayName,
+        resolvedAccount?.name,
+        resolvedAccount?.label,
+        resolvedAccountId,
+    ]
+        .map(cleanString)
+        .filter(Boolean);
+
+    for (const candidate of candidates) {
+        if (looksLikeInternalAccountId(candidate)) {
+            continue;
+        }
+
+        return candidate;
+    }
+
+    return "";
+}
+
+function createDefaultRiskDraft(detectedAccountSize, resolvedAccount, hasActiveAccount = true) {
+    if (!hasActiveAccount) {
+        return {
+            mode: "",
+            accountSize: null,
+            dailyTarget: 0,
+            instrument: "MNQ",
+            side: "long",
+            entry: "",
+            stop: "",
+            target: "",
+            qty: 1,
+        };
+    }
+
     const normalizedAccountSize = normalizeAccountSize(
         detectedAccountSize || resolvedAccount?.accountSize,
         25000
@@ -818,103 +1549,145 @@ function createDefaultRiskDraft(detectedAccountSize, resolvedAccount) {
     };
 }
 
-function getCalculatorStatus({
-    hasInputError,
-    hasDirectionError,
-    totalRisk,
-    remainingThresholdRoom,
-    remainingDllRoom,
-    rrRatio,
-    isOverAllowedContracts,
-    hasLiveContractBreach,
+function buildTopAlert({
+    accountName,
+    thresholdRuleStatus,
+    dllRuleStatus,
+    exposureRuleStatus,
+    payoutRuleStatus,
+    inactivityRuleStatus,
 }) {
-    if (hasInputError || hasDirectionError) {
+    const rules = [
+        { key: "Threshold", ...thresholdRuleStatus },
+        { key: "DLL", ...dllRuleStatus },
+        { key: "Exposure", ...exposureRuleStatus },
+        { key: "Payout", ...payoutRuleStatus },
+        { key: "Inactivity", ...inactivityRuleStatus },
+    ];
+
+    const redRule = rules.find((rule) => rule.status === "red");
+    if (redRule) {
         return {
-            label: "Rot",
-            color: COLORS.red,
-            background: "rgba(248, 113, 113, 0.10)",
-            border: COLORS.red,
-            message: "Stop, Ziel oder Richtung passen noch nicht.",
+            status: "red",
+            title: `${accountName}. Regel verletzt.`,
+            message: `${redRule.key} ist verletzt.`,
+            detail: redRule.hint,
         };
     }
 
-    if (hasLiveContractBreach) {
+    const yellowRule = rules.find((rule) => rule.status === "yellow");
+    if (yellowRule) {
         return {
-            label: "Rot",
-            color: COLORS.red,
-            background: "rgba(248, 113, 113, 0.10)",
-            border: COLORS.red,
-            message: "Live Position liegt bereits über der erlaubten Max Kontraktzahl.",
-        };
-    }
-
-    if (isOverAllowedContracts) {
-        return {
-            label: "Rot",
-            color: COLORS.red,
-            background: "rgba(248, 113, 113, 0.10)",
-            border: COLORS.red,
-            message: "Kontraktzahl liegt über der erlaubten Safe Size.",
-        };
-    }
-
-    if (!Number.isFinite(totalRisk) || totalRisk <= 0) {
-        return {
-            label: "Neutral",
-            color: COLORS.textSoft,
-            background: "rgba(148, 163, 184, 0.08)",
-            border: COLORS.border,
-            message: "Trade Daten eingeben, dann rechnet der Block live.",
-        };
-    }
-
-    if (totalRisk > remainingThresholdRoom) {
-        return {
-            label: "Rot",
-            color: COLORS.red,
-            background: "rgba(248, 113, 113, 0.10)",
-            border: COLORS.red,
-            message: "Trade ist zu gross für den aktiven Threshold.",
-        };
-    }
-
-    if (remainingDllRoom !== null && remainingDllRoom !== undefined && totalRisk > remainingDllRoom) {
-        return {
-            label: "Rot",
-            color: COLORS.red,
-            background: "rgba(248, 113, 113, 0.10)",
-            border: COLORS.red,
-            message: "Trade ist zu gross für das aktive DLL.",
-        };
-    }
-
-    const thresholdShare =
-        remainingThresholdRoom > 0 ? totalRisk / remainingThresholdRoom : Number.POSITIVE_INFINITY;
-
-    const dllShare =
-        remainingDllRoom !== null &&
-            remainingDllRoom !== undefined &&
-            remainingDllRoom > 0
-            ? totalRisk / remainingDllRoom
-            : 0;
-
-    if (thresholdShare >= 0.6 || dllShare >= 0.6 || rrRatio < 1) {
-        return {
-            label: "Orange",
-            color: COLORS.orange,
-            background: "rgba(251, 146, 60, 0.10)",
-            border: COLORS.orange,
-            message: "Trade ist eng am Limit oder das CRV ist schwach.",
+            status: "yellow",
+            title: `${accountName}. Achtung.`,
+            message: `${yellowRule.key} ist kritisch.`,
+            detail: yellowRule.hint,
         };
     }
 
     return {
-        label: "Grün",
-        color: COLORS.green,
-        background: "rgba(74, 222, 128, 0.10)",
-        border: COLORS.green,
-        message: "Trade passt sauber in dein aktuelles Risiko.",
+        status: "green",
+        title: `${accountName}. Alles sauber.`,
+        message: "Aktuell liegt keine kritische Regelverletzung vor.",
+        detail: "Threshold, DLL, Exposure, Payout und Inactivity sind im grünen Bereich oder nicht aktiv.",
     };
+}
+
+function TopAlertBar({ alert }) {
+    const ui = getStatusUi(alert.status);
+
+    return (
+        <div
+            style={{
+                border: `1px solid ${ui.border}`,
+                borderRadius: 18,
+                padding: 14,
+                background: ui.background,
+                boxShadow: COLORS.shadow,
+                display: "grid",
+                gap: 5,
+            }}
+        >
+            <div
+                style={{
+                    color: ui.text,
+                    fontSize: 16,
+                    fontWeight: 900,
+                }}
+            >
+                {alert.title}
+            </div>
+
+            <div
+                style={{
+                    color: COLORS.text,
+                    fontSize: 14,
+                    fontWeight: 800,
+                    lineHeight: 1.45,
+                }}
+            >
+                {alert.message}
+            </div>
+
+            <div
+                style={{
+                    color: COLORS.textSoft,
+                    fontSize: 11,
+                    lineHeight: 1.45,
+                }}
+            >
+                {alert.detail}
+            </div>
+        </div>
+    );
+}
+
+function RuleStatusCard({ title, value, hint, status = "green" }) {
+    const ui = getStatusUi(status);
+
+    return (
+        <div
+            style={{
+                background: ui.background,
+                border: `1px solid ${ui.border}`,
+                borderRadius: 14,
+                padding: 12,
+                minHeight: 86,
+                display: "grid",
+                gap: 5,
+            }}
+        >
+            <div
+                style={{
+                    color: COLORS.textSoft,
+                    fontSize: 10,
+                }}
+            >
+                {title}
+            </div>
+
+            <div
+                style={{
+                    color: ui.text,
+                    fontSize: 14,
+                    fontWeight: 800,
+                    wordBreak: "break-word",
+                }}
+            >
+                {value}
+            </div>
+
+            <div
+                style={{
+                    color: COLORS.textSoft,
+                    fontSize: 10,
+                    lineHeight: 1.4,
+                }}
+            >
+                {hint}
+            </div>
+        </div>
+    );
 }
 
 function InfoCard({ label, value, hint, color, background, borderColor }) {
@@ -923,16 +1696,16 @@ function InfoCard({ label, value, hint, color, background, borderColor }) {
             style={{
                 background: background || COLORS.panelBg,
                 border: `1px solid ${borderColor || color || COLORS.border}`,
-                borderRadius: 16,
-                padding: 14,
-                minHeight: 78,
+                borderRadius: 14,
+                padding: 12,
+                minHeight: 72,
             }}
         >
             <div
                 style={{
                     color: COLORS.textSoft,
-                    fontSize: 11,
-                    marginBottom: 6,
+                    fontSize: 10,
+                    marginBottom: 5,
                 }}
             >
                 {label}
@@ -941,7 +1714,7 @@ function InfoCard({ label, value, hint, color, background, borderColor }) {
             <div
                 style={{
                     color: color || COLORS.text,
-                    fontSize: 14,
+                    fontSize: 13,
                     fontWeight: 700,
                     wordBreak: "break-word",
                 }}
@@ -953,9 +1726,9 @@ function InfoCard({ label, value, hint, color, background, borderColor }) {
                 <div
                     style={{
                         color: COLORS.textSoft,
-                        fontSize: 11,
-                        marginTop: 6,
-                        lineHeight: 1.4,
+                        fontSize: 10,
+                        marginTop: 5,
+                        lineHeight: 1.35,
                     }}
                 >
                     {hint}
@@ -965,18 +1738,117 @@ function InfoCard({ label, value, hint, color, background, borderColor }) {
     );
 }
 
-function InputField({ label, children }) {
+function CompactMetricCard({
+    label,
+    value,
+    hint = "",
+    color = COLORS.text,
+    background = "rgba(255, 255, 255, 0.03)",
+    borderColor = COLORS.border,
+}) {
     return (
-        <label
+        <div
             style={{
+                background,
+                border: `1px solid ${borderColor}`,
+                borderRadius: 10,
+                padding: 8,
+                minHeight: 58,
                 display: "grid",
-                gap: 6,
+                gap: 3,
             }}
         >
             <div
                 style={{
                     color: COLORS.textSoft,
-                    fontSize: 12,
+                    fontSize: 8,
+                    lineHeight: 1.2,
+                }}
+            >
+                {label}
+            </div>
+
+            <div
+                style={{
+                    color,
+                    fontSize: 11,
+                    fontWeight: 800,
+                    lineHeight: 1.15,
+                    wordBreak: "break-word",
+                }}
+            >
+                {value || "–"}
+            </div>
+
+            {hint ? (
+                <div
+                    style={{
+                        color: COLORS.textSoft,
+                        fontSize: 8,
+                        lineHeight: 1.25,
+                    }}
+                >
+                    {hint}
+                </div>
+            ) : null}
+        </div>
+    );
+}
+
+function CompactRulePill({ title, value, status = "green" }) {
+    const ui = getStatusUi(status);
+
+    return (
+        <div
+            style={{
+                border: `1px solid ${ui.border}`,
+                borderRadius: 10,
+                padding: "6px 7px",
+                background: ui.background,
+                display: "grid",
+                gap: 2,
+                minHeight: 44,
+            }}
+        >
+            <div
+                style={{
+                    color: COLORS.textSoft,
+                    fontSize: 7,
+                    lineHeight: 1.1,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.05em",
+                }}
+            >
+                {title}
+            </div>
+
+            <div
+                style={{
+                    color: ui.text,
+                    fontSize: 9,
+                    fontWeight: 800,
+                    lineHeight: 1.2,
+                    wordBreak: "break-word",
+                }}
+            >
+                {value}
+            </div>
+        </div>
+    );
+}
+
+function InputField({ label, children }) {
+    return (
+        <label
+            style={{
+                display: "grid",
+                gap: 5,
+            }}
+        >
+            <div
+                style={{
+                    color: COLORS.textSoft,
+                    fontSize: 11,
                     fontWeight: 600,
                 }}
             >
@@ -987,177 +1859,582 @@ function InputField({ label, children }) {
     );
 }
 
-function CenterAlertBox({ riskStatus }) {
-    if (!riskStatus.badgeText) {
-        return null;
-    }
-
+function NeutralRiskPanel() {
     return (
         <div
             style={{
-                width: "100%",
-                minHeight: 150,
-                border: `1px solid ${riskStatus.border}`,
-                borderRadius: 18,
-                background: "rgba(255, 255, 255, 0.02)",
                 display: "grid",
-                justifyItems: "center",
-                alignContent: "center",
                 gap: 14,
-                padding: "20px 24px",
             }}
         >
             <div
                 style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    minHeight: 76,
-                    padding: "0 36px",
-                    borderRadius: 14,
-                    border: `1px solid ${riskStatus.border}`,
-                    background: "rgba(255, 255, 255, 0.05)",
-                    color: riskStatus.color,
-                    fontSize: 44,
-                    fontWeight: 900,
-                    letterSpacing: "0.06em",
-                    textTransform: "uppercase",
-                    boxShadow:
-                        riskStatus.label === "Orange"
-                            ? "0 0 20px rgba(251, 146, 60, 0.18)"
-                            : "0 0 20px rgba(248, 113, 113, 0.18)",
+                    color: COLORS.title,
+                    fontSize: 16,
+                    fontWeight: 800,
                 }}
             >
-                {riskStatus.badgeText}
+                Risk Übersicht
             </div>
 
             <div
                 style={{
-                    color: riskStatus.color,
-                    fontSize: 30,
-                    fontWeight: 900,
-                    lineHeight: 1,
-                    textAlign: "center",
-                    textTransform: "uppercase",
-                    letterSpacing: "0.04em",
-                    textShadow:
-                        riskStatus.label === "Orange"
-                            ? "0 0 20px rgba(251, 146, 60, 0.28)"
-                            : "0 0 20px rgba(248, 113, 113, 0.28)",
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                    gap: 10,
                 }}
             >
-                {riskStatus.subline}
+                <InfoCard
+                    label="Balance"
+                    value="–"
+                    hint="Kein aktiver Account gewählt"
+                    color={COLORS.cyan}
+                />
+                <InfoCard
+                    label="Startbalance"
+                    value="–"
+                    hint="Kein aktiver Account gewählt"
+                    color={COLORS.yellow}
+                />
+                <InfoCard
+                    label="Kontogrösse"
+                    value="–"
+                    hint="Kein aktiver Account gewählt"
+                    color={COLORS.purple}
+                />
             </div>
         </div>
     );
 }
 
 function RiskPanelContent({
+    provider,
     resolvedAccount,
     resolvedAccountId,
-    accountFills,
+    scopeAccountId,
     accountBalanceRows,
-    liveTodayTradeCount,
+    accountFills,
+    accountOrders,
+    activeTradingDayKey,
     liveTodayPnl,
     currentBalance,
     startBalance,
     detectedAccountSize,
     balanceDelta,
-    liveOpenContracts,
+    liveExposureUnits,
     livePositions,
+    showCalculator = true,
 }) {
-    const [tradeSimulation, setTradeSimulation] = useState(() => {
-        return getTradeSimulationForAccount(resolvedAccountId);
-    });
-
-    const [simulationDraft, setSimulationDraft] = useState(
-        DEFAULT_SIMULATION_DRAFT
-    );
-
+    const persistenceRef = useRef("");
     const [riskDraft, setRiskDraft] = useState(() =>
-        createDefaultRiskDraft(detectedAccountSize, resolvedAccount)
+        createDefaultRiskDraft(detectedAccountSize, resolvedAccount, true)
     );
 
-    const simulatedTradeCount = Array.isArray(tradeSimulation?.trades)
-        ? tradeSimulation.trades.length
-        : 0;
+    const compactMode = showCalculator === false;
+    const providerLabel = formatProviderLabel(provider);
 
-    const simulatedPnl = sumNumbers(
-        (tradeSimulation?.trades || []).map((trade) => trade?.pnl || 0)
-    );
+    const openPositionCount = useMemo(() => {
+        return livePositions.filter((position) => Math.abs(toNumber(position?.quantity, 0)) > 0).length;
+    }, [livePositions]);
 
-    const testModeActive =
-        SHOW_INTERNAL_TEST_UI && simulatedTradeCount > 0;
-
-    const effectiveTradeCount = testModeActive
-        ? simulatedTradeCount
-        : liveTodayTradeCount;
-
-    const effectivePnl = testModeActive ? simulatedPnl : liveTodayPnl;
-    const riskStatus = getRiskStatus(effectiveTradeCount);
+    const openOrderCount = useMemo(() => {
+        return countOpenOrders(accountOrders);
+    }, [accountOrders]);
 
     const riskSnapshot = useMemo(() => {
         return buildApexRiskSnapshot({
-            account: resolvedAccount,
+            account: {
+                ...resolvedAccount,
+                provider,
+                dataProvider: provider,
+            },
             mode: riskDraft.mode,
             accountSize: riskDraft.accountSize,
             balanceHistoryRows: accountBalanceRows,
             currentBalance,
-            currentContracts: liveOpenContracts,
+            currentContracts: liveExposureUnits,
+            fills: accountFills,
         });
     }, [
+        provider,
         resolvedAccount,
         riskDraft.mode,
         riskDraft.accountSize,
         accountBalanceRows,
         currentBalance,
-        liveOpenContracts,
+        liveExposureUnits,
+        accountFills,
     ]);
 
-    const currentInstrumentOpenContracts = useMemo(() => {
-        const selectedInstrument = cleanString(riskDraft.instrument).toUpperCase();
-
-        if (!selectedInstrument) {
-            return 0;
+    const thresholdRuleStatus = useMemo(() => {
+        if (riskSnapshot.status?.thresholdBreached) {
+            return {
+                status: "red",
+                value: "Verletzt",
+                hint: `Threshold ${formatCurrency(riskSnapshot.thresholdBalance)}`,
+            };
         }
 
-        const positions = Array.isArray(livePositions) ? livePositions : [];
+        if ((riskSnapshot.distanceToThreshold || 0) <= 250) {
+            return {
+                status: "yellow",
+                value: "Kritisch",
+                hint: `Rest ${formatCurrency(riskSnapshot.distanceToThreshold)}`,
+            };
+        }
 
-        return positions.reduce((sum, position) => {
-            const instrumentKey = cleanString(
-                position?.instrument ||
-                position?.symbol ||
-                position?.ticker ||
-                position?.contract ||
-                position?.name
-            ).toUpperCase();
+        return {
+            status: "green",
+            value: "Sauber",
+            hint: `Rest ${formatCurrency(riskSnapshot.distanceToThreshold)}`,
+        };
+    }, [riskSnapshot]);
 
-            const matchesInstrument =
-                instrumentKey === selectedInstrument ||
-                instrumentKey.startsWith(selectedInstrument) ||
-                selectedInstrument.startsWith(instrumentKey);
+    const dllRuleStatus = useMemo(() => {
+        if (riskSnapshot.dll === null || riskSnapshot.dll === undefined) {
+            return {
+                status: "green",
+                value: "Nicht aktiv",
+                hint: "In diesem Modus gibt es kein DLL.",
+            };
+        }
 
-            if (!matchesInstrument) {
-                return sum;
-            }
+        if (riskSnapshot.status?.dllBreached) {
+            return {
+                status: "red",
+                value: "Verletzt",
+                hint: `Rest ${formatCurrency(riskSnapshot.remainingDll)}`,
+            };
+        }
 
-            return sum + Math.abs(toNumber(position?.quantity, 0));
-        }, 0);
-    }, [livePositions, riskDraft.instrument]);
+        if ((riskSnapshot.remainingDll || 0) <= 150) {
+            return {
+                status: "yellow",
+                value: "Kritisch",
+                hint: `Rest ${formatCurrency(riskSnapshot.remainingDll)}`,
+            };
+        }
 
-    function handleDraftChange(key, value) {
-        setSimulationDraft((prev) => ({
-            ...prev,
-            [key]: value,
-        }));
-    }
+        return {
+            status: "green",
+            value: "Sauber",
+            hint: `Rest ${formatCurrency(riskSnapshot.remainingDll)}`,
+        };
+    }, [riskSnapshot]);
 
-    function handleRiskDraftChange(key, value) {
-        setRiskDraft((prev) => ({
-            ...prev,
-            [key]: value,
-        }));
-    }
+    const exposureRuleStatus = useMemo(() => {
+        if (riskSnapshot.status?.contractBreached) {
+            return {
+                status: "red",
+                value: "Verletzt",
+                hint: `${formatExposureUnits(liveExposureUnits)} von ${formatExposureUnits(riskSnapshot.maxContracts)}`,
+            };
+        }
+
+        const freeExposure = Math.max((riskSnapshot.maxContracts || 0) - toNumber(liveExposureUnits, 0), 0);
+
+        if (freeExposure <= 1) {
+            return {
+                status: "yellow",
+                value: "Kritisch",
+                hint: `Frei ${formatExposureUnits(freeExposure)}`,
+            };
+        }
+
+        return {
+            status: "green",
+            value: "Sauber",
+            hint: `Frei ${formatExposureUnits(freeExposure)}`,
+        };
+    }, [riskSnapshot, liveExposureUnits]);
+
+    const payoutRuleStatus = useMemo(() => {
+        if (riskSnapshot.accountPhase !== "pa") {
+            return {
+                status: "green",
+                value: "Später aktiv",
+                hint: "Payout gilt erst in PA.",
+            };
+        }
+
+        if (!riskSnapshot.payout) {
+            return {
+                status: "yellow",
+                value: "Offen",
+                hint: "Payout Daten fehlen.",
+            };
+        }
+
+        if (riskSnapshot.payout.eligible) {
+            return {
+                status: "green",
+                value: "Frei",
+                hint: `Requestable ${formatCurrency(riskSnapshot.payout.requestableAmountAfterMinimumCheck)}`,
+            };
+        }
+
+        if (riskSnapshot.payout.status === "red") {
+            return {
+                status: "red",
+                value: "Blockiert",
+                hint: riskSnapshot.payout.reasons?.[0] || "Payout blockiert.",
+            };
+        }
+
+        return {
+            status: "yellow",
+            value: "Noch nicht frei",
+            hint: riskSnapshot.payout.reasons?.[0] || "Payout Bedingungen noch offen.",
+        };
+    }, [riskSnapshot]);
+
+    const inactivityRuleStatus = useMemo(() => {
+        if (riskSnapshot.accountPhase !== "pa") {
+            return {
+                status: "green",
+                value: "Später aktiv",
+                hint: "Inactivity gilt erst in PA.",
+            };
+        }
+
+        if (!riskSnapshot.inactivity) {
+            return {
+                status: "yellow",
+                value: "Offen",
+                hint: "Inactivity Daten fehlen.",
+            };
+        }
+
+        if (riskSnapshot.inactivity.status === "red") {
+            return {
+                status: "red",
+                value: "Verletzt",
+                hint: `Tage seit Referenz ${formatDecimal(riskSnapshot.inactivity.daysSinceReference, 0)}`,
+            };
+        }
+
+        if (riskSnapshot.inactivity.status === "yellow") {
+            return {
+                status: "yellow",
+                value: "Kritisch",
+                hint: `Noch ${formatDecimal(riskSnapshot.inactivity.daysRemaining, 0)} Tage`,
+            };
+        }
+
+        return {
+            status: "green",
+            value: "Sauber",
+            hint: `Noch ${formatDecimal(riskSnapshot.inactivity.daysRemaining, 0)} Tage`,
+        };
+    }, [riskSnapshot]);
+
+    const topAlert = useMemo(() => {
+        const accountName =
+            resolvedAccount?.tradingAccountName ||
+            resolvedAccount?.displayName ||
+            scopeAccountId ||
+            resolvedAccountId ||
+            "Account";
+
+        return buildTopAlert({
+            accountName,
+            thresholdRuleStatus,
+            dllRuleStatus,
+            exposureRuleStatus,
+            payoutRuleStatus,
+            inactivityRuleStatus,
+        });
+    }, [
+        resolvedAccount,
+        scopeAccountId,
+        resolvedAccountId,
+        thresholdRuleStatus,
+        dllRuleStatus,
+        exposureRuleStatus,
+        payoutRuleStatus,
+        inactivityRuleStatus,
+    ]);
+
+    const calculator = useMemo(() => {
+        const instrument = getInstrumentConfig(riskDraft.instrument);
+        const side = riskDraft.side === "short" ? "short" : "long";
+        const entry = toNumber(riskDraft.entry, 0);
+        const stop = toNumber(riskDraft.stop, 0);
+        const target = toNumber(riskDraft.target, 0);
+        const qty = toSafeInteger(riskDraft.qty, 1);
+        const dailyTarget = Math.max(toNumber(riskDraft.dailyTarget, 0), 0);
+
+        const hasEntry = entry > 0;
+        const hasStop = stop > 0;
+        const hasTarget = target > 0;
+
+        const stopDistancePoints =
+            hasEntry && hasStop ? Math.abs(entry - stop) : 0;
+        const targetDistancePoints =
+            hasEntry && hasTarget ? Math.abs(target - entry) : 0;
+
+        const stopTicks =
+            stopDistancePoints > 0 ? stopDistancePoints / instrument.tickSize : 0;
+        const targetTicks =
+            targetDistancePoints > 0 ? targetDistancePoints / instrument.tickSize : 0;
+
+        const riskPerContract = stopTicks * instrument.tickValue;
+        const rewardPerContract = targetTicks * instrument.tickValue;
+        const totalRisk = riskPerContract * qty;
+        const totalReward = rewardPerContract * qty;
+        const rrRatio = totalRisk > 0 ? totalReward / totalRisk : null;
+
+        const hasDirectionError =
+            (side === "long" && ((hasStop && stop >= entry) || (hasTarget && target <= entry))) ||
+            (side === "short" && ((hasStop && stop <= entry) || (hasTarget && target >= entry)));
+
+        const hasInputError =
+            !hasEntry ||
+            !hasStop ||
+            !hasTarget ||
+            stopDistancePoints <= 0 ||
+            targetDistancePoints <= 0;
+
+        const remainingThresholdRoom = Math.max(riskSnapshot.distanceToThreshold || 0, 0);
+        const remainingDllRoom =
+            riskSnapshot.dll === null || riskSnapshot.dll === undefined
+                ? null
+                : Math.max(riskSnapshot.remainingDll || 0, 0);
+
+        let status = "green";
+        let message = "Trade passt sauber in dein aktuelles Risiko.";
+
+        if (hasInputError || hasDirectionError) {
+            status = "red";
+            message = "Entry, Stop, Target oder Richtung passen noch nicht.";
+        } else if (totalRisk > remainingThresholdRoom) {
+            status = "red";
+            message = "Trade ist zu gross für den aktiven Threshold.";
+        } else if (
+            remainingDllRoom !== null &&
+            remainingDllRoom !== undefined &&
+            totalRisk > remainingDllRoom
+        ) {
+            status = "red";
+            message = "Trade ist zu gross für das aktive DLL.";
+        } else if ((rrRatio || 0) < 1) {
+            status = "yellow";
+            message = "CRV ist schwach.";
+        }
+
+        const projectedBalanceAfterStop =
+            currentBalance !== null && currentBalance !== undefined
+                ? currentBalance - totalRisk
+                : null;
+
+        const projectedBalanceAfterTarget =
+            currentBalance !== null && currentBalance !== undefined
+                ? currentBalance + totalReward
+                : null;
+
+        const targetGap = Math.max(dailyTarget - Math.max(liveTodayPnl, 0), 0);
+
+        return {
+            instrument,
+            qty,
+            stopDistancePoints,
+            targetDistancePoints,
+            stopTicks,
+            targetTicks,
+            riskPerContract,
+            rewardPerContract,
+            totalRisk,
+            totalReward,
+            rrRatio,
+            hasInputError,
+            hasDirectionError,
+            projectedBalanceAfterStop,
+            projectedBalanceAfterTarget,
+            targetGap,
+            status,
+            message,
+        };
+    }, [riskDraft, riskSnapshot, currentBalance, liveTodayPnl]);
+
+    const persistencePayload = useMemo(() => {
+        const tradingDayKey = cleanString(activeTradingDayKey) || getTradingDayKey(new Date());
+        const safeCurrentBalance = toNumber(currentBalance, 0);
+        const safeStartBalance = toNumber(startBalance, 0);
+        const safeDailyPnl = toNumber(liveTodayPnl, 0);
+
+        const drawdownLimit = toNumber(
+            riskSnapshot.thresholdBalance ?? riskSnapshot.liquidationBalance,
+            0
+        );
+
+        const maxDailyLoss = toNumber(riskSnapshot.dll, 0);
+        const liquidationValue = toNumber(
+            riskSnapshot.liquidationBalance ?? riskSnapshot.thresholdBalance,
+            0
+        );
+
+        const stopRiskViolation = Boolean(riskSnapshot.status?.thresholdBreached);
+        const trailingDrawdownViolation = Boolean(riskSnapshot.status?.dllBreached);
+        const contractViolation = Boolean(riskSnapshot.status?.contractBreached);
+        const isLocked = stopRiskViolation || trailingDrawdownViolation || contractViolation;
+
+        return {
+            sessionKey: tradingDayKey,
+            tradingDate: tradingDayKey,
+            dailyPnL: safeDailyPnl,
+            realizedPnL: safeDailyPnl,
+            unrealizedPnL: 0,
+            startingBalance: safeStartBalance,
+            currentBalance: safeCurrentBalance,
+            liquidationPrice: liquidationValue,
+            liquidationPriceBreached: stopRiskViolation || trailingDrawdownViolation,
+            stopRiskViolation,
+            trailingDrawdownViolation,
+            isLocked,
+            drawdownLimit,
+            maxDailyLoss,
+            openPositionCount,
+            openOrderCount,
+            accountSize: toNumber(detectedAccountSize, 0),
+            balance: safeCurrentBalance,
+            tradingAccountId: cleanString(
+                resolvedAccount?.tradingAccountId ||
+                resolvedAccount?.apexId ||
+                resolvedAccount?.accountId ||
+                scopeAccountId
+            ),
+            tradingAccountName: cleanString(
+                resolvedAccount?.tradingAccountName ||
+                resolvedAccount?.displayName ||
+                resolvedAccount?.name ||
+                resolvedAccount?.accountName ||
+                scopeAccountId
+            ),
+            provider,
+            dataProvider: provider,
+        };
+    }, [
+        provider,
+        activeTradingDayKey,
+        currentBalance,
+        startBalance,
+        liveTodayPnl,
+        riskSnapshot,
+        openPositionCount,
+        openOrderCount,
+        detectedAccountSize,
+        resolvedAccount,
+        scopeAccountId,
+    ]);
+
+    useEffect(() => {
+        if (!cleanString(resolvedAccountId)) {
+            return;
+        }
+
+        const signature = JSON.stringify(persistencePayload);
+
+        if (persistenceRef.current === signature) {
+            return;
+        }
+
+        saveDailyState(resolvedAccountId, persistencePayload);
+        saveLiveAccountSnapshot(resolvedAccountId, persistencePayload);
+
+        const hasRedStatus =
+            thresholdRuleStatus.status === "red" ||
+            dllRuleStatus.status === "red" ||
+            exposureRuleStatus.status === "red" ||
+            payoutRuleStatus.status === "red" ||
+            inactivityRuleStatus.status === "red";
+
+        const hasYellowStatus =
+            thresholdRuleStatus.status === "yellow" ||
+            dllRuleStatus.status === "yellow" ||
+            exposureRuleStatus.status === "yellow" ||
+            payoutRuleStatus.status === "yellow" ||
+            inactivityRuleStatus.status === "yellow";
+
+        const riskLevel = hasRedStatus ? "red" : hasYellowStatus ? "yellow" : "green";
+        const riskLabel = hasRedStatus
+            ? "Regel verletzt"
+            : hasYellowStatus
+                ? "Kritisch"
+                : "Alles sauber";
+
+        saveRiskStatusForAccount(resolvedAccountId, {
+            level: riskLevel,
+            label: riskLabel,
+            source: "risk-panel",
+            provider,
+            flags: {
+                threshold: thresholdRuleStatus.status !== "green",
+                dll: dllRuleStatus.status !== "green",
+                exposure: exposureRuleStatus.status !== "green",
+                payout: payoutRuleStatus.status !== "green",
+                inactivity: inactivityRuleStatus.status !== "green",
+            },
+            meta: {
+                provider,
+                threshold: thresholdRuleStatus,
+                dll: dllRuleStatus,
+                exposure: exposureRuleStatus,
+                payout: payoutRuleStatus,
+                inactivity: inactivityRuleStatus,
+                dailyPnL: persistencePayload.dailyPnL,
+                currentBalance: persistencePayload.currentBalance,
+                startBalance: persistencePayload.startingBalance,
+                openPositionCount: persistencePayload.openPositionCount,
+                openOrderCount: persistencePayload.openOrderCount,
+                tradingDate: persistencePayload.tradingDate,
+            },
+        });
+
+        persistenceRef.current = signature;
+    }, [
+        provider,
+        resolvedAccountId,
+        persistencePayload,
+        thresholdRuleStatus,
+        dllRuleStatus,
+        exposureRuleStatus,
+        payoutRuleStatus,
+        inactivityRuleStatus,
+    ]);
+
+    useEffect(() => {
+        persistenceRef.current = "";
+    }, [resolvedAccountId, provider]);
+
+    useEffect(() => {
+        if (typeof window === "undefined") {
+            return;
+        }
+
+        window.dispatchEvent(
+            new CustomEvent(RISK_ALERT_EVENT_NAME, {
+                detail: {
+                    accountId: resolvedAccountId || "",
+                    accountName:
+                        resolvedAccount?.tradingAccountName ||
+                        resolvedAccount?.displayName ||
+                        resolvedAccount?.name ||
+                        resolvedAccountId ||
+                        "Account",
+                    provider,
+                    alert: topAlert,
+                    emittedAt: Date.now(),
+                },
+            })
+        );
+    }, [
+        provider,
+        resolvedAccountId,
+        resolvedAccount?.tradingAccountName,
+        resolvedAccount?.displayName,
+        resolvedAccount?.name,
+        topAlert,
+    ]);
 
     function handleModeChange(nextMode) {
         setRiskDraft((prev) => ({
@@ -1176,309 +2453,394 @@ function RiskPanelContent({
         }));
     }
 
+    function handleRiskDraftChange(key, value) {
+        setRiskDraft((prev) => ({
+            ...prev,
+            [key]: value,
+        }));
+    }
+
     function handleResetRiskDraft() {
-        setRiskDraft(createDefaultRiskDraft(detectedAccountSize, resolvedAccount));
+        setRiskDraft(createDefaultRiskDraft(detectedAccountSize, resolvedAccount, true));
     }
 
-    function handleAddTestTrade() {
-        const nextTrade = {
-            id: createId(),
-            accountId: resolvedAccountId,
-            instrument: cleanString(simulationDraft.instrument) || "MNQ",
-            side: simulationDraft.side === "short" ? "short" : "long",
-            qty: toSafeInteger(simulationDraft.qty, 1),
-            pnl: toNumber(simulationDraft.pnl, 0),
-            createdAt: new Date().toISOString(),
-        };
+    if (compactMode) {
+        const compactStatusUi = getStatusUi(topAlert.status);
 
-        setTradeSimulation((prev) => {
-            const previousTrades = Array.isArray(prev?.trades) ? prev.trades : [];
-            const next = {
-                trades: [...previousTrades, nextTrade],
-                updatedAt: new Date().toISOString(),
-            };
+        const compactRules = [
+            {
+                title: "Threshold",
+                value: thresholdRuleStatus.value,
+                status: thresholdRuleStatus.status,
+            },
+            {
+                title: "DLL",
+                value: dllRuleStatus.value,
+                status: dllRuleStatus.status,
+            },
+            {
+                title: "Exposure",
+                value: exposureRuleStatus.value,
+                status: exposureRuleStatus.status,
+            },
+            {
+                title: "Payout",
+                value: payoutRuleStatus.value,
+                status: payoutRuleStatus.status,
+            },
+            {
+                title: "Inactivity",
+                value: inactivityRuleStatus.value,
+                status: inactivityRuleStatus.status,
+            },
+        ];
 
-            persistTradeSimulationForAccount(resolvedAccountId, next);
-            return next;
-        });
-    }
+        return (
+            <div
+                style={{
+                    display: "grid",
+                    gap: 8,
+                }}
+            >
+                <div
+                    style={{
+                        border: `1px solid ${compactStatusUi.border}`,
+                        borderRadius: 12,
+                        padding: 10,
+                        background: compactStatusUi.background,
+                        boxShadow: COLORS.shadow,
+                        display: "grid",
+                        gap: 8,
+                    }}
+                >
+                    <div
+                        style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "flex-start",
+                            gap: 8,
+                            flexWrap: "wrap",
+                        }}
+                    >
+                        <div style={{ display: "grid", gap: 3, minWidth: 0 }}>
+                            <div
+                                style={{
+                                    color: COLORS.title,
+                                    fontSize: 12,
+                                    fontWeight: 800,
+                                }}
+                            >
+                                Risk Fokus
+                            </div>
 
-    function handleResetSimulation() {
-        persistTradeSimulationForAccount(resolvedAccountId, EMPTY_SIMULATION);
-        setTradeSimulation(EMPTY_SIMULATION);
-        setSimulationDraft(DEFAULT_SIMULATION_DRAFT);
-    }
+                            <div
+                                style={{
+                                    color: COLORS.text,
+                                    fontSize: 12,
+                                    fontWeight: 800,
+                                    lineHeight: 1.2,
+                                    wordBreak: "break-word",
+                                }}
+                            >
+                                {resolvedAccount?.tradingAccountName ||
+                                    resolvedAccount?.displayName ||
+                                    scopeAccountId ||
+                                    resolvedAccountId ||
+                                    "Unbekannt"}
+                            </div>
+                        </div>
 
-    const calculator = (() => {
-        const accountSize = riskSnapshot.startBalance;
-        const dailyTarget = Math.max(toNumber(riskDraft.dailyTarget, 0), 0);
-        const instrument = getInstrumentConfig(riskDraft.instrument);
-        const side = riskDraft.side === "short" ? "short" : "long";
-        const entry = toNumber(riskDraft.entry, 0);
-        const stop = toNumber(riskDraft.stop, 0);
-        const target = toNumber(riskDraft.target, 0);
-        const qty = toSafeInteger(riskDraft.qty, 1);
+                        <div
+                            style={{
+                                display: "flex",
+                                gap: 6,
+                                flexWrap: "wrap",
+                                justifyContent: "flex-end",
+                            }}
+                        >
+                            <div
+                                style={{
+                                    border: `1px solid ${COLORS.border}`,
+                                    borderRadius: 999,
+                                    padding: "4px 8px",
+                                    color: COLORS.cyan,
+                                    background: "rgba(34,211,238,0.08)",
+                                    fontSize: 8,
+                                    fontWeight: 800,
+                                    whiteSpace: "nowrap",
+                                }}
+                            >
+                                {providerLabel}
+                            </div>
 
-        const hasEntry = entry > 0;
-        const hasStop = stop > 0;
-        const hasTarget = target > 0;
+                            <div
+                                style={{
+                                    border: `1px solid ${compactStatusUi.border}`,
+                                    borderRadius: 999,
+                                    padding: "4px 8px",
+                                    color: compactStatusUi.text,
+                                    background: "rgba(255,255,255,0.04)",
+                                    fontSize: 8,
+                                    fontWeight: 800,
+                                    whiteSpace: "nowrap",
+                                }}
+                            >
+                                {getModeLabel(riskSnapshot.mode)}
+                            </div>
+                        </div>
+                    </div>
 
-        const stopDistancePoints =
-            hasEntry && hasStop ? Math.abs(entry - stop) : 0;
-        const targetDistancePoints =
-            hasEntry && hasTarget ? Math.abs(target - entry) : 0;
+                    <div
+                        style={{
+                            display: "grid",
+                            gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                            gap: 6,
+                        }}
+                    >
+                        <CompactMetricCard
+                            label="Balance"
+                            value={formatCurrency(currentBalance)}
+                            hint="Aktuell"
+                            color={COLORS.cyan}
+                            borderColor="rgba(34, 211, 238, 0.20)"
+                            background="rgba(34, 211, 238, 0.04)"
+                        />
 
-        const stopTicks =
-            stopDistancePoints > 0 ? stopDistancePoints / instrument.tickSize : 0;
-        const targetTicks =
-            targetDistancePoints > 0 ? targetDistancePoints / instrument.tickSize : 0;
+                        <CompactMetricCard
+                            label="Tages PnL"
+                            value={formatSignedCurrency(liveTodayPnl)}
+                            hint={formatTradingDayLabel(activeTradingDayKey)}
+                            color={liveTodayPnl >= 0 ? COLORS.green : COLORS.red}
+                            borderColor={liveTodayPnl >= 0 ? "rgba(74, 222, 128, 0.22)" : "rgba(248, 113, 113, 0.22)"}
+                            background={liveTodayPnl >= 0 ? "rgba(74, 222, 128, 0.04)" : "rgba(248, 113, 113, 0.04)"}
+                        />
 
-        const riskPerContract = stopTicks * instrument.tickValue;
-        const rewardPerContract = targetTicks * instrument.tickValue;
-        const riskPerPoint = instrument.pointValue * qty;
+                        <CompactMetricCard
+                            label="Threshold Rest"
+                            value={formatCurrency(riskSnapshot.distanceToThreshold)}
+                            hint={thresholdRuleStatus.hint}
+                            color={
+                                thresholdRuleStatus.status === "red"
+                                    ? COLORS.red
+                                    : thresholdRuleStatus.status === "yellow"
+                                        ? COLORS.orange
+                                        : COLORS.green
+                            }
+                            borderColor={
+                                thresholdRuleStatus.status === "red"
+                                    ? "rgba(248, 113, 113, 0.22)"
+                                    : thresholdRuleStatus.status === "yellow"
+                                        ? "rgba(251, 146, 60, 0.22)"
+                                        : "rgba(74, 222, 128, 0.22)"
+                            }
+                            background={
+                                thresholdRuleStatus.status === "red"
+                                    ? "rgba(248, 113, 113, 0.04)"
+                                    : thresholdRuleStatus.status === "yellow"
+                                        ? "rgba(251, 146, 60, 0.04)"
+                                        : "rgba(74, 222, 128, 0.04)"
+                            }
+                        />
 
-        const totalRisk = riskPerContract * qty;
-        const totalReward = rewardPerContract * qty;
-        const rrRatio = totalRisk > 0 ? totalReward / totalRisk : null;
+                        <CompactMetricCard
+                            label="DLL Rest"
+                            value={
+                                riskSnapshot.dll === null
+                                    ? "Kein DLL"
+                                    : formatCurrency(riskSnapshot.remainingDll)
+                            }
+                            hint={
+                                riskSnapshot.dll === null
+                                    ? "Nicht aktiv"
+                                    : dllRuleStatus.hint
+                            }
+                            color={
+                                dllRuleStatus.status === "red"
+                                    ? COLORS.red
+                                    : dllRuleStatus.status === "yellow"
+                                        ? COLORS.orange
+                                        : COLORS.green
+                            }
+                            borderColor={
+                                dllRuleStatus.status === "red"
+                                    ? "rgba(248, 113, 113, 0.22)"
+                                    : dllRuleStatus.status === "yellow"
+                                        ? "rgba(251, 146, 60, 0.22)"
+                                        : "rgba(74, 222, 128, 0.22)"
+                            }
+                            background={
+                                dllRuleStatus.status === "red"
+                                    ? "rgba(248, 113, 113, 0.04)"
+                                    : dllRuleStatus.status === "yellow"
+                                        ? "rgba(251, 146, 60, 0.04)"
+                                        : "rgba(74, 222, 128, 0.04)"
+                            }
+                        />
 
-        const hasDirectionError =
-            (side === "long" && ((hasStop && stop >= entry) || (hasTarget && target <= entry))) ||
-            (side === "short" && ((hasStop && stop <= entry) || (hasTarget && target >= entry)));
+                        <CompactMetricCard
+                            label="Exposure"
+                            value={formatExposureUnits(liveExposureUnits)}
+                            hint={`Max ${formatExposureUnits(riskSnapshot.maxContracts)}`}
+                            color={
+                                exposureRuleStatus.status === "red"
+                                    ? COLORS.red
+                                    : exposureRuleStatus.status === "yellow"
+                                        ? COLORS.orange
+                                        : COLORS.green
+                            }
+                            borderColor={
+                                exposureRuleStatus.status === "red"
+                                    ? "rgba(248, 113, 113, 0.22)"
+                                    : exposureRuleStatus.status === "yellow"
+                                        ? "rgba(251, 146, 60, 0.22)"
+                                        : "rgba(74, 222, 128, 0.22)"
+                            }
+                            background={
+                                exposureRuleStatus.status === "red"
+                                    ? "rgba(248, 113, 113, 0.04)"
+                                    : exposureRuleStatus.status === "yellow"
+                                        ? "rgba(251, 146, 60, 0.04)"
+                                        : "rgba(74, 222, 128, 0.04)"
+                            }
+                        />
 
-        const hasInputError =
-            !hasEntry ||
-            !hasStop ||
-            !hasTarget ||
-            stopDistancePoints <= 0 ||
-            targetDistancePoints <= 0;
+                        <CompactMetricCard
+                            label="Kontogrösse"
+                            value={formatAccountSizeValue(detectedAccountSize)}
+                            hint={balanceDelta === null ? "Kein Delta" : `Delta ${formatSignedCurrency(balanceDelta)}`}
+                            color={COLORS.purple}
+                            borderColor="rgba(167, 139, 250, 0.22)"
+                            background="rgba(167, 139, 250, 0.04)"
+                        />
 
-        const remainingThresholdRoom = Math.max(riskSnapshot.distanceToThreshold || 0, 0);
-        const activeDll = riskSnapshot.dll;
-        const remainingDllRoom =
-            activeDll === null || activeDll === undefined
-                ? null
-                : Math.max(riskSnapshot.remainingDll || 0, 0);
+                        <CompactMetricCard
+                            label="Positionen"
+                            value={formatDecimal(openPositionCount, 0)}
+                            hint="Offen"
+                            color={COLORS.text}
+                            borderColor={COLORS.border}
+                            background="rgba(255,255,255,0.025)"
+                        />
 
-        const liveContractCount = Math.max(toNumber(liveOpenContracts, 0), 0);
-        const maxContractsByRule = Math.max(riskSnapshot.maxContracts || 0, 0);
-        const remainingContractSlots = maxContractsByRule - liveContractCount;
+                        <CompactMetricCard
+                            label="Orders"
+                            value={formatDecimal(openOrderCount, 0)}
+                            hint="Working"
+                            color={COLORS.text}
+                            borderColor={COLORS.border}
+                            background="rgba(255,255,255,0.025)"
+                        />
+                    </div>
 
-        const maxContractsByThreshold =
-            riskPerContract > 0
-                ? Math.max(Math.floor(remainingThresholdRoom / riskPerContract), 0)
-                : 0;
+                    <div
+                        style={{
+                            display: "grid",
+                            gridTemplateColumns: "repeat(5, minmax(0, 1fr))",
+                            gap: 6,
+                        }}
+                    >
+                        {compactRules.map((rule) => (
+                            <CompactRulePill
+                                key={rule.title}
+                                title={rule.title}
+                                value={rule.value}
+                                status={rule.status}
+                            />
+                        ))}
+                    </div>
 
-        const maxContractsByDll =
-            riskPerContract > 0 &&
-                remainingDllRoom !== null &&
-                remainingDllRoom !== undefined
-                ? Math.max(Math.floor(remainingDllRoom / riskPerContract), 0)
-                : null;
+                    <div
+                        style={{
+                            display: "flex",
+                            gap: 6,
+                            flexWrap: "wrap",
+                        }}
+                    >
+                        <div
+                            style={{
+                                border: `1px solid ${COLORS.border}`,
+                                borderRadius: 999,
+                                padding: "3px 7px",
+                                background: "rgba(255,255,255,0.04)",
+                                color: COLORS.textSoft,
+                                fontSize: 8,
+                                fontWeight: 700,
+                            }}
+                        >
+                            Tag {formatTradingDayLabel(activeTradingDayKey)}
+                        </div>
 
-        let allowedContracts = maxContractsByThreshold;
+                        <div
+                            style={{
+                                border: `1px solid ${COLORS.border}`,
+                                borderRadius: 999,
+                                padding: "3px 7px",
+                                background: "rgba(255,255,255,0.04)",
+                                color: COLORS.textSoft,
+                                fontSize: 8,
+                                fontWeight: 700,
+                            }}
+                        >
+                            Liq. {formatCurrency(riskSnapshot.liquidationBalance)}
+                        </div>
 
-        if (maxContractsByDll !== null && maxContractsByDll !== undefined) {
-            allowedContracts = Math.min(allowedContracts, maxContractsByDll);
-        }
+                        <div
+                            style={{
+                                border: `1px solid ${COLORS.border}`,
+                                borderRadius: 999,
+                                padding: "3px 7px",
+                                background: "rgba(34,211,238,0.08)",
+                                color: COLORS.cyan,
+                                fontSize: 8,
+                                fontWeight: 800,
+                            }}
+                        >
+                            {providerLabel}
+                        </div>
 
-        allowedContracts = Math.min(allowedContracts, Math.max(remainingContractSlots, 0));
+                        <div
+                            style={{
+                                border: `1px solid ${COLORS.border}`,
+                                borderRadius: 999,
+                                padding: "3px 7px",
+                                background: "rgba(255,255,255,0.04)",
+                                color: compactStatusUi.text,
+                                fontSize: 8,
+                                fontWeight: 800,
+                            }}
+                        >
+                            {topAlert.message}
+                        </div>
+                    </div>
 
-        const projectedPnlAfterStop = effectivePnl - totalRisk;
-        const projectedPnlAfterTarget = effectivePnl + totalReward;
-        const projectedBalanceAfterStop =
-            currentBalance !== null && currentBalance !== undefined
-                ? currentBalance - totalRisk
-                : null;
-        const projectedBalanceAfterTarget =
-            currentBalance !== null && currentBalance !== undefined
-                ? currentBalance + totalReward
-                : null;
-
-        const remainingThresholdAfterTrade = Math.max(
-            remainingThresholdRoom - totalRisk,
-            0
+                    <div
+                        style={{
+                            border: `1px solid ${compactStatusUi.border}`,
+                            borderRadius: 10,
+                            padding: "7px 8px",
+                            background: "rgba(255,255,255,0.025)",
+                            color: COLORS.textSoft,
+                            fontSize: 9,
+                            lineHeight: 1.3,
+                        }}
+                    >
+                        {topAlert.detail}
+                    </div>
+                </div>
+            </div>
         );
-
-        const remainingDllAfterTrade =
-            remainingDllRoom === null || remainingDllRoom === undefined
-                ? null
-                : Math.max(remainingDllRoom - totalRisk, 0);
-
-        const targetGap = Math.max(dailyTarget - Math.max(effectivePnl, 0), 0);
-
-        const riskPercentOfAccount =
-            accountSize > 0 ? (totalRisk / accountSize) * 100 : null;
-
-        const riskPercentOfDll =
-            activeDll && activeDll > 0 ? (totalRisk / activeDll) * 100 : null;
-
-        const remainingDllPercentAfterTrade =
-            activeDll &&
-                activeDll > 0 &&
-                remainingDllAfterTrade !== null &&
-                remainingDllAfterTrade !== undefined
-                ? (remainingDllAfterTrade / activeDll) * 100
-                : null;
-
-        const hasLiveContractBreach = Boolean(riskSnapshot.status?.contractBreached);
-
-        const isOverAllowedContracts =
-            !hasInputError &&
-            !hasDirectionError &&
-            qty > allowedContracts;
-
-        const status = getCalculatorStatus({
-            hasInputError,
-            hasDirectionError,
-            totalRisk,
-            remainingThresholdRoom,
-            remainingDllRoom,
-            rrRatio,
-            isOverAllowedContracts,
-            hasLiveContractBreach,
-        });
-
-        return {
-            accountSize,
-            dailyTarget,
-            instrument,
-            side,
-            entry,
-            stop,
-            target,
-            qty,
-            stopDistancePoints,
-            targetDistancePoints,
-            stopTicks,
-            targetTicks,
-            riskPerContract,
-            rewardPerContract,
-            riskPerPoint,
-            totalRisk,
-            totalReward,
-            rrRatio,
-            hasDirectionError,
-            hasInputError,
-            remainingThresholdRoom,
-            activeDll,
-            remainingDllRoom,
-            maxContractsByThreshold,
-            maxContractsByDll,
-            maxContractsByRule,
-            liveContractCount,
-            remainingContractSlots,
-            allowedContracts,
-            projectedPnlAfterStop,
-            projectedPnlAfterTarget,
-            projectedBalanceAfterStop,
-            projectedBalanceAfterTarget,
-            remainingThresholdAfterTrade,
-            remainingDllAfterTrade,
-            targetGap,
-            riskPercentOfAccount,
-            riskPercentOfDll,
-            remainingDllPercentAfterTrade,
-            status,
-            isOverAllowedContracts,
-            hasLiveContractBreach,
-        };
-    })();
-
-    const riskLimitState = useMemo(() => {
-        const currentContracts = Math.max(toNumber(calculator.liveContractCount, 0), 0);
-        const plannedContracts = toSafeInteger(riskDraft.qty, 1);
-        const maxContracts = Math.max(toNumber(calculator.maxContractsByRule, 0), 0);
-        const safeSize = Math.max(toNumber(calculator.allowedContracts, 0), 0);
-        const instrumentContracts = Math.max(toNumber(currentInstrumentOpenContracts, 0), 0);
-
-        return buildRiskLimitState({
-            maxContracts,
-            safeSize,
-            currentContracts,
-            plannedContracts,
-            currentInstrumentContracts: instrumentContracts,
-            openAfterEntry: currentContracts + plannedContracts,
-            instrumentAfterEntry: instrumentContracts + plannedContracts,
-            freeSlotsNow: maxContracts - currentContracts,
-            freeSlotsAfterEntry: maxContracts - (currentContracts + plannedContracts),
-            liveOverLimit: Boolean(calculator.hasLiveContractBreach),
-        });
-    }, [
-        calculator.liveContractCount,
-        calculator.maxContractsByRule,
-        calculator.allowedContracts,
-        calculator.hasLiveContractBreach,
-        currentInstrumentOpenContracts,
-        riskDraft.qty,
-    ]);
-
-    const safeSizeCard = riskLimitState.blocks.safeSize;
-    const safeSizeColors = getRiskStatusColors(safeSizeCard.status);
-
-    const openAfterEntryCard = riskLimitState.blocks.openAfterEntry;
-    const openAfterEntryColors = getRiskStatusColors(openAfterEntryCard.status);
-
-    const freeSlotsAfterEntryCard = riskLimitState.blocks.freeSlotsAfterEntry;
-    const freeSlotsAfterEntryColors = getRiskStatusColors(freeSlotsAfterEntryCard.status);
-
-    const liveOverLimitCard = riskLimitState.blocks.liveOverLimit;
-    const liveOverLimitColors = getRiskStatusColors(liveOverLimitCard.status);
-
-    const instrumentAfterEntryCard = riskLimitState.blocks.instrumentAfterEntry;
-    const instrumentAfterEntryColors = getRiskStatusColors(instrumentAfterEntryCard.status);
-
-    const safeSizeAvailable =
-        !calculator.hasInputError &&
-        !calculator.hasDirectionError &&
-        !calculator.hasLiveContractBreach &&
-        calculator.allowedContracts > 0;
-
-    function handleApplySafeSize() {
-        if (!safeSizeAvailable) {
-            return;
-        }
-
-        handleRiskDraftChange("qty", calculator.allowedContracts);
     }
+
+    const calculatorUi = getStatusUi(calculator.status);
 
     return (
         <div
             style={{
                 display: "grid",
-                gap: 16,
+                gap: 14,
             }}
         >
-            <div
-                style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    gap: 12,
-                    flexWrap: "wrap",
-                }}
-            >
-                <div>
-                    <div
-                        style={{
-                            color: COLORS.title,
-                            fontSize: 18,
-                            fontWeight: 800,
-                        }}
-                    >
-                        Risk Übersicht
-                    </div>
-                    <div
-                        style={{
-                            color: COLORS.textSoft,
-                            fontSize: 13,
-                            marginTop: 4,
-                            wordBreak: "break-word",
-                        }}
-                    >
-                        Account {resolvedAccount?.displayName || resolvedAccountId || "Unbekannt"}
-                    </div>
-                </div>
-            </div>
+            <TopAlertBar alert={topAlert} />
 
             <div
                 style={{
@@ -1505,14 +2867,15 @@ function RiskPanelContent({
                 <InfoCard
                     label="Startbalance"
                     value={formatCurrency(startBalance)}
-                    hint={
-                        accountBalanceRows.length
-                            ? `Erster Eintrag ${formatDateTime(
-                                getBalanceTimestamp(accountBalanceRows[0])
-                            )}`
-                            : "Startwert aus Account"
-                    }
+                    hint={detectedAccountSize > 0 ? `Basis ${formatAccountSizeLabel(detectedAccountSize)}` : "Startwert aus Account"}
                     color={COLORS.yellow}
+                />
+
+                <InfoCard
+                    label="Tages PnL"
+                    value={formatSignedCurrency(liveTodayPnl)}
+                    hint={`Trading Day ${formatTradingDayLabel(activeTradingDayKey)}`}
+                    color={liveTodayPnl >= 0 ? COLORS.green : COLORS.red}
                 />
 
                 <InfoCard
@@ -1525,17 +2888,37 @@ function RiskPanelContent({
                     }
                     color={COLORS.purple}
                 />
+
+                <InfoCard
+                    label="Provider"
+                    value={providerLabel}
+                    hint="Aktiver Datenweg"
+                    color={COLORS.cyan}
+                />
+
+                <InfoCard
+                    label="Live Exposure"
+                    value={formatExposureUnits(liveExposureUnits)}
+                    hint={`Max ${formatExposureUnits(riskSnapshot.maxContracts)}`}
+                    color={
+                        exposureRuleStatus.status === "red"
+                            ? COLORS.red
+                            : exposureRuleStatus.status === "yellow"
+                                ? COLORS.orange
+                                : COLORS.green
+                    }
+                />
             </div>
 
             <div
                 style={{
                     background: COLORS.panelBg,
                     border: `1px solid ${COLORS.border}`,
-                    borderRadius: 20,
-                    padding: 18,
+                    borderRadius: 18,
+                    padding: 16,
                     boxShadow: COLORS.shadow,
                     display: "grid",
-                    gap: 14,
+                    gap: 12,
                 }}
             >
                 <div
@@ -1551,7 +2934,7 @@ function RiskPanelContent({
                         <div
                             style={{
                                 color: COLORS.title,
-                                fontSize: 16,
+                                fontSize: 15,
                                 fontWeight: 800,
                             }}
                         >
@@ -1560,8 +2943,8 @@ function RiskPanelContent({
                         <div
                             style={{
                                 color: COLORS.textSoft,
-                                fontSize: 13,
-                                marginTop: 4,
+                                fontSize: 12,
+                                marginTop: 3,
                             }}
                         >
                             Direkte Ableitung aus Account Balance History und Modus
@@ -1570,45 +2953,69 @@ function RiskPanelContent({
 
                     <div
                         style={{
-                            border: `1px solid ${riskSnapshot.status.level === "danger"
-                                    ? COLORS.red
-                                    : riskSnapshot.status.level === "warning"
-                                        ? COLORS.orange
-                                        : COLORS.border
-                                }`,
-                            borderRadius: 999,
-                            padding: "8px 14px",
-                            color:
-                                riskSnapshot.status.level === "danger"
-                                    ? COLORS.red
-                                    : riskSnapshot.status.level === "warning"
-                                        ? COLORS.orange
-                                        : COLORS.text,
-                            background:
-                                riskSnapshot.status.level === "danger"
-                                    ? "rgba(248, 113, 113, 0.10)"
-                                    : riskSnapshot.status.level === "warning"
-                                        ? "rgba(251, 146, 60, 0.10)"
-                                        : "rgba(255,255,255,0.03)",
-                            fontSize: 12,
-                            fontWeight: 800,
-                            whiteSpace: "nowrap",
+                            display: "flex",
+                            gap: 8,
+                            flexWrap: "wrap",
+                            justifyContent: "flex-end",
                         }}
                     >
-                        {getModeLabel(riskSnapshot.mode)}
+                        <div
+                            style={{
+                                border: `1px solid ${COLORS.borderStrong}`,
+                                borderRadius: 999,
+                                padding: "7px 12px",
+                                color: COLORS.cyan,
+                                background: "rgba(34,211,238,0.08)",
+                                fontSize: 11,
+                                fontWeight: 800,
+                                whiteSpace: "nowrap",
+                            }}
+                        >
+                            {providerLabel}
+                        </div>
+
+                        <div
+                            style={{
+                                border: `1px solid ${riskSnapshot.status?.level === "danger"
+                                    ? "rgba(248, 113, 113, 0.24)"
+                                    : riskSnapshot.status?.level === "warning"
+                                        ? "rgba(251, 146, 60, 0.24)"
+                                        : COLORS.border
+                                    }`,
+                                borderRadius: 999,
+                                padding: "7px 12px",
+                                color:
+                                    riskSnapshot.status?.level === "danger"
+                                        ? COLORS.red
+                                        : riskSnapshot.status?.level === "warning"
+                                            ? COLORS.orange
+                                            : COLORS.text,
+                                background:
+                                    riskSnapshot.status?.level === "danger"
+                                        ? "rgba(248, 113, 113, 0.08)"
+                                        : riskSnapshot.status?.level === "warning"
+                                            ? "rgba(251, 146, 60, 0.08)"
+                                            : "rgba(255,255,255,0.03)",
+                                fontSize: 11,
+                                fontWeight: 800,
+                                whiteSpace: "nowrap",
+                            }}
+                        >
+                            {getModeLabel(riskSnapshot.mode)}
+                        </div>
                     </div>
                 </div>
 
                 <div
                     style={{
                         display: "grid",
-                        gap: 8,
+                        gap: 7,
                     }}
                 >
                     <div
                         style={{
                             color: COLORS.textSoft,
-                            fontSize: 12,
+                            fontSize: 11,
                             fontWeight: 600,
                         }}
                     >
@@ -1633,21 +3040,18 @@ function RiskPanelContent({
                                     style={{
                                         border: `1px solid ${isActive ? COLORS.cyan : COLORS.borderStrong}`,
                                         background: isActive
-                                            ? "rgba(34, 211, 238, 0.16)"
-                                            : "rgba(0, 0, 0, 0.20)",
+                                            ? "rgba(34, 211, 238, 0.14)"
+                                            : "rgba(0, 0, 0, 0.18)",
                                         color: isActive ? COLORS.cyan : COLORS.text,
-                                        borderRadius: 14,
-                                        padding: "12px 14px",
+                                        borderRadius: 13,
+                                        padding: "11px 13px",
                                         textAlign: "left",
                                         cursor: "pointer",
-                                        boxShadow: isActive
-                                            ? "0 0 0 1px rgba(34, 211, 238, 0.18), 0 0 18px rgba(34, 211, 238, 0.12)"
-                                            : "none",
                                     }}
                                 >
                                     <div
                                         style={{
-                                            fontSize: 14,
+                                            fontSize: 13,
                                             fontWeight: 800,
                                             marginBottom: 4,
                                         }}
@@ -1657,9 +3061,9 @@ function RiskPanelContent({
 
                                     <div
                                         style={{
-                                            fontSize: 11,
+                                            fontSize: 10,
                                             color: isActive ? COLORS.title : COLORS.textSoft,
-                                            lineHeight: 1.45,
+                                            lineHeight: 1.4,
                                         }}
                                     >
                                         {option.value.includes("INTRADAY")
@@ -1675,13 +3079,13 @@ function RiskPanelContent({
                 <div
                     style={{
                         display: "grid",
-                        gap: 8,
+                        gap: 7,
                     }}
                 >
                     <div
                         style={{
                             color: COLORS.textSoft,
-                            fontSize: 12,
+                            fontSize: 11,
                             fontWeight: 600,
                         }}
                     >
@@ -1707,21 +3111,18 @@ function RiskPanelContent({
                                     style={{
                                         border: `1px solid ${isActive ? COLORS.cyan : COLORS.borderStrong}`,
                                         background: isActive
-                                            ? "rgba(34, 211, 238, 0.16)"
-                                            : "rgba(0, 0, 0, 0.20)",
+                                            ? "rgba(34, 211, 238, 0.14)"
+                                            : "rgba(0, 0, 0, 0.18)",
                                         color: isActive ? COLORS.cyan : COLORS.text,
-                                        borderRadius: 14,
-                                        padding: "12px 14px",
+                                        borderRadius: 13,
+                                        padding: "11px 13px",
                                         textAlign: "left",
                                         cursor: "pointer",
-                                        boxShadow: isActive
-                                            ? "0 0 0 1px rgba(34, 211, 238, 0.18), 0 0 18px rgba(34, 211, 238, 0.12)"
-                                            : "none",
                                     }}
                                 >
                                     <div
                                         style={{
-                                            fontSize: 14,
+                                            fontSize: 13,
                                             fontWeight: 800,
                                             marginBottom: 4,
                                         }}
@@ -1731,9 +3132,9 @@ function RiskPanelContent({
 
                                     <div
                                         style={{
-                                            fontSize: 11,
+                                            fontSize: 10,
                                             color: isActive ? COLORS.title : COLORS.textSoft,
-                                            lineHeight: 1.45,
+                                            lineHeight: 1.4,
                                         }}
                                     >
                                         Start {formatCurrency(size)}
@@ -1751,842 +3152,49 @@ function RiskPanelContent({
                         gap: 10,
                     }}
                 >
-                    <InfoCard
-                        label="Referenz Balance"
-                        value={formatCurrency(riskSnapshot.referenceBalance)}
-                        hint="Direkt aus Snapshot"
-                        color={COLORS.cyan}
+                    <RuleStatusCard
+                        title="Threshold"
+                        value={thresholdRuleStatus.value}
+                        hint={thresholdRuleStatus.hint}
+                        status={thresholdRuleStatus.status}
                     />
-                    <InfoCard
-                        label="Peak Balance"
-                        value={formatCurrency(riskSnapshot.peakBalance)}
-                        hint={riskSnapshot.thresholdModel}
-                        color={COLORS.yellow}
+                    <RuleStatusCard
+                        title="DLL"
+                        value={dllRuleStatus.value}
+                        hint={dllRuleStatus.hint}
+                        status={dllRuleStatus.status}
                     />
-                    <InfoCard
-                        label="Threshold"
-                        value={formatCurrency(riskSnapshot.thresholdBalance)}
-                        hint={`Abstand ${formatCurrency(riskSnapshot.distanceToThreshold)}`}
-                        color={
-                            riskSnapshot.status.thresholdBreached
-                                ? COLORS.red
-                                : COLORS.orange
-                        }
+                    <RuleStatusCard
+                        title="Exposure"
+                        value={exposureRuleStatus.value}
+                        hint={exposureRuleStatus.hint}
+                        status={exposureRuleStatus.status}
                     />
-                    <InfoCard
-                        label="Aktives DLL"
-                        value={
-                            riskSnapshot.dll === null
-                                ? "Kein DLL"
-                                : formatCurrency(riskSnapshot.dll)
-                        }
-                        hint={
-                            riskSnapshot.dll === null
-                                ? "In diesem Modus nicht aktiv"
-                                : `Rest ${formatCurrency(riskSnapshot.remainingDll)}`
-                        }
-                        color={COLORS.purple}
+                    <RuleStatusCard
+                        title="Payout"
+                        value={payoutRuleStatus.value}
+                        hint={payoutRuleStatus.hint}
+                        status={payoutRuleStatus.status}
                     />
-                    <InfoCard
-                        label="Max Kontrakte"
-                        value={String(riskSnapshot.maxContracts)}
-                        hint={
-                            riskSnapshot.tier
-                                ? `PA Level ${riskSnapshot.tier.level}`
-                                : "Regelbasierter Wert"
-                        }
-                        color={COLORS.green}
-                    />
-                    <InfoCard
-                        label="Live Kontrakte"
-                        value={formatDecimal(liveOpenContracts, 0)}
-                        hint={`Frei ${formatDecimal(Math.max((riskSnapshot.maxContracts || 0) - toNumber(liveOpenContracts, 0), 0), 0)}`}
-                        color={
-                            riskSnapshot.status.contractBreached
-                                ? COLORS.red
-                                : COLORS.cyan
-                        }
-                    />
-                    <InfoCard
-                        label="Liquidation"
-                        value={formatCurrency(riskSnapshot.liquidationBalance)}
-                        hint="Aktive Grenzlinie"
-                        color={COLORS.red}
+                    <RuleStatusCard
+                        title="Inactivity"
+                        value={inactivityRuleStatus.value}
+                        hint={inactivityRuleStatus.hint}
+                        status={inactivityRuleStatus.status}
                     />
                 </div>
-
-                {riskSnapshot.status.contractBreached ? (
-                    <div
-                        style={{
-                            border: `1px solid ${COLORS.red}`,
-                            borderRadius: 14,
-                            padding: 14,
-                            background: "rgba(248, 113, 113, 0.10)",
-                            color: COLORS.red,
-                            fontSize: 15,
-                            lineHeight: 1.5,
-                            fontWeight: 800,
-                        }}
-                    >
-                        Live Überlimit. Offen sind {formatDecimal(liveOpenContracts, 0)} Kontrakte.
-                        Erlaubt sind {riskSnapshot.maxContracts}.
-                    </div>
-                ) : null}
             </div>
 
-            {SHOW_INTERNAL_TEST_UI ? (
-                <div
-                    style={{
-                        background: riskStatus.background,
-                        border: `1px solid ${riskStatus.border}`,
-                        borderRadius: 20,
-                        padding: 18,
-                        boxShadow: COLORS.shadow,
-                        display: "grid",
-                        gap: 14,
-                    }}
-                >
-                    <div
-                        style={{
-                            display: "grid",
-                            gridTemplateColumns: "220px minmax(320px, 1fr) 160px",
-                            gap: 16,
-                            alignItems: "stretch",
-                        }}
-                    >
-                        <div
-                            style={{
-                                display: "flex",
-                                flexDirection: "column",
-                                justifyContent: "flex-start",
-                            }}
-                        >
-                            <div
-                                style={{
-                                    color: COLORS.title,
-                                    fontSize: 13,
-                                    fontWeight: 700,
-                                }}
-                            >
-                                Trades heute
-                            </div>
-
-                            <div
-                                style={{
-                                    color: COLORS.text,
-                                    fontSize: 34,
-                                    fontWeight: 900,
-                                    lineHeight: 1,
-                                    marginTop: 6,
-                                }}
-                            >
-                                {effectiveTradeCount}
-                            </div>
-
-                            <div
-                                style={{
-                                    color: COLORS.textSoft,
-                                    fontSize: 12,
-                                    marginTop: 8,
-                                }}
-                            >
-                                Quelle {testModeActive ? "Testmodus" : "Live CSV"}
-                            </div>
-                        </div>
-
-                        <CenterAlertBox riskStatus={riskStatus} />
-
-                        <div
-                            style={{
-                                display: "grid",
-                                gap: 8,
-                                alignContent: "start",
-                            }}
-                        >
-                            <InfoCard
-                                label="Live Trades heute"
-                                value={String(liveTodayTradeCount)}
-                                hint={`${accountFills.length} Fills für Account`}
-                            />
-                            <InfoCard
-                                label="Test Trades"
-                                value={String(simulatedTradeCount)}
-                            />
-                            <InfoCard
-                                label="PnL"
-                                value={formatSignedCurrency(effectivePnl)}
-                            />
-                        </div>
-                    </div>
-
-                    <div
-                        style={{
-                            border: `1px solid ${COLORS.border}`,
-                            borderRadius: 14,
-                            padding: 14,
-                            background: "rgba(255, 255, 255, 0.04)",
-                            color: COLORS.text,
-                            fontSize: 15,
-                            lineHeight: 1.5,
-                            fontWeight: 700,
-                        }}
-                    >
-                        {riskStatus.message}
-                    </div>
-                </div>
-            ) : null}
-
-            <div
-                style={{
-                    background: COLORS.panelBg,
-                    border: `1px solid ${calculator.status.border}`,
-                    borderRadius: 20,
-                    padding: 18,
-                    boxShadow: COLORS.shadow,
-                    display: "grid",
-                    gap: 14,
-                }}
-            >
-                <div
-                    style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        gap: 12,
-                        flexWrap: "wrap",
-                    }}
-                >
-                    <div>
-                        <div
-                            style={{
-                                color: COLORS.title,
-                                fontSize: 16,
-                                fontWeight: 800,
-                            }}
-                        >
-                            Riskrechner
-                        </div>
-                        <div
-                            style={{
-                                color: COLORS.textSoft,
-                                fontSize: 13,
-                                marginTop: 4,
-                            }}
-                        >
-                            Direkte Trade Prüfung vor dem Entry
-                        </div>
-                    </div>
-
-                    <div
-                        style={{
-                            border: `1px solid ${calculator.status.border}`,
-                            borderRadius: 999,
-                            padding: "8px 14px",
-                            color: calculator.status.color,
-                            background: calculator.status.background,
-                            fontSize: 12,
-                            fontWeight: 800,
-                            whiteSpace: "nowrap",
-                        }}
-                    >
-                        {calculator.status.label}
-                    </div>
-                </div>
-
-                <div
-                    style={{
-                        display: "grid",
-                        gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                        gap: 12,
-                    }}
-                >
-                    <InputField label="Tagesziel">
-                        <input
-                            type="number"
-                            step="1"
-                            value={riskDraft.dailyTarget}
-                            onChange={(event) =>
-                                handleRiskDraftChange(
-                                    "dailyTarget",
-                                    toNumber(event.target.value, 0)
-                                )
-                            }
-                            style={{
-                                width: "100%",
-                                padding: "12px 14px",
-                                borderRadius: 12,
-                                border: `1px solid ${COLORS.borderStrong}`,
-                                background: "rgba(0,0,0,0.25)",
-                                color: COLORS.text,
-                                outline: "none",
-                            }}
-                        />
-                    </InputField>
-
-                    <InputField label="Instrument">
-                        <select
-                            value={riskDraft.instrument}
-                            onChange={(event) =>
-                                handleRiskDraftChange(
-                                    "instrument",
-                                    cleanString(event.target.value).toUpperCase()
-                                )
-                            }
-                            style={{
-                                width: "100%",
-                                padding: "12px 14px",
-                                borderRadius: 12,
-                                border: `1px solid ${COLORS.borderStrong}`,
-                                background: "rgba(0,0,0,0.25)",
-                                color: COLORS.text,
-                                outline: "none",
-                            }}
-                        >
-                            <option value="MNQ">MNQ</option>
-                            <option value="NQ">NQ</option>
-                            <option value="MES">MES</option>
-                            <option value="ES">ES</option>
-                        </select>
-                    </InputField>
-
-                    <InputField label="Seite">
-                        <select
-                            value={riskDraft.side}
-                            onChange={(event) =>
-                                handleRiskDraftChange(
-                                    "side",
-                                    event.target.value === "short" ? "short" : "long"
-                                )
-                            }
-                            style={{
-                                width: "100%",
-                                padding: "12px 14px",
-                                borderRadius: 12,
-                                border: `1px solid ${COLORS.borderStrong}`,
-                                background: "rgba(0,0,0,0.25)",
-                                color: COLORS.text,
-                                outline: "none",
-                            }}
-                        >
-                            <option value="long">long</option>
-                            <option value="short">short</option>
-                        </select>
-                    </InputField>
-
-                    <InputField label="Entry">
-                        <input
-                            type="number"
-                            step="0.25"
-                            value={riskDraft.entry}
-                            onChange={(event) =>
-                                handleRiskDraftChange(
-                                    "entry",
-                                    event.target.value
-                                )
-                            }
-                            style={{
-                                width: "100%",
-                                padding: "12px 14px",
-                                borderRadius: 12,
-                                border: `1px solid ${COLORS.borderStrong}`,
-                                background: "rgba(0,0,0,0.25)",
-                                color: COLORS.text,
-                                outline: "none",
-                            }}
-                            placeholder="z. B. 18250.25"
-                        />
-                    </InputField>
-
-                    <InputField label="Stop">
-                        <input
-                            type="number"
-                            step="0.25"
-                            value={riskDraft.stop}
-                            onChange={(event) =>
-                                handleRiskDraftChange(
-                                    "stop",
-                                    event.target.value
-                                )
-                            }
-                            style={{
-                                width: "100%",
-                                padding: "12px 14px",
-                                borderRadius: 12,
-                                border: `1px solid ${COLORS.borderStrong}`,
-                                background: "rgba(0,0,0,0.25)",
-                                color: COLORS.text,
-                                outline: "none",
-                            }}
-                            placeholder="z. B. 18235.25"
-                        />
-                    </InputField>
-
-                    <InputField label="Target">
-                        <input
-                            type="number"
-                            step="0.25"
-                            value={riskDraft.target}
-                            onChange={(event) =>
-                                handleRiskDraftChange(
-                                    "target",
-                                    event.target.value
-                                )
-                            }
-                            style={{
-                                width: "100%",
-                                padding: "12px 14px",
-                                borderRadius: 12,
-                                border: `1px solid ${COLORS.borderStrong}`,
-                                background: "rgba(0,0,0,0.25)",
-                                color: COLORS.text,
-                                outline: "none",
-                            }}
-                            placeholder="z. B. 18280.25"
-                        />
-                    </InputField>
-
-                    <InputField label="Kontrakte">
-                        <input
-                            type="number"
-                            min={1}
-                            step={1}
-                            value={riskDraft.qty}
-                            onChange={(event) =>
-                                handleRiskDraftChange(
-                                    "qty",
-                                    toSafeInteger(event.target.value, 1)
-                                )
-                            }
-                            style={{
-                                width: "100%",
-                                padding: "12px 14px",
-                                borderRadius: 12,
-                                border: `1px solid ${calculator.isOverAllowedContracts
-                                        ? COLORS.red
-                                        : COLORS.borderStrong
-                                    }`,
-                                background: calculator.isOverAllowedContracts
-                                    ? "rgba(248, 113, 113, 0.10)"
-                                    : "rgba(0,0,0,0.25)",
-                                color: COLORS.text,
-                                outline: "none",
-                                boxShadow: calculator.isOverAllowedContracts
-                                    ? "0 0 0 1px rgba(248, 113, 113, 0.18)"
-                                    : "none",
-                            }}
-                        />
-                    </InputField>
-                </div>
-
-                <div
-                    style={{
-                        display: "flex",
-                        gap: 10,
-                        flexWrap: "wrap",
-                    }}
-                >
-                    <button
-                        type="button"
-                        onClick={handleApplySafeSize}
-                        disabled={!safeSizeAvailable}
-                        style={{
-                            border: `1px solid ${safeSizeAvailable ? COLORS.green : COLORS.borderStrong}`,
-                            color: safeSizeAvailable ? COLORS.green : COLORS.textSoft,
-                            background: safeSizeAvailable
-                                ? "rgba(74, 222, 128, 0.08)"
-                                : "rgba(255,255,255,0.02)",
-                            borderRadius: 12,
-                            padding: "12px 14px",
-                            fontWeight: 800,
-                            cursor: safeSizeAvailable ? "pointer" : "not-allowed",
-                            opacity: safeSizeAvailable ? 1 : 0.7,
-                        }}
-                    >
-                        Safe Size übernehmen
-                    </button>
-
-                    <button
-                        type="button"
-                        onClick={handleResetRiskDraft}
-                        style={{
-                            border: `1px solid ${COLORS.cyan}`,
-                            color: COLORS.cyan,
-                            background: "transparent",
-                            borderRadius: 12,
-                            padding: "12px 14px",
-                            fontWeight: 800,
-                            cursor: "pointer",
-                        }}
-                    >
-                        Rechner zurücksetzen
-                    </button>
-                </div>
-
-                <div
-                    style={{
-                        border: `1px solid ${safeSizeColors.border}`,
-                        borderRadius: 14,
-                        padding: 14,
-                        background: safeSizeColors.background,
-                        color: safeSizeColors.text,
-                        fontSize: 13,
-                        lineHeight: 1.5,
-                        fontWeight: 600,
-                    }}
-                >
-                    {safeSizeAvailable
-                        ? `Safe Size bereit. Mit einem Klick werden ${calculator.allowedContracts} zusätzliche Kontrakte übernommen.`
-                        : "Safe Size noch nicht bereit. Entry, Stop und Target vollständig setzen."}
-                </div>
-
-                {calculator.hasLiveContractBreach ? (
-                    <div
-                        style={{
-                            border: `1px solid ${COLORS.red}`,
-                            borderRadius: 14,
-                            padding: 14,
-                            background: "rgba(248, 113, 113, 0.10)",
-                            color: COLORS.red,
-                            fontSize: 15,
-                            lineHeight: 1.5,
-                            fontWeight: 800,
-                        }}
-                    >
-                        Live Position ist bereits über dem Limit.
-                        Offen sind {formatDecimal(calculator.liveContractCount, 0)} Kontrakte.
-                        Erlaubt sind {calculator.maxContractsByRule}.
-                    </div>
-                ) : null}
-
-                {calculator.isOverAllowedContracts ? (
-                    <div
-                        style={{
-                            border: `1px solid ${COLORS.red}`,
-                            borderRadius: 14,
-                            padding: 14,
-                            background: "rgba(248, 113, 113, 0.10)",
-                            color: COLORS.red,
-                            fontSize: 15,
-                            lineHeight: 1.5,
-                            fontWeight: 800,
-                        }}
-                    >
-                        Achtung. Deine Kontraktzahl liegt über der erlaubten Safe Size.
-                        Erlaubt sind {calculator.allowedContracts} zusätzliche Kontrakte.
-                        Eingegeben sind {calculator.qty}.
-                    </div>
-                ) : null}
-
-                <div
-                    style={{
-                        border: `1px solid ${calculator.status.border}`,
-                        borderRadius: 14,
-                        padding: 14,
-                        background: calculator.status.background,
-                        color: calculator.status.color,
-                        fontSize: 15,
-                        lineHeight: 1.5,
-                        fontWeight: 700,
-                    }}
-                >
-                    {calculator.status.message}
-                </div>
-
-                <div
-                    style={{
-                        display: "grid",
-                        gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                        gap: 10,
-                    }}
-                >
-                    <InfoCard
-                        label="Risiko pro Kontrakt"
-                        value={formatCurrency(calculator.riskPerContract)}
-                        hint={`${formatPoints(calculator.stopDistancePoints)} · ${formatTicks(calculator.stopTicks)}`}
-                        color={COLORS.red}
-                    />
-                    <InfoCard
-                        label="Chance pro Kontrakt"
-                        value={formatCurrency(calculator.rewardPerContract)}
-                        hint={`${formatPoints(calculator.targetDistancePoints)} · ${formatTicks(calculator.targetTicks)}`}
-                        color={COLORS.green}
-                    />
-                    <InfoCard
-                        label="Gesamtrisiko"
-                        value={formatCurrency(calculator.totalRisk)}
-                        hint={`${calculator.qty} neue Kontrakte`}
-                        color={COLORS.orange}
-                    />
-                    <InfoCard
-                        label="Gesamtziel"
-                        value={formatCurrency(calculator.totalReward)}
-                        hint={`${calculator.qty} neue Kontrakte`}
-                        color={COLORS.green}
-                    />
-                    <InfoCard
-                        label="CRV"
-                        value={formatRatio(calculator.rrRatio)}
-                        hint={`${calculator.instrument.label} · Tick ${formatDecimal(calculator.instrument.tickSize, 2)} · ${formatCurrency(calculator.instrument.tickValue)}`}
-                        color={COLORS.purple}
-                    />
-                </div>
-
-                <div
-                    style={{
-                        border: `1px solid ${COLORS.border}`,
-                        borderRadius: 16,
-                        padding: 14,
-                        background: "rgba(255, 255, 255, 0.03)",
-                        display: "grid",
-                        gap: 10,
-                    }}
-                >
-                    <div
-                        style={{
-                            color: COLORS.title,
-                            fontSize: 13,
-                            fontWeight: 800,
-                        }}
-                    >
-                        Limit Lage
-                    </div>
-
-                    <div
-                        style={{
-                            display: "grid",
-                            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                            gap: 10,
-                        }}
-                    >
-                        <InfoCard
-                            label="Live Kontrakte gesamt"
-                            value={formatDecimal(riskLimitState.currentContracts, 0)}
-                            hint={`Max ${formatDecimal(riskLimitState.maxContracts, 0)}`}
-                            color={liveOverLimitCard.value ? COLORS.red : COLORS.cyan}
-                        />
-                        <InfoCard
-                            label="Live Kontrakte im Instrument"
-                            value={formatDecimal(riskLimitState.currentInstrumentContracts, 0)}
-                            hint={`Instrument ${calculator.instrument.label}`}
-                            color={COLORS.cyan}
-                        />
-                        <InfoCard
-                            label="Neu geplante Kontrakte"
-                            value={formatDecimal(riskLimitState.plannedContracts, 0)}
-                            hint={`Instrument ${calculator.instrument.label}`}
-                            color={COLORS.purple}
-                        />
-                        <InfoCard
-                            label="Freie Slots jetzt"
-                            value={formatDecimal(riskLimitState.freeSlotsNow, 0)}
-                            hint={`Max ${formatDecimal(riskLimitState.maxContracts, 0)}`}
-                            color={
-                                riskLimitState.freeSlotsNow < 0
-                                    ? COLORS.red
-                                    : riskLimitState.freeSlotsNow <= 1
-                                        ? COLORS.orange
-                                        : COLORS.text
-                            }
-                        />
-                        <InfoCard
-                            label="Max Kontrakte"
-                            value={formatDecimal(riskLimitState.maxContracts, 0)}
-                            hint="Regelbasierte Obergrenze"
-                            color={COLORS.green}
-                        />
-                    </div>
-
-                    <div
-                        style={{
-                            display: "grid",
-                            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                            gap: 10,
-                        }}
-                    >
-                        <InfoCard
-                            label="Offen nach Entry"
-                            value={formatDecimal(openAfterEntryCard.value, 0)}
-                            hint={openAfterEntryCard.reason}
-                            color={openAfterEntryColors.text}
-                            background={openAfterEntryColors.background}
-                            borderColor={openAfterEntryColors.border}
-                        />
-                        <InfoCard
-                            label="Freie Slots nach Entry"
-                            value={formatDecimal(freeSlotsAfterEntryCard.value, 0)}
-                            hint={freeSlotsAfterEntryCard.reason}
-                            color={freeSlotsAfterEntryColors.text}
-                            background={freeSlotsAfterEntryColors.background}
-                            borderColor={freeSlotsAfterEntryColors.border}
-                        />
-                        <InfoCard
-                            label="Safe Size"
-                            value={formatDecimal(safeSizeCard.value, 0)}
-                            hint={safeSizeCard.reason}
-                            color={safeSizeColors.text}
-                            background={safeSizeColors.background}
-                            borderColor={safeSizeColors.border}
-                        />
-                        <InfoCard
-                            label="Live Überlimit"
-                            value={liveOverLimitCard.value ? "Ja" : "Nein"}
-                            hint={liveOverLimitCard.reason}
-                            color={liveOverLimitColors.text}
-                            background={liveOverLimitColors.background}
-                            borderColor={liveOverLimitColors.border}
-                        />
-                        <InfoCard
-                            label="Instrument nach Entry"
-                            value={formatDecimal(instrumentAfterEntryCard.value, 0)}
-                            hint={instrumentAfterEntryCard.reason}
-                            color={instrumentAfterEntryColors.text}
-                            background={instrumentAfterEntryColors.background}
-                            borderColor={instrumentAfterEntryColors.border}
-                        />
-                    </div>
-                </div>
-
-                <div
-                    style={{
-                        border: `1px solid ${COLORS.border}`,
-                        borderRadius: 16,
-                        padding: 14,
-                        background: "rgba(255, 255, 255, 0.03)",
-                        display: "grid",
-                        gap: 10,
-                    }}
-                >
-                    <div
-                        style={{
-                            color: COLORS.title,
-                            fontSize: 13,
-                            fontWeight: 800,
-                        }}
-                    >
-                        Risiko in Punkten und Prozent
-                    </div>
-
-                    <div
-                        style={{
-                            display: "grid",
-                            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                            gap: 10,
-                        }}
-                    >
-                        <InfoCard
-                            label="Risiko pro Punkt"
-                            value={formatCurrency(calculator.riskPerPoint)}
-                            hint={`${formatCurrency(calculator.instrument.pointValue)} pro Kontrakt · ${calculator.qty} Kontrakte`}
-                            color={COLORS.cyan}
-                        />
-                        <InfoCard
-                            label="Risiko in Prozent Konto"
-                            value={formatPercent(calculator.riskPercentOfAccount)}
-                            hint={`Basis ${formatCurrency(calculator.accountSize)}`}
-                            color={COLORS.yellow}
-                        />
-                        <InfoCard
-                            label="Risiko in Prozent DLL"
-                            value={formatPercent(calculator.riskPercentOfDll)}
-                            hint={
-                                calculator.activeDll === null
-                                    ? "Kein DLL aktiv"
-                                    : `Basis ${formatCurrency(calculator.activeDll)}`
-                            }
-                            color={COLORS.orange}
-                        />
-                        <InfoCard
-                            label="Rest DLL nach Stop"
-                            value={formatPercent(calculator.remainingDllPercentAfterTrade)}
-                            hint={
-                                calculator.remainingDllAfterTrade === null
-                                    ? "Kein DLL aktiv"
-                                    : `${formatCurrency(calculator.remainingDllAfterTrade)} frei`
-                            }
-                            color={COLORS.green}
-                        />
-                    </div>
-                </div>
-
-                <div
-                    style={{
-                        display: "grid",
-                        gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                        gap: 10,
-                    }}
-                >
-                    <InfoCard
-                        label="Rest Threshold"
-                        value={formatCurrency(calculator.remainingThresholdRoom)}
-                        hint={`Liquidation ${formatCurrency(riskSnapshot.thresholdBalance)}`}
-                        color={COLORS.cyan}
-                    />
-                    <InfoCard
-                        label="Rest DLL"
-                        value={
-                            calculator.remainingDllRoom === null
-                                ? "Kein DLL"
-                                : formatCurrency(calculator.remainingDllRoom)
-                        }
-                        hint={
-                            calculator.activeDll === null
-                                ? "In diesem Modus nicht aktiv"
-                                : `Aktiv ${formatCurrency(calculator.activeDll)}`
-                        }
-                        color={COLORS.yellow}
-                    />
-                    <InfoCard
-                        label="Balance nach Stop"
-                        value={formatCurrency(calculator.projectedBalanceAfterStop)}
-                        hint={`PnL ${formatSignedCurrency(calculator.projectedPnlAfterStop)}`}
-                        color={COLORS.red}
-                    />
-                    <InfoCard
-                        label="Balance nach Ziel"
-                        value={formatCurrency(calculator.projectedBalanceAfterTarget)}
-                        hint={`Zum Tagesziel fehlen ${formatCurrency(calculator.targetGap)}`}
-                        color={COLORS.green}
-                    />
-                </div>
-
-                {(calculator.hasDirectionError || calculator.hasInputError) ? (
-                    <div
-                        style={{
-                            border: `1px solid ${COLORS.red}`,
-                            borderRadius: 14,
-                            padding: 14,
-                            background: "rgba(248, 113, 113, 0.08)",
-                            color: COLORS.red,
-                            fontSize: 14,
-                            fontWeight: 700,
-                            lineHeight: 1.5,
-                        }}
-                    >
-                        {calculator.hasInputError
-                            ? "Entry, Stop und Target müssen gesetzt sein und Abstand haben."
-                            : ""}
-                        {calculator.hasInputError && calculator.hasDirectionError ? " " : ""}
-                        {calculator.hasDirectionError
-                            ? calculator.side === "long"
-                                ? "Bei long muss Stop unter Entry und Target über Entry liegen."
-                                : "Bei short muss Stop über Entry und Target unter Entry liegen."
-                            : ""}
-                    </div>
-                ) : null}
-            </div>
-
-            {SHOW_INTERNAL_TEST_UI ? <RiskTestRunner /> : null}
-
-            {SHOW_INTERNAL_TEST_UI ? (
+            {showCalculator ? (
                 <div
                     style={{
                         background: COLORS.panelBg,
-                        border: `1px solid ${COLORS.border}`,
-                        borderRadius: 20,
-                        padding: 18,
+                        border: `1px solid ${calculatorUi.border}`,
+                        borderRadius: 18,
+                        padding: 16,
                         boxShadow: COLORS.shadow,
                         display: "grid",
-                        gap: 14,
+                        gap: 12,
                     }}
                 >
                     <div
@@ -2602,33 +3210,64 @@ function RiskPanelContent({
                             <div
                                 style={{
                                     color: COLORS.title,
-                                    fontSize: 16,
+                                    fontSize: 15,
                                     fontWeight: 800,
                                 }}
                             >
-                                Simulation
+                                Riskrechner
                             </div>
                             <div
                                 style={{
                                     color: COLORS.textSoft,
-                                    fontSize: 13,
-                                    marginTop: 4,
+                                    fontSize: 12,
+                                    marginTop: 3,
                                 }}
                             >
-                                Testet Grün, Orange und Rot direkt im UI
+                                Direkte Trade Prüfung vor dem Entry
                             </div>
                         </div>
 
                         <div
                             style={{
-                                color: COLORS.textSoft,
-                                fontSize: 12,
+                                display: "flex",
+                                gap: 8,
+                                flexWrap: "wrap",
+                                justifyContent: "flex-end",
                             }}
                         >
-                            Letzte Änderung{" "}
-                            {tradeSimulation?.updatedAt
-                                ? formatDateTime(tradeSimulation.updatedAt)
-                                : "Keine"}
+                            <div
+                                style={{
+                                    border: `1px solid ${COLORS.borderStrong}`,
+                                    borderRadius: 999,
+                                    padding: "7px 12px",
+                                    color: COLORS.cyan,
+                                    background: "rgba(34,211,238,0.08)",
+                                    fontSize: 11,
+                                    fontWeight: 800,
+                                    whiteSpace: "nowrap",
+                                }}
+                            >
+                                {providerLabel}
+                            </div>
+
+                            <div
+                                style={{
+                                    border: `1px solid ${calculatorUi.border}`,
+                                    borderRadius: 999,
+                                    padding: "7px 12px",
+                                    color: calculatorUi.text,
+                                    background: calculatorUi.background,
+                                    fontSize: 11,
+                                    fontWeight: 800,
+                                    whiteSpace: "nowrap",
+                                }}
+                            >
+                                {calculator.status === "green"
+                                    ? "Grün"
+                                    : calculator.status === "yellow"
+                                        ? "Gelb"
+                                        : "Rot"}
+                            </div>
                         </div>
                     </div>
 
@@ -2636,96 +3275,107 @@ function RiskPanelContent({
                         style={{
                             display: "grid",
                             gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                            gap: 12,
+                            gap: 10,
                         }}
                     >
-                        <InputField label="Instrument">
+                        <InputField label="Tagesziel">
                             <input
-                                value={simulationDraft.instrument}
+                                type="number"
+                                step="1"
+                                value={riskDraft.dailyTarget}
                                 onChange={(event) =>
-                                    handleDraftChange(
-                                        "instrument",
-                                        event.target.value.toUpperCase()
+                                    handleRiskDraftChange(
+                                        "dailyTarget",
+                                        toNumber(event.target.value, 0)
                                     )
                                 }
-                                style={{
-                                    width: "100%",
-                                    padding: "12px 14px",
-                                    borderRadius: 12,
-                                    border: `1px solid ${COLORS.borderStrong}`,
-                                    background: "rgba(0,0,0,0.25)",
-                                    color: COLORS.text,
-                                    outline: "none",
-                                }}
-                                placeholder="MNQ"
+                                style={inputStyle}
                             />
+                        </InputField>
+
+                        <InputField label="Instrument">
+                            <select
+                                value={riskDraft.instrument}
+                                onChange={(event) =>
+                                    handleRiskDraftChange(
+                                        "instrument",
+                                        cleanString(event.target.value).toUpperCase()
+                                    )
+                                }
+                                style={inputStyle}
+                            >
+                                <option value="MNQ">MNQ</option>
+                                <option value="NQ">NQ</option>
+                                <option value="MES">MES</option>
+                                <option value="ES">ES</option>
+                            </select>
                         </InputField>
 
                         <InputField label="Seite">
                             <select
-                                value={simulationDraft.side}
+                                value={riskDraft.side}
                                 onChange={(event) =>
-                                    handleDraftChange(
+                                    handleRiskDraftChange(
                                         "side",
                                         event.target.value === "short" ? "short" : "long"
                                     )
                                 }
-                                style={{
-                                    width: "100%",
-                                    padding: "12px 14px",
-                                    borderRadius: 12,
-                                    border: `1px solid ${COLORS.borderStrong}`,
-                                    background: "rgba(0,0,0,0.25)",
-                                    color: COLORS.text,
-                                    outline: "none",
-                                }}
+                                style={inputStyle}
                             >
                                 <option value="long">long</option>
                                 <option value="short">short</option>
                             </select>
                         </InputField>
 
-                        <InputField label="Menge">
+                        <InputField label="Entry">
+                            <input
+                                type="number"
+                                step="0.25"
+                                value={riskDraft.entry}
+                                onChange={(event) =>
+                                    handleRiskDraftChange("entry", event.target.value)
+                                }
+                                style={inputStyle}
+                            />
+                        </InputField>
+
+                        <InputField label="Stop">
+                            <input
+                                type="number"
+                                step="0.25"
+                                value={riskDraft.stop}
+                                onChange={(event) =>
+                                    handleRiskDraftChange("stop", event.target.value)
+                                }
+                                style={inputStyle}
+                            />
+                        </InputField>
+
+                        <InputField label="Target">
+                            <input
+                                type="number"
+                                step="0.25"
+                                value={riskDraft.target}
+                                onChange={(event) =>
+                                    handleRiskDraftChange("target", event.target.value)
+                                }
+                                style={inputStyle}
+                            />
+                        </InputField>
+
+                        <InputField label="Kontrakte">
                             <input
                                 type="number"
                                 min={1}
                                 step={1}
-                                value={simulationDraft.qty}
+                                value={riskDraft.qty}
                                 onChange={(event) =>
-                                    handleDraftChange(
+                                    handleRiskDraftChange(
                                         "qty",
                                         toSafeInteger(event.target.value, 1)
                                     )
                                 }
-                                style={{
-                                    width: "100%",
-                                    padding: "12px 14px",
-                                    borderRadius: 12,
-                                    border: `1px solid ${COLORS.borderStrong}`,
-                                    background: "rgba(0,0,0,0.25)",
-                                    color: COLORS.text,
-                                    outline: "none",
-                                }}
-                            />
-                        </InputField>
-
-                        <InputField label="PnL">
-                            <input
-                                type="number"
-                                step="0.01"
-                                value={simulationDraft.pnl}
-                                onChange={(event) =>
-                                    handleDraftChange("pnl", toNumber(event.target.value, 0))
-                                }
-                                style={{
-                                    width: "100%",
-                                    padding: "12px 14px",
-                                    borderRadius: 12,
-                                    border: `1px solid ${COLORS.borderStrong}`,
-                                    background: "rgba(0,0,0,0.25)",
-                                    color: COLORS.text,
-                                    outline: "none",
-                                }}
+                                style={inputStyle}
                             />
                         </InputField>
                     </div>
@@ -2739,35 +3389,26 @@ function RiskPanelContent({
                     >
                         <button
                             type="button"
-                            onClick={handleAddTestTrade}
-                            style={{
-                                border: `1px solid ${COLORS.green}`,
-                                color: COLORS.green,
-                                background: "transparent",
-                                borderRadius: 12,
-                                padding: "12px 14px",
-                                fontWeight: 800,
-                                cursor: "pointer",
-                            }}
+                            onClick={handleResetRiskDraft}
+                            style={buttonStyle}
                         >
-                            Test Trade hinzufügen
+                            Rechner zurücksetzen
                         </button>
+                    </div>
 
-                        <button
-                            type="button"
-                            onClick={handleResetSimulation}
-                            style={{
-                                border: `1px solid ${COLORS.orange}`,
-                                color: COLORS.orange,
-                                background: "transparent",
-                                borderRadius: 12,
-                                padding: "12px 14px",
-                                fontWeight: 800,
-                                cursor: "pointer",
-                            }}
-                        >
-                            Reset
-                        </button>
+                    <div
+                        style={{
+                            border: `1px solid ${calculatorUi.border}`,
+                            borderRadius: 13,
+                            padding: 12,
+                            background: calculatorUi.background,
+                            color: calculatorUi.text,
+                            fontSize: 14,
+                            lineHeight: 1.45,
+                            fontWeight: 700,
+                        }}
+                    >
+                        {calculator.message}
                     </div>
 
                     <div
@@ -2778,88 +3419,55 @@ function RiskPanelContent({
                         }}
                     >
                         <InfoCard
-                            label="Test Trades"
-                            value={String(simulatedTradeCount)}
-                            hint="Nur Simulation"
+                            label="Risiko pro Kontrakt"
+                            value={formatCurrency(calculator.riskPerContract)}
+                            hint={`${formatDecimal(calculator.stopTicks, 0)} Ticks`}
+                            color={COLORS.red}
                         />
                         <InfoCard
-                            label="Test PnL"
-                            value={formatSignedCurrency(simulatedPnl)}
-                            hint="Nur Simulation"
+                            label="Chance pro Kontrakt"
+                            value={formatCurrency(calculator.rewardPerContract)}
+                            hint={`${formatDecimal(calculator.targetTicks, 0)} Ticks`}
+                            color={COLORS.green}
                         />
                         <InfoCard
-                            label="Status Vorschau"
-                            value={getRiskStatus(simulatedTradeCount).label}
-                            hint={
-                                simulatedTradeCount > 0
-                                    ? getRiskStatus(simulatedTradeCount).message
-                                    : "Keine Test Trades"
-                            }
+                            label="Gesamtrisiko"
+                            value={formatCurrency(calculator.totalRisk)}
+                            hint={`${calculator.qty} neue Kontrakte`}
+                            color={COLORS.orange}
                         />
-                    </div>
-
-                    <div
-                        style={{
-                            border: `1px solid ${COLORS.border}`,
-                            borderRadius: 16,
-                            overflow: "hidden",
-                        }}
-                    >
-                        <div
-                            style={{
-                                display: "grid",
-                                gridTemplateColumns: "160px 100px 90px 90px 1fr",
-                                gap: 10,
-                                padding: "12px 14px",
-                                background: COLORS.panelBgStrong,
-                                color: COLORS.textSoft,
-                                fontSize: 11,
-                                fontWeight: 700,
-                                textTransform: "uppercase",
-                            }}
-                        >
-                            <div>Zeit</div>
-                            <div>Instrument</div>
-                            <div>Seite</div>
-                            <div>Menge</div>
-                            <div>PnL</div>
-                        </div>
-
-                        {simulatedTradeCount === 0 ? (
-                            <div
-                                style={{
-                                    padding: 16,
-                                    color: COLORS.textSoft,
-                                    fontSize: 14,
-                                }}
-                            >
-                                Keine Test Trades vorhanden
-                            </div>
-                        ) : (
-                            tradeSimulation.trades
-                                .slice()
-                                .reverse()
-                                .map((trade) => (
-                                    <div
-                                        key={trade.id}
-                                        style={{
-                                            display: "grid",
-                                            gridTemplateColumns: "160px 100px 90px 90px 1fr",
-                                            gap: 10,
-                                            padding: "12px 14px",
-                                            borderTop: `1px solid ${COLORS.border}`,
-                                            color: COLORS.text,
-                                            fontSize: 13,
-                                        }}
-                                    >
-                                        <div>{formatDateTime(trade.createdAt)}</div>
-                                        <div>{trade.instrument}</div>
-                                        <div>{trade.side}</div>
-                                        <div>{trade.qty}</div>
-                                        <div>{formatSignedCurrency(trade.pnl)}</div>
-                                    </div>
-                                ))
-                        )}
+                        <InfoCard
+                            label="Gesamtziel"
+                            value={formatCurrency(calculator.totalReward)}
+                            hint={`${calculator.qty} neue Kontrakte`}
+                            color={COLORS.green}
+                        />
+                        <InfoCard
+                            label="CRV"
+                            value={formatRatio(calculator.rrRatio)}
+                            hint={calculator.instrument.label}
+                            color={COLORS.purple}
+                        />
+                        <InfoCard
+                            label="Balance nach Stop"
+                            value={formatCurrency(calculator.projectedBalanceAfterStop)}
+                            hint={`Tagesziel offen ${formatCurrency(calculator.targetGap)}`}
+                            color={COLORS.red}
+                        />
+                        <InfoCard
+                            label="Balance nach Ziel"
+                            value={formatCurrency(calculator.projectedBalanceAfterTarget)}
+                            hint={`Tagesziel offen ${formatCurrency(calculator.targetGap)}`}
+                            color={COLORS.green}
+                        />
+                        <InfoCard
+                            label="Risiko Prozent"
+                            value={formatPercent(
+                                startBalance > 0 ? (calculator.totalRisk / startBalance) * 100 : null
+                            )}
+                            hint={`Basis ${formatCurrency(startBalance)}`}
+                            color={COLORS.yellow}
+                        />
                     </div>
                 </div>
             ) : null}
@@ -2867,9 +3475,31 @@ function RiskPanelContent({
     );
 }
 
+const inputStyle = {
+    width: "100%",
+    padding: "11px 13px",
+    borderRadius: 11,
+    border: `1px solid ${COLORS.borderStrong}`,
+    background: "rgba(0,0,0,0.22)",
+    color: COLORS.text,
+    outline: "none",
+};
+
+const buttonStyle = {
+    border: `1px solid ${COLORS.cyan}`,
+    color: COLORS.cyan,
+    background: "transparent",
+    borderRadius: 11,
+    padding: "10px 13px",
+    fontWeight: 800,
+    cursor: "pointer",
+};
+
 export default function RiskPanel(props) {
     const resolvedAccount =
         props?.account || props?.activeAccount || props?.selectedAccount || null;
+
+    const provider = resolvePanelProvider(props, resolvedAccount);
 
     const resolvedAccountId =
         cleanString(props?.resolvedAccountId) ||
@@ -2878,22 +3508,145 @@ export default function RiskPanel(props) {
         cleanString(props?.selectedAccountId) ||
         cleanString(resolvedAccount?.id);
 
+    const scopeAccountId = resolveScopeAccountId(resolvedAccount, resolvedAccountId);
+    const hasActiveAccount = hasActiveAccountContext(resolvedAccount, resolvedAccountId);
+    const showCalculator = props?.showCalculator !== false;
+
     const fillsProp = props?.fills;
     const accountBalanceHistoryProp = props?.accountBalanceHistory;
+    const ordersProp = props?.orders;
+    const effectiveImportsProp = props?.effectiveImports ?? null;
+    const importsProp = props?.imports ?? null;
+
+    const [localImports, setLocalImports] = useState(() => {
+        return loadParsedImportsForProvider(resolvedAccountId, provider);
+    });
+
+    useEffect(() => {
+        if (typeof window === "undefined") {
+            return;
+        }
+
+        const loadImports = () => {
+            const nextImports = loadParsedImportsForProvider(resolvedAccountId, provider);
+            setLocalImports(nextImports);
+        };
+
+        const eventNames = getImportEventNames(provider);
+
+        loadImports();
+
+        eventNames.forEach((eventName) => {
+            window.addEventListener(eventName, loadImports);
+        });
+
+        window.addEventListener("storage", loadImports);
+        window.addEventListener("focus", loadImports);
+
+        return () => {
+            eventNames.forEach((eventName) => {
+                window.removeEventListener(eventName, loadImports);
+            });
+
+            window.removeEventListener("storage", loadImports);
+            window.removeEventListener("focus", loadImports);
+        };
+    }, [resolvedAccountId, provider]);
+
+    const resolvedAccountImports = useMemo(() => {
+        return resolveImportsForProvider(provider, resolvedAccount?.imports);
+    }, [provider, resolvedAccount?.imports]);
+
+    const directImports = useMemo(() => {
+        return resolveImportsForProvider(provider, importsProp);
+    }, [provider, importsProp]);
+
+    const directEffectiveImports = useMemo(() => {
+        return resolveImportsForProvider(provider, effectiveImportsProp);
+    }, [provider, effectiveImportsProp]);
+
+    const effectiveImports = useMemo(() => {
+        if (hasImportCollectionContent(directEffectiveImports)) {
+            return directEffectiveImports;
+        }
+
+        return resolveAccountImportsFromSources(
+            localImports,
+            resolvedAccountImports,
+            hasImportCollectionContent(directImports) ? directImports : importsProp
+        );
+    }, [
+        localImports,
+        resolvedAccountImports,
+        directImports,
+        directEffectiveImports,
+        importsProp,
+    ]);
+
+    const importedFillsData = useMemo(() => {
+        return callImportBuilder(
+            "buildFillsData",
+            effectiveImports,
+            scopeAccountId || resolvedAccountId,
+            provider
+        );
+    }, [effectiveImports, scopeAccountId, resolvedAccountId, provider]);
+
+    const importedOrdersData = useMemo(() => {
+        return callImportBuilder(
+            "buildOrdersData",
+            effectiveImports,
+            scopeAccountId || resolvedAccountId,
+            provider
+        );
+    }, [effectiveImports, scopeAccountId, resolvedAccountId, provider]);
+
+    const importedCashHistoryData = useMemo(() => {
+        return callImportBuilder(
+            "buildCashHistoryData",
+            effectiveImports,
+            scopeAccountId || resolvedAccountId,
+            provider
+        );
+    }, [effectiveImports, scopeAccountId, resolvedAccountId, provider]);
 
     const rawFills = useMemo(() => {
-        return Array.isArray(fillsProp) ? fillsProp : [];
-    }, [fillsProp]);
+        if (Array.isArray(fillsProp) && fillsProp.length > 0) {
+            return fillsProp;
+        }
+
+        return Array.isArray(importedFillsData?.entries)
+            ? importedFillsData.entries
+            : [];
+    }, [fillsProp, importedFillsData]);
+
+    const rawOrders = useMemo(() => {
+        if (Array.isArray(ordersProp) && ordersProp.length > 0) {
+            return ordersProp;
+        }
+
+        return Array.isArray(importedOrdersData?.entries)
+            ? importedOrdersData.entries
+            : [];
+    }, [ordersProp, importedOrdersData]);
 
     const rawAccountBalanceHistory = useMemo(() => {
-        return Array.isArray(accountBalanceHistoryProp)
-            ? accountBalanceHistoryProp
+        if (Array.isArray(accountBalanceHistoryProp) && accountBalanceHistoryProp.length > 0) {
+            return accountBalanceHistoryProp;
+        }
+
+        return Array.isArray(importedCashHistoryData?.entries)
+            ? importedCashHistoryData.entries
             : [];
-    }, [accountBalanceHistoryProp]);
+    }, [accountBalanceHistoryProp, importedCashHistoryData]);
 
     const accountFills = useMemo(() => {
-        return scopeRowsByAccount(rawFills, resolvedAccountId);
-    }, [rawFills, resolvedAccountId]);
+        return scopeRowsByAccount(rawFills, scopeAccountId);
+    }, [rawFills, scopeAccountId]);
+
+    const accountOrders = useMemo(() => {
+        return scopeRowsByAccount(rawOrders, scopeAccountId);
+    }, [rawOrders, scopeAccountId]);
 
     const positionAnalytics = useMemo(() => {
         return buildFillAnalytics({
@@ -2908,29 +3661,48 @@ export default function RiskPanel(props) {
             : [];
     }, [positionAnalytics]);
 
-    const liveOpenContracts = useMemo(() => {
+    const liveExposureUnits = useMemo(() => {
         return livePositions.reduce((sum, position) => {
-            return sum + Math.abs(toNumber(position?.quantity, 0));
+            return (
+                sum +
+                Math.abs(toNumber(position?.quantity, 0)) * getPositionApexUnit(position)
+            );
         }, 0);
     }, [livePositions]);
 
     const accountBalanceRows = useMemo(() => {
-        const filtered = scopeRowsByAccount(rawAccountBalanceHistory, resolvedAccountId);
+        const filtered = scopeRowsByAccount(rawAccountBalanceHistory, scopeAccountId);
+        const effectiveRows =
+            filtered.length > 0 ? filtered : rawAccountBalanceHistory;
 
-        return [...filtered].sort((a, b) => {
+        return [...effectiveRows].sort((a, b) => {
             const aTime = (getBalanceTimestamp(a) || new Date(0)).getTime();
             const bTime = (getBalanceTimestamp(b) || new Date(0)).getTime();
             return aTime - bTime;
         });
-    }, [rawAccountBalanceHistory, resolvedAccountId]);
+    }, [rawAccountBalanceHistory, scopeAccountId]);
 
-    const liveTodayTrades = useMemo(() => {
-        return getUniqueTradesForToday(accountFills);
+    const balanceSummary = useMemo(() => {
+        return buildBalanceSummary(accountBalanceRows);
+    }, [accountBalanceRows]);
+
+    const latestFillTradingDayKey = useMemo(() => {
+        return getLatestTradingDayKey(accountFills, getFillTimestamp);
     }, [accountFills]);
 
-    const liveTodayTradeCount = liveTodayTrades.length;
+    const activeTradingDayKey = useMemo(() => {
+        return (
+            cleanString(latestFillTradingDayKey) ||
+            cleanString(balanceSummary.latestTradingDayKey) ||
+            getTradingDayKey(new Date())
+        );
+    }, [latestFillTradingDayKey, balanceSummary.latestTradingDayKey]);
 
-    const liveTodayPnl = useMemo(() => {
+    const liveTodayTrades = useMemo(() => {
+        return getUniqueTradesForDay(accountFills, activeTradingDayKey);
+    }, [accountFills, activeTradingDayKey]);
+
+    const fillsDerivedTodayPnl = useMemo(() => {
         return sumNumbers(
             liveTodayTrades.map((row) => {
                 return getFillPnl(row) || 0;
@@ -2938,41 +3710,120 @@ export default function RiskPanel(props) {
         );
     }, [liveTodayTrades]);
 
-    const historyCurrentBalance =
-        accountBalanceRows.length > 0
-            ? getBalanceValue(accountBalanceRows[accountBalanceRows.length - 1])
-            : null;
+    const balanceRowsForActiveTradingDay = useMemo(() => {
+        return getRowsForTradingDay(accountBalanceRows, activeTradingDayKey, getBalanceTimestamp);
+    }, [accountBalanceRows, activeTradingDayKey]);
 
-    const historyStartBalance =
-        accountBalanceRows.length > 0 ? getBalanceValue(accountBalanceRows[0]) : null;
+    const balanceDerivedTodayPnl = useMemo(() => {
+        if (!balanceRowsForActiveTradingDay.length) {
+            return null;
+        }
 
-    const accountCurrentBalance = toNumber(resolvedAccount?.currentBalance, null);
-    const accountStartingBalance = toNumber(resolvedAccount?.startingBalance, null);
-    const accountDeclaredSize = toNumber(resolvedAccount?.accountSize, null);
+        const values = balanceRowsForActiveTradingDay
+            .map((row) => getBalanceDayPnlValue(row))
+            .filter((value) => value !== null && value !== undefined);
+
+        if (!values.length) {
+            return null;
+        }
+
+        const hasDeltaRows = balanceRowsForActiveTradingDay.some((row) => {
+            const flexible = buildFlexibleSource(row);
+
+            return cleanString(
+                pickFlexibleValue(flexible, [
+                    "delta",
+                    "cashChange",
+                    "netChange",
+                    "change",
+                    "Delta",
+                    "Cash Change",
+                    "Net Change",
+                ])
+            );
+        });
+
+        if (hasDeltaRows) {
+            return sumNumbers(values);
+        }
+
+        return values[values.length - 1];
+    }, [balanceRowsForActiveTradingDay]);
+
+    const fillCommissionForActiveTradingDay = useMemo(() => {
+        return sumNumbers(
+            liveTodayTrades.map((row) => getFillCommission(row) || 0)
+        );
+    }, [liveTodayTrades]);
+
+    const accountCurrentBalance = parseFlexibleNumber(resolvedAccount?.currentBalance);
+    const accountStartingBalance = parseFlexibleNumber(resolvedAccount?.startingBalance);
+    const accountDeclaredSize = parseFlexibleNumber(resolvedAccount?.accountSize);
+
+    const baseDetectedAccountSize = useMemo(() => {
+        return deriveAccountSize({
+            accountId: scopeAccountId || resolvedAccountId,
+            account: resolvedAccount,
+            startBalance:
+                accountStartingBalance !== null && accountStartingBalance > 0
+                    ? accountStartingBalance
+                    : accountDeclaredSize,
+            currentBalance:
+                balanceSummary.currentBalance !== null && balanceSummary.currentBalance !== undefined
+                    ? balanceSummary.currentBalance
+                    : accountCurrentBalance !== null && accountCurrentBalance !== undefined
+                        ? accountCurrentBalance
+                        : accountDeclaredSize,
+            fallbackSize: resolvedAccount?.accountSize,
+        });
+    }, [
+        scopeAccountId,
+        resolvedAccountId,
+        resolvedAccount,
+        accountStartingBalance,
+        accountDeclaredSize,
+        balanceSummary.currentBalance,
+        accountCurrentBalance,
+    ]);
 
     const currentBalance =
-        historyCurrentBalance !== null && historyCurrentBalance !== undefined
-            ? historyCurrentBalance
+        balanceSummary.currentBalance !== null && balanceSummary.currentBalance !== undefined
+            ? balanceSummary.currentBalance
             : accountCurrentBalance !== null && accountCurrentBalance !== undefined
                 ? accountCurrentBalance
                 : accountStartingBalance !== null && accountStartingBalance !== undefined
                     ? accountStartingBalance
-                    : accountDeclaredSize;
+                    : accountDeclaredSize !== null && accountDeclaredSize !== undefined
+                        ? accountDeclaredSize
+                        : baseDetectedAccountSize;
 
     const startBalance =
-        historyStartBalance !== null && historyStartBalance !== undefined
-            ? historyStartBalance
-            : accountStartingBalance !== null && accountStartingBalance !== undefined
-                ? accountStartingBalance
-                : accountDeclaredSize;
+        accountStartingBalance !== null && accountStartingBalance > 0
+            ? accountStartingBalance
+            : baseDetectedAccountSize > 0
+                ? baseDetectedAccountSize
+                : balanceSummary.startBalance !== null && balanceSummary.startBalance !== undefined
+                    ? balanceSummary.startBalance
+                    : accountDeclaredSize !== null && accountDeclaredSize !== undefined
+                        ? accountDeclaredSize
+                        : currentBalance;
 
     const detectedAccountSize = deriveAccountSize({
-        accountId: resolvedAccountId,
+        accountId: scopeAccountId || resolvedAccountId,
         account: resolvedAccount,
         startBalance,
         currentBalance,
-        fallbackSize: resolvedAccount?.accountSize,
+        fallbackSize: baseDetectedAccountSize || resolvedAccount?.accountSize,
     });
+
+    const liveTodayPnl =
+        balanceDerivedTodayPnl !== null && balanceDerivedTodayPnl !== undefined
+            ? balanceDerivedTodayPnl
+            : fillsDerivedTodayPnl !== 0
+                ? fillsDerivedTodayPnl
+                : fillCommissionForActiveTradingDay > 0
+                    ? -fillCommissionForActiveTradingDay
+                    : 0;
 
     const balanceDelta =
         currentBalance !== null &&
@@ -2982,21 +3833,29 @@ export default function RiskPanel(props) {
             ? currentBalance - startBalance
             : null;
 
+    if (!hasActiveAccount) {
+        return <NeutralRiskPanel />;
+    }
+
     return (
         <RiskPanelContent
-            key={`risk-panel-${resolvedAccountId || "unknown"}-${detectedAccountSize || 0}`}
+            key={`risk-panel-${provider}-${resolvedAccountId || "unknown"}-${detectedAccountSize || 0}`}
+            provider={provider}
             resolvedAccount={resolvedAccount}
             resolvedAccountId={resolvedAccountId}
-            accountFills={accountFills}
+            scopeAccountId={scopeAccountId}
             accountBalanceRows={accountBalanceRows}
-            liveTodayTradeCount={liveTodayTradeCount}
+            accountFills={accountFills}
+            accountOrders={accountOrders}
+            activeTradingDayKey={activeTradingDayKey}
             liveTodayPnl={liveTodayPnl}
             currentBalance={currentBalance}
             startBalance={startBalance}
             detectedAccountSize={detectedAccountSize}
             balanceDelta={balanceDelta}
-            liveOpenContracts={liveOpenContracts}
+            liveExposureUnits={liveExposureUnits}
             livePositions={livePositions}
+            showCalculator={showCalculator}
         />
     );
 }
