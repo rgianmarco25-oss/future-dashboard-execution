@@ -467,6 +467,9 @@ function truncateMiddle(value, maxLength = 24) {
 
 function resolveFeedLabel(provider, fillCount, openPositionCount, historyCount) {
     const providerLabel = formatProviderLabel(provider);
+    const providerStatus = cleanString(
+    liveSnapshot?.dataProviderStatus || resolvedAccount?.dataProviderStatus
+).toLowerCase();
 
     if (openPositionCount > 0) {
         return "Live Positionen aktiv";
@@ -1005,9 +1008,22 @@ export default function PositionsPanel({
 
     const providerLabel = formatProviderLabel(provider);
 
-    const forceAtasZeroState = useMemo(() => {
-        return normalizeProvider(provider) === "atas" && !hasLiveAtasIdentity(liveSnapshot);
-    }, [provider, liveSnapshot]);
+   const forceAtasZeroState = useMemo(() => {
+    if (normalizeProvider(provider) !== "atas") {
+        return false;
+    }
+
+    if (hasLiveAtasIdentity(liveSnapshot)) {
+        return false;
+    }
+
+    return (
+        !providerStatus ||
+        providerStatus === "disconnected" ||
+        providerStatus === "error" ||
+        providerStatus === "not_connected"
+    );
+}, [provider, liveSnapshot, providerStatus]);
 
     const scopeAccountId = useMemo(() => {
         if (forceAtasZeroState) {
@@ -1125,18 +1141,33 @@ export default function PositionsPanel({
         importsProp,
     ]);
 
-    const importedFillsData = useMemo(() => {
-        if (forceAtasZeroState) {
-            return { entries: EMPTY_LIST };
+  const effectiveFills = useMemo(() => {
+    if (forceAtasZeroState) {
+        return EMPTY_LIST;
+    }
+
+    if (normalizeProvider(provider) === "atas") {
+        if (liveSnapshotFills.length > 0) {
+            return liveSnapshotFills;
         }
 
-        return callImportBuilder(
-            "buildFillsData",
-            effectiveImports,
-            scopeAccountId || resolvedAppAccountId,
-            provider
-        );
-    }, [forceAtasZeroState, effectiveImports, scopeAccountId, resolvedAppAccountId, provider]);
+        if (directFills.length > 0) {
+            return directFills;
+        }
+
+        return EMPTY_LIST;
+    }
+
+    if (directFills.length > 0) {
+        return directFills;
+    }
+
+    if (storedFills.length > 0) {
+        return storedFills;
+    }
+
+    return liveSnapshotFills;
+}, [forceAtasZeroState, provider, liveSnapshotFills, directFills, storedFills]);
 
     const positionHistoryData = useMemo(() => {
         if (forceAtasZeroState) {
@@ -1192,33 +1223,6 @@ export default function PositionsPanel({
         return getLiveSnapshotFills(liveSnapshot);
     }, [liveSnapshot, forceAtasZeroState]);
 
-    const effectiveFills = useMemo(() => {
-        if (forceAtasZeroState) {
-            return EMPTY_LIST;
-        }
-
-        if (normalizeProvider(provider) === "atas") {
-            if (liveSnapshotFills.length > 0) {
-                return liveSnapshotFills;
-            }
-
-            if (directFills.length > 0) {
-                return directFills;
-            }
-
-            return storedFills;
-        }
-
-        if (directFills.length > 0) {
-            return directFills;
-        }
-
-        if (storedFills.length > 0) {
-            return storedFills;
-        }
-
-        return liveSnapshotFills;
-    }, [forceAtasZeroState, provider, liveSnapshotFills, directFills, storedFills]);
 
     const analytics = useMemo(() => {
         return buildFillAnalytics({

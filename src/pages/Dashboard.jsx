@@ -201,18 +201,28 @@ function buildRuntimeAccountMeta(account) {
     const hasIdentity = hasStrictProviderIdentity(account, snapshot, provider);
     const zeroState = shouldUseAtasZeroState(account, snapshot, provider);
 
-    const rawOrders =
-        Array.isArray(snapshot?.orders) && snapshot.orders.length > 0
+const rawOrders =
+    provider === "atas"
+        ? (Array.isArray(snapshot?.orders) ? snapshot.orders : EMPTY_LIST)
+        : Array.isArray(snapshot?.orders) && snapshot.orders.length > 0
             ? snapshot.orders
             : getSafeRows(getOrders(account.id));
 
-    const rawFills =
-        Array.isArray(snapshot?.fills) && snapshot.fills.length > 0
+const rawFills =
+    provider === "atas"
+        ? (Array.isArray(snapshot?.fills) ? snapshot.fills : EMPTY_LIST)
+        : Array.isArray(snapshot?.fills) && snapshot.fills.length > 0
             ? snapshot.fills
             : getSafeRows(getFills(account.id));
 
-    const rawCashHistory =
-        Array.isArray(snapshot?.balanceHistory) && snapshot.balanceHistory.length > 0
+const rawCashHistory =
+    provider === "atas"
+        ? Array.isArray(snapshot?.balanceHistory)
+            ? snapshot.balanceHistory
+            : Array.isArray(snapshot?.cashHistory)
+                ? snapshot.cashHistory
+                : EMPTY_LIST
+        : Array.isArray(snapshot?.balanceHistory) && snapshot.balanceHistory.length > 0
             ? snapshot.balanceHistory
             : Array.isArray(snapshot?.cashHistory) && snapshot.cashHistory.length > 0
                 ? snapshot.cashHistory
@@ -236,15 +246,19 @@ function buildRuntimeAccountMeta(account) {
         toNumber(account?.accountSize, 0)
     );
 
-    const startBalance = zeroState
-        ? fallbackStartBalance
+const startBalance = zeroState
+    ? fallbackStartBalance
+    : provider === "atas"
+        ? toNumber(snapshot?.startingBalance, fallbackStartBalance)
         : toNumber(
             snapshot?.startingBalance,
             toNumber(account?.startingBalance, toNumber(account?.accountSize, 0))
         );
 
-    const currentBalance = zeroState
-        ? startBalance
+const currentBalance = zeroState
+    ? startBalance
+    : provider === "atas"
+        ? toNumber(snapshot?.currentBalance, startBalance)
         : toNumber(
             snapshot?.currentBalance,
             toNumber(account?.currentBalance, startBalance)
