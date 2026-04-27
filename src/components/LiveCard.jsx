@@ -115,6 +115,30 @@ function formatSignedCurrency(value) {
     return numeric >= 0 ? `+${absolute}` : `-${absolute}`;
 }
 
+function formatNumber(value, digits = 0) {
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+        return "–";
+    }
+
+    return Number(value).toLocaleString("de-CH", {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits,
+    });
+}
+
+function formatPrice(value) {
+    const numeric = toNumber(value, 0);
+
+    if (!numeric) {
+        return "0";
+    }
+
+    return numeric.toLocaleString("de-CH", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+    });
+}
+
 function formatDateTimeLocal(value) {
     const date = toDateOrNull(value);
 
@@ -138,25 +162,27 @@ function formatAccountSizeLabel(value) {
         return "–";
     }
 
+    if (amount >= 145000) {
+        return "150K";
+    }
+
+    if (amount >= 95000) {
+        return "100K";
+    }
+
+    if (amount >= 45000) {
+        return "50K";
+    }
+
+    if (amount >= 20000) {
+        return "25K";
+    }
+
     if (amount >= 1000) {
         return `${Math.round(amount / 1000)}K`;
     }
 
     return String(amount);
-}
-
-function normalizePhase(value) {
-    return cleanString(value).toLowerCase() === "pa" ? "PA" : "EVAL";
-}
-
-function normalizeProductType(value) {
-    const raw = cleanString(value).toLowerCase();
-
-    if (raw.includes("intra")) {
-        return "Intraday";
-    }
-
-    return "EOD";
 }
 
 function formatStatusLabel(value) {
@@ -192,7 +218,7 @@ function formatStatusLabel(value) {
 function getStatusColors(status) {
     const lower = cleanString(status).toLowerCase();
 
-    if (lower === "passed") {
+    if (lower === "passed" || lower === "connected" || lower === "ready" || lower === "online") {
         return {
             background: "rgba(34, 197, 94, 0.14)",
             border: "rgba(34, 197, 94, 0.26)",
@@ -200,7 +226,7 @@ function getStatusColors(status) {
         };
     }
 
-    if (lower === "active") {
+    if (lower === "active" || lower === "syncing") {
         return {
             background: "rgba(34, 211, 238, 0.12)",
             border: "rgba(34, 211, 238, 0.24)",
@@ -208,7 +234,7 @@ function getStatusColors(status) {
         };
     }
 
-    if (lower === "failed") {
+    if (lower === "failed" || lower === "error" || lower === "disconnected" || lower === "offline") {
         return {
             background: "rgba(239, 68, 68, 0.12)",
             border: "rgba(239, 68, 68, 0.24)",
@@ -234,7 +260,7 @@ function getStatusColors(status) {
 function getProviderStatusTone(status) {
     const normalized = cleanString(status).toLowerCase();
 
-    if (normalized === "connected" || normalized === "ready") {
+    if (normalized === "connected" || normalized === "ready" || normalized === "online") {
         return "green";
     }
 
@@ -242,7 +268,7 @@ function getProviderStatusTone(status) {
         return "yellow";
     }
 
-    if (normalized === "error" || normalized === "disconnected") {
+    if (normalized === "error" || normalized === "disconnected" || normalized === "offline") {
         return "red";
     }
 
@@ -287,6 +313,113 @@ function pickFlexibleValue(source, keys) {
     }
 
     return "";
+}
+
+function isAtasProviderValue(value) {
+    return cleanString(value).toLowerCase().includes("atas");
+}
+
+function isReplaySnapshot(snapshot = {}) {
+    const accountId = cleanString(snapshot?.accountId).toLowerCase();
+    const accountName = cleanString(snapshot?.accountName).toLowerCase();
+    const tradingAccountId = cleanString(snapshot?.tradingAccountId).toLowerCase();
+    const sourceName = cleanString(snapshot?.sourceName).toLowerCase();
+
+    return (
+        accountId === "replay" ||
+        accountName === "replay" ||
+        tradingAccountId === "replay" ||
+        sourceName === "replay"
+    );
+}
+
+function isAtasContext(account = {}, snapshot = {}, provider = "") {
+    if (isAtasProviderValue(provider)) {
+        return true;
+    }
+
+    if (isAtasProviderValue(snapshot?.dataProvider)) {
+        return true;
+    }
+
+    if (isAtasProviderValue(snapshot?.provider)) {
+        return true;
+    }
+
+    if (isAtasProviderValue(snapshot?.source?.provider)) {
+        return true;
+    }
+
+    if (isReplaySnapshot(snapshot)) {
+        return true;
+    }
+
+    if (isAtasProviderValue(account?.dataProvider)) {
+        return true;
+    }
+
+    if (isAtasProviderValue(account?.provider)) {
+        return true;
+    }
+
+    if (isAtasProviderValue(account?.source?.provider)) {
+        return true;
+    }
+
+    return false;
+}
+
+function getAtasStartBalanceValue(snapshot = {}) {
+    if (!snapshot || typeof snapshot !== "object") {
+        return 0;
+    }
+
+    const flexible = buildFlexibleSource(snapshot);
+
+    const value = pickFlexibleValue(flexible, [
+        "atasStartingBalance",
+        "atasStartBalance",
+        "providerStartingBalance",
+        "providerStartBalance",
+        "snapshotStartingBalance",
+        "snapshotStartBalance",
+        "startingBalance",
+        "startBalance",
+    ]);
+
+    const parsed = parseFlexibleNumber(value);
+
+    return parsed !== null ? parsed : 0;
+}
+
+function getAtasCurrentBalanceValue(snapshot = {}) {
+    if (!snapshot || typeof snapshot !== "object") {
+        return 0;
+    }
+
+    const flexible = buildFlexibleSource(snapshot);
+
+    const value = pickFlexibleValue(flexible, [
+        "currentBalance",
+        "balance",
+        "cash",
+        "accountBalance",
+        "cashBalance",
+        "netLiq",
+        "netliq",
+    ]);
+
+    const parsed = parseFlexibleNumber(value);
+
+    return parsed !== null ? parsed : 0;
+}
+
+function getAtasModeLabel(snapshot = {}) {
+    if (isReplaySnapshot(snapshot)) {
+        return "Replay";
+    }
+
+    return "Desktop";
 }
 
 function toDateOrNull(value) {
@@ -572,7 +705,7 @@ export default function LiveCard(props) {
         cleanString(activeAccount?.id) ||
         "";
 
-    const [, setRefreshTick] = useState(0);
+    const [refreshTick, setRefreshTick] = useState(0);
 
     useEffect(() => {
         const handleRefresh = () => {
@@ -584,11 +717,17 @@ export default function LiveCard(props) {
         }
 
         window.addEventListener("tradovate-csv-imports-updated", handleRefresh);
+        window.addEventListener("future-dashboard-storage", handleRefresh);
+        window.addEventListener("atas-bridge-accounts-updated", handleRefresh);
+        window.addEventListener("atas-bridge-status-updated", handleRefresh);
         window.addEventListener("storage", handleRefresh);
         window.addEventListener("focus", handleRefresh);
 
         return () => {
             window.removeEventListener("tradovate-csv-imports-updated", handleRefresh);
+            window.removeEventListener("future-dashboard-storage", handleRefresh);
+            window.removeEventListener("atas-bridge-accounts-updated", handleRefresh);
+            window.removeEventListener("atas-bridge-status-updated", handleRefresh);
             window.removeEventListener("storage", handleRefresh);
             window.removeEventListener("focus", handleRefresh);
         };
@@ -600,7 +739,7 @@ export default function LiveCard(props) {
         }
 
         return getAccountById(resolvedAccountId) || {};
-    }, [resolvedAccountId]);
+    }, [resolvedAccountId, refreshTick]);
 
     const liveSnapshot = useMemo(() => {
         if (!resolvedAccountId) {
@@ -608,7 +747,7 @@ export default function LiveCard(props) {
         }
 
         return getLiveAccountSnapshot(resolvedAccountId) || null;
-    }, [resolvedAccountId]);
+    }, [resolvedAccountId, refreshTick]);
 
     const resolvedAccount = useMemo(() => {
         return {
@@ -627,28 +766,36 @@ export default function LiveCard(props) {
         );
     }, [resolvedAccount, liveSnapshot]);
 
+    const isAtasRuntime = useMemo(() => {
+        return isAtasContext(resolvedAccount, liveSnapshot, runtimeProvider);
+    }, [resolvedAccount, liveSnapshot, runtimeProvider]);
+
+    const effectiveProvider = useMemo(() => {
+        return isAtasRuntime ? "atas" : runtimeProvider;
+    }, [isAtasRuntime, runtimeProvider]);
+
     const isAtasZeroState = useMemo(() => {
         return shouldUseAtasZeroState(
             resolvedAccount,
             liveSnapshot,
-            runtimeProvider
+            effectiveProvider
         );
-    }, [resolvedAccount, liveSnapshot, runtimeProvider]);
+    }, [resolvedAccount, liveSnapshot, effectiveProvider]);
 
     const rows = useMemo(() => {
-        if (isAtasZeroState) {
+        if (isAtasZeroState || isAtasRuntime) {
             return [];
         }
 
         const propRows = Array.isArray(accountBalanceHistoryProp) ? accountBalanceHistoryProp : [];
         return sortBalanceRows(propRows);
-    }, [accountBalanceHistoryProp, isAtasZeroState]);
+    }, [accountBalanceHistoryProp, isAtasZeroState, isAtasRuntime]);
 
     const balanceSummary = useMemo(() => {
-        if (isAtasZeroState) {
+        if (isAtasZeroState || isAtasRuntime) {
             return {
-                startBalance: 0,
-                currentBalance: 0,
+                startBalance: getAtasStartBalanceValue(liveSnapshot),
+                currentBalance: getAtasCurrentBalanceValue(liveSnapshot),
                 rowCount: 0,
                 firstTimestamp: null,
                 lastTimestamp: null,
@@ -656,11 +803,15 @@ export default function LiveCard(props) {
         }
 
         return buildBalanceSummary(rows);
-    }, [rows, isAtasZeroState]);
+    }, [rows, isAtasZeroState, isAtasRuntime, liveSnapshot]);
 
     const startBalance = useMemo(() => {
         if (isAtasZeroState) {
             return 0;
+        }
+
+        if (isAtasRuntime) {
+            return getAtasStartBalanceValue(liveSnapshot);
         }
 
         if (balanceSummary.startBalance !== null && balanceSummary.startBalance !== undefined) {
@@ -680,11 +831,15 @@ export default function LiveCard(props) {
         );
 
         return storedStartingBalance !== null ? storedStartingBalance : null;
-    }, [balanceSummary.startBalance, liveSnapshot, resolvedAccount, isAtasZeroState]);
+    }, [balanceSummary.startBalance, liveSnapshot, resolvedAccount, isAtasZeroState, isAtasRuntime]);
 
     const currentBalance = useMemo(() => {
         if (isAtasZeroState) {
             return 0;
+        }
+
+        if (isAtasRuntime) {
+            return getAtasCurrentBalanceValue(liveSnapshot);
         }
 
         if (balanceSummary.currentBalance !== null && balanceSummary.currentBalance !== undefined) {
@@ -704,7 +859,7 @@ export default function LiveCard(props) {
         );
 
         return storedCurrentBalance !== null ? storedCurrentBalance : null;
-    }, [balanceSummary.currentBalance, liveSnapshot, resolvedAccount, isAtasZeroState]);
+    }, [balanceSummary.currentBalance, liveSnapshot, resolvedAccount, isAtasZeroState, isAtasRuntime]);
 
     const balanceDelta = useMemo(() => {
         if (isAtasZeroState) {
@@ -724,19 +879,25 @@ export default function LiveCard(props) {
     }, [startBalance, currentBalance, isAtasZeroState]);
 
     const providerLabel = useMemo(() => {
-        return getProviderLabel(runtimeProvider);
-    }, [runtimeProvider]);
+        return getProviderLabel(effectiveProvider);
+    }, [effectiveProvider]);
 
     const providerTypeLabel = useMemo(() => {
+        if (isAtasRuntime) {
+            return getAtasModeLabel(liveSnapshot);
+        }
+
         return getProviderTypeLabel(
             cleanString(liveSnapshot?.dataProviderType || resolvedAccount?.dataProviderType),
-            runtimeProvider
+            effectiveProvider
         );
-    }, [liveSnapshot, resolvedAccount, runtimeProvider]);
+    }, [liveSnapshot, resolvedAccount, effectiveProvider, isAtasRuntime]);
 
     const providerStatusValue = useMemo(() => {
         return cleanString(
-            liveSnapshot?.dataProviderStatus || resolvedAccount?.dataProviderStatus
+            liveSnapshot?.dataProviderStatus ||
+                liveSnapshot?.connectionStatus ||
+                resolvedAccount?.dataProviderStatus
         );
     }, [liveSnapshot, resolvedAccount]);
 
@@ -753,7 +914,7 @@ export default function LiveCard(props) {
             getStrictProviderDisplayName(
                 resolvedAccount,
                 liveSnapshot,
-                runtimeProvider
+                effectiveProvider
             )
         );
 
@@ -765,15 +926,19 @@ export default function LiveCard(props) {
             return "Kein ATAS Account";
         }
 
+        if (isAtasRuntime) {
+            return "Replay";
+        }
+
         return "Kein aktiver Account";
-    }, [resolvedAccount, liveSnapshot, runtimeProvider, isAtasZeroState]);
+    }, [resolvedAccount, liveSnapshot, effectiveProvider, isAtasZeroState, isAtasRuntime]);
 
     const tradingRef = useMemo(() => {
         const value = cleanString(
             getStrictProviderTradingRef(
                 resolvedAccount,
                 liveSnapshot,
-                runtimeProvider
+                effectiveProvider
             )
         );
 
@@ -785,15 +950,19 @@ export default function LiveCard(props) {
             return "Kein ATAS Account";
         }
 
+        if (isAtasRuntime) {
+            return "Replay";
+        }
+
         return "Keine Trading Ref";
-    }, [resolvedAccount, liveSnapshot, runtimeProvider, isAtasZeroState]);
+    }, [resolvedAccount, liveSnapshot, effectiveProvider, isAtasZeroState, isAtasRuntime]);
 
     const sourceName = useMemo(() => {
         const value = cleanString(
             getStrictProviderAccountName(
                 resolvedAccount,
                 liveSnapshot,
-                runtimeProvider
+                effectiveProvider
             )
         );
 
@@ -805,22 +974,81 @@ export default function LiveCard(props) {
             return "Kein ATAS Account";
         }
 
+        if (isAtasRuntime) {
+            return "Replay";
+        }
+
         return "Offen";
-    }, [resolvedAccount, liveSnapshot, runtimeProvider, isAtasZeroState]);
+    }, [resolvedAccount, liveSnapshot, effectiveProvider, isAtasZeroState, isAtasRuntime]);
 
     const lastSyncLabel = useMemo(() => {
         return formatDateTimeLocal(
-            cleanString(liveSnapshot?.lastSyncAt || resolvedAccount?.lastSyncAt)
+            cleanString(
+                liveSnapshot?.lastSyncAt ||
+                    liveSnapshot?.receivedAt ||
+                    liveSnapshot?.timestamp ||
+                    resolvedAccount?.lastSyncAt
+            )
         );
     }, [liveSnapshot, resolvedAccount]);
 
     const statusColors = useMemo(() => {
+        if (isAtasRuntime) {
+            return getStatusColors(providerStatusValue);
+        }
+
         return getStatusColors(resolvedAccount?.accountStatus);
-    }, [resolvedAccount?.accountStatus]);
+    }, [resolvedAccount?.accountStatus, providerStatusValue, isAtasRuntime]);
+
+    const statusBadgeLabel = useMemo(() => {
+        if (isAtasRuntime) {
+            return providerStatusLabel;
+        }
+
+        return formatStatusLabel(resolvedAccount?.accountStatus);
+    }, [isAtasRuntime, providerStatusLabel, resolvedAccount?.accountStatus]);
+
+    const phaseBadgeLabel = useMemo(() => {
+        if (isAtasRuntime) {
+            const phase = cleanString(
+                liveSnapshot?.accountPhase ||
+                    resolvedAccount?.accountPhase
+            ).toLowerCase() === "pa"
+                ? "PA"
+                : "EVAL";
+
+            const productRaw = cleanString(
+                liveSnapshot?.productType ||
+                    resolvedAccount?.productType
+            ).toLowerCase();
+
+            const productType = productRaw.includes("intra") ? "Intraday" : "EOD";
+
+            return `${phase} ${productType}`;
+        }
+
+        const phase = cleanString(resolvedAccount?.accountPhase).toLowerCase() === "pa" ? "PA" : "EVAL";
+        const productRaw = cleanString(resolvedAccount?.productType).toLowerCase();
+        const productType = productRaw.includes("intra") ? "Intraday" : "EOD";
+
+        return `${phase} ${productType}`;
+    }, [resolvedAccount, liveSnapshot, isAtasRuntime]);
+
+    const modeBadgeLabel = useMemo(() => {
+        if (isAtasRuntime) {
+            return getAtasModeLabel(liveSnapshot);
+        }
+
+        return "";
+    }, [isAtasRuntime, liveSnapshot]);
 
     const fillsCount = useMemo(() => {
         if (isAtasZeroState) {
             return 0;
+        }
+
+        if (isAtasRuntime) {
+            return Array.isArray(liveSnapshot?.fills) ? liveSnapshot.fills.length : 0;
         }
 
         if (Array.isArray(fillsProp) && fillsProp.length) {
@@ -832,11 +1060,15 @@ export default function LiveCard(props) {
         }
 
         return 0;
-    }, [fillsProp, liveSnapshot, isAtasZeroState]);
+    }, [fillsProp, liveSnapshot, isAtasZeroState, isAtasRuntime]);
 
     const ordersCount = useMemo(() => {
         if (isAtasZeroState) {
             return 0;
+        }
+
+        if (isAtasRuntime) {
+            return Array.isArray(liveSnapshot?.orders) ? liveSnapshot.orders.length : 0;
         }
 
         if (Array.isArray(ordersProp) && ordersProp.length) {
@@ -848,15 +1080,73 @@ export default function LiveCard(props) {
         }
 
         return 0;
-    }, [ordersProp, liveSnapshot, isAtasZeroState]);
+    }, [ordersProp, liveSnapshot, isAtasZeroState, isAtasRuntime]);
 
     const accountSizeLabel = useMemo(() => {
-        if (isAtasZeroState) {
-            return "0";
-        }
+        const rawSize =
+            resolvedAccount?.accountSize ||
+            liveSnapshot?.accountSize ||
+            resolvedAccount?.startingBalance ||
+            liveSnapshot?.startingBalance ||
+            resolvedAccount?.currentBalance ||
+            liveSnapshot?.currentBalance;
 
-        return formatAccountSizeLabel(resolvedAccount?.accountSize);
-    }, [resolvedAccount, isAtasZeroState]);
+        return formatAccountSizeLabel(rawSize);
+    }, [resolvedAccount, liveSnapshot]);
+
+    const symbol = useMemo(() => {
+        return cleanString(
+            liveSnapshot?.symbol ||
+                liveSnapshot?.instrument ||
+                liveSnapshot?.contract ||
+                resolvedAccount?.symbol ||
+                ""
+        );
+    }, [liveSnapshot, resolvedAccount]);
+
+    const positionQty = useMemo(() => {
+        return toNumber(
+            liveSnapshot?.positionQty ??
+                liveSnapshot?.qty ??
+                liveSnapshot?.quantity ??
+                resolvedAccount?.positionQty,
+            0
+        );
+    }, [liveSnapshot, resolvedAccount]);
+
+    const avgPrice = useMemo(() => {
+        return toNumber(
+            liveSnapshot?.avgPrice ??
+                liveSnapshot?.averagePrice ??
+                resolvedAccount?.avgPrice,
+            0
+        );
+    }, [liveSnapshot, resolvedAccount]);
+
+    const realizedPnL = useMemo(() => {
+        return toNumber(
+            liveSnapshot?.realizedPnL ??
+                liveSnapshot?.realizedPnl ??
+                resolvedAccount?.realizedPnL,
+            0
+        );
+    }, [liveSnapshot, resolvedAccount]);
+
+    const unrealizedPnL = useMemo(() => {
+        return toNumber(
+            liveSnapshot?.unrealizedPnL ??
+                liveSnapshot?.unrealizedPnl ??
+                resolvedAccount?.unrealizedPnL,
+            0
+        );
+    }, [liveSnapshot, resolvedAccount]);
+
+    const dailyPnL = useMemo(() => {
+        return toNumber(
+            liveSnapshot?.dailyPnL,
+            realizedPnL + unrealizedPnL
+        );
+    }, [liveSnapshot, realizedPnL, unrealizedPnL]);
 
     return (
         <section
@@ -945,7 +1235,7 @@ export default function LiveCard(props) {
                             whiteSpace: "nowrap",
                         }}
                     >
-                        {formatStatusLabel(resolvedAccount?.accountStatus)}
+                        {statusBadgeLabel}
                     </span>
 
                     <span
@@ -962,8 +1252,27 @@ export default function LiveCard(props) {
                             whiteSpace: "nowrap",
                         }}
                     >
-                        {normalizePhase(resolvedAccount?.accountPhase)} {normalizeProductType(resolvedAccount?.productType)}
+                        {phaseBadgeLabel}
                     </span>
+
+                    {modeBadgeLabel ? (
+                        <span
+                            style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                padding: "5px 10px",
+                                borderRadius: 999,
+                                border: `1px solid ${COLORS.border}`,
+                                background: "rgba(34, 211, 238, 0.08)",
+                                color: COLORS.accent,
+                                fontSize: 12,
+                                fontWeight: 800,
+                                whiteSpace: "nowrap",
+                            }}
+                        >
+                            {modeBadgeLabel}
+                        </span>
+                    ) : null}
                 </div>
             </div>
 
@@ -1017,6 +1326,31 @@ export default function LiveCard(props) {
                 />
 
                 <InfoTile
+                    label="Symbol"
+                    value={symbol || "–"}
+                    hint="ATAS Kontrakt"
+                    color={COLORS.accent}
+                    borderColor="rgba(34, 211, 238, 0.22)"
+                    background="rgba(34, 211, 238, 0.04)"
+                />
+
+                <InfoTile
+                    label="Position Qty"
+                    value={formatNumber(positionQty, 0)}
+                    hint={positionQty === 0 ? "Keine offene Position" : "Offene Kontrakte"}
+                    color={positionQty === 0 ? COLORS.text : COLORS.warning}
+                    borderColor={positionQty === 0 ? COLORS.border : "rgba(245, 158, 11, 0.22)"}
+                    background={positionQty === 0 ? COLORS.panelBgSoft : "rgba(245, 158, 11, 0.04)"}
+                />
+
+                <InfoTile
+                    label="Avg Price"
+                    value={formatPrice(avgPrice)}
+                    hint="Durchschnittlicher Entry"
+                    color={COLORS.text}
+                />
+
+                <InfoTile
                     label="Kontogrösse"
                     value={accountSizeLabel}
                     hint="Account Grösse"
@@ -1031,7 +1365,9 @@ export default function LiveCard(props) {
                     hint={
                         balanceSummary.firstTimestamp
                             ? `Erster Eintrag ${formatDateTimeLocal(balanceSummary.firstTimestamp)}`
-                            : "Startwert"
+                            : isAtasRuntime
+                                ? "ATAS Startwert"
+                                : "Startwert"
                     }
                     color={COLORS.yellow}
                     borderColor="rgba(250, 204, 21, 0.22)"
@@ -1044,7 +1380,9 @@ export default function LiveCard(props) {
                     hint={
                         balanceSummary.lastTimestamp
                             ? `Letzter Eintrag ${formatDateTimeLocal(balanceSummary.lastTimestamp)}`
-                            : "Aktueller Wert"
+                            : isAtasRuntime
+                                ? "ATAS Live Wert"
+                                : "Aktueller Wert"
                     }
                     color={COLORS.accent}
                     borderColor="rgba(34, 211, 238, 0.22)"
@@ -1069,8 +1407,35 @@ export default function LiveCard(props) {
                 />
 
                 <InfoTile
+                    label="Realized PnL"
+                    value={formatSignedCurrency(realizedPnL)}
+                    hint={isAtasRuntime ? "ATAS Snapshot" : "Snapshot"}
+                    color={realizedPnL < 0 ? COLORS.danger : COLORS.positive}
+                    borderColor={realizedPnL < 0 ? "rgba(239, 68, 68, 0.22)" : "rgba(34, 197, 94, 0.22)"}
+                    background={realizedPnL < 0 ? "rgba(239, 68, 68, 0.04)" : "rgba(34, 197, 94, 0.04)"}
+                />
+
+                <InfoTile
+                    label="Unrealized PnL"
+                    value={formatSignedCurrency(unrealizedPnL)}
+                    hint="Offene Position"
+                    color={unrealizedPnL < 0 ? COLORS.danger : COLORS.positive}
+                    borderColor={unrealizedPnL < 0 ? "rgba(239, 68, 68, 0.22)" : "rgba(34, 197, 94, 0.22)"}
+                    background={unrealizedPnL < 0 ? "rgba(239, 68, 68, 0.04)" : "rgba(34, 197, 94, 0.04)"}
+                />
+
+                <InfoTile
+                    label="Daily PnL"
+                    value={formatSignedCurrency(dailyPnL)}
+                    hint="Realized plus Unrealized"
+                    color={dailyPnL < 0 ? COLORS.danger : COLORS.positive}
+                    borderColor={dailyPnL < 0 ? "rgba(239, 68, 68, 0.22)" : "rgba(34, 197, 94, 0.22)"}
+                    background={dailyPnL < 0 ? "rgba(239, 68, 68, 0.04)" : "rgba(34, 197, 94, 0.04)"}
+                />
+
+                <InfoTile
                     label="Balance Rows"
-                    value={String(isAtasZeroState ? 0 : rows.length)}
+                    value={String(isAtasZeroState || isAtasRuntime ? 0 : rows.length)}
                     hint="Account Balance History"
                     color={COLORS.text}
                 />

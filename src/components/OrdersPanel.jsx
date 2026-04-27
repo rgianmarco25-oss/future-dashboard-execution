@@ -7,8 +7,13 @@ import {
     getStrictProviderScopeAccountId,
     getStrictProviderTradingRef,
 } from "../utils/providerDisplay";
+import {
+    fetchAtasHistoryOrders,
+    getAtasHistoryStartDate,
+} from "../utils/atasBridgeApi";
 
 const EMPTY_LIST = [];
+const ATAS_HISTORY_START_DATE = getAtasHistoryStartDate();
 
 const COLORS = {
     panelBg: "#050816",
@@ -32,12 +37,197 @@ const COLORS = {
     accentGlow: "rgba(125, 211, 252, 0.12)",
 };
 
+const MICRO_CONTRACT_PREFIXES = [
+    "MNQ",
+    "MES",
+    "MYM",
+    "M2K",
+    "MCL",
+    "MGC",
+    "M6E",
+    "M6B",
+    "M6A",
+    "M6J",
+];
+
+const CONTRACT_PREFIXES = [
+    "MNQ",
+    "NQ",
+    "MES",
+    "ES",
+    "MYM",
+    "YM",
+    "M2K",
+    "RTY",
+    "MCL",
+    "CL",
+    "MGC",
+    "GC",
+    "M6E",
+    "6E",
+    "M6B",
+    "6B",
+    "M6A",
+    "6A",
+    "M6J",
+    "6J",
+];
+
+const MICRO_TO_FULL_PREFIX = {
+    MNQ: "NQ",
+    MES: "ES",
+    MYM: "YM",
+    M2K: "RTY",
+    MCL: "CL",
+    MGC: "GC",
+    M6E: "6E",
+    M6B: "6B",
+    M6A: "6A",
+    M6J: "6J",
+};
+
+const FULL_TO_MICRO_PREFIX = Object.fromEntries(
+    Object.entries(MICRO_TO_FULL_PREFIX).map(([micro, full]) => [full, micro])
+);
+
 function cleanString(value) {
     if (value === null || value === undefined) {
         return "";
     }
 
     return String(value).trim();
+}
+
+function normalizeContractText(value) {
+    const text = cleanString(value).toUpperCase();
+
+    if (!text) {
+        return "";
+    }
+
+    return text
+        .replace("@CME", "")
+        .replace("@CBOT", "")
+        .replace("@NYMEX", "")
+        .replace("@COMEX", "")
+        .replace("@ICE", "")
+        .replace("@SIM", "")
+        .replace(".SIM", "")
+        .replace("-SIM", "")
+        .replace("_SIM", "")
+        .replace(/\s+/g, "")
+        .trim();
+}
+
+function extractContractSymbol(value) {
+    const normalized = normalizeContractText(value);
+
+    if (!normalized) {
+        return "";
+    }
+
+    const contractMatch = normalized.match(
+        /(MNQ|NQ|MES|ES|MYM|YM|M2K|RTY|MCL|CL|MGC|GC|M6E|6E|M6B|6B|M6A|6A|M6J|6J)[A-Z]\d{1,2}/
+    );
+
+    if (contractMatch) {
+        return contractMatch[0];
+    }
+
+    const directPrefix = CONTRACT_PREFIXES.find((prefix) =>
+        normalized.startsWith(prefix)
+    );
+
+    if (directPrefix) {
+        return normalized;
+    }
+
+    return normalized;
+}
+
+function getContractPrefix(value) {
+    const normalized = extractContractSymbol(value);
+
+    if (!normalized) {
+        return "";
+    }
+
+    return CONTRACT_PREFIXES.find((prefix) =>
+        normalized.startsWith(prefix)
+    ) || "";
+}
+
+function getContractFamilyKey(value) {
+    const prefix = getContractPrefix(value);
+
+    if (!prefix) {
+        return "";
+    }
+
+    return MICRO_TO_FULL_PREFIX[prefix] || prefix;
+}
+
+function isMicroContract(value) {
+    const normalized = extractContractSymbol(value);
+
+    return MICRO_CONTRACT_PREFIXES.some((prefix) =>
+        normalized.startsWith(prefix)
+    );
+}
+
+function reduceContractsWithMicroPriority(values) {
+    const contracts = values
+        .map(extractContractSymbol)
+        .filter(Boolean)
+        .filter((value) => value !== "–");
+
+    if (!contracts.length) {
+        return EMPTY_LIST;
+    }
+
+    const uniqueContracts = [...new Set(contracts)];
+
+    const microFamilies = new Set(
+        uniqueContracts
+            .filter(isMicroContract)
+            .map(getContractFamilyKey)
+            .filter(Boolean)
+    );
+
+    return uniqueContracts.filter((contract) => {
+        const prefix = getContractPrefix(contract);
+        const family = getContractFamilyKey(contract);
+
+        if (!prefix || !family) {
+            return true;
+        }
+
+        if (!microFamilies.has(family)) {
+            return true;
+        }
+
+        if (isMicroContract(contract)) {
+            return true;
+        }
+
+        return !FULL_TO_MICRO_PREFIX[prefix];
+    });
+}
+
+function pickBestContract(values) {
+    const contracts = reduceContractsWithMicroPriority(values);
+
+    if (!contracts.length) {
+        return "";
+    }
+
+    const microContract = contracts.find(isMicroContract);
+
+    if (microContract) {
+        return microContract;
+    }
+
+    return contracts[0];
 }
 
 function normalizeProvider(value) {
@@ -103,7 +293,30 @@ function toArray(value) {
 }
 
 function toNumber(value, fallback = 0) {
-    const number = Number(value);
+    if (typeof value === "number" && Number.isFinite(value)) {
+        return value;
+    }
+
+    const text = cleanString(value)
+        .replace(/\s/g, "")
+        .replace(/[$€£]/g, "")
+        .replace(/USD|EUR|CHF/gi, "")
+        .replace(/'/g, "");
+
+    if (!text) {
+        return fallback;
+    }
+
+    const normalized = text.includes(",") && text.includes(".")
+        ? text.lastIndexOf(",") > text.lastIndexOf(".")
+            ? text.replace(/\./g, "").replace(/,/g, ".")
+            : text.replace(/,/g, "")
+        : text.includes(",")
+            ? text.replace(/,/g, ".")
+            : text;
+
+    const number = Number(normalized);
+
     return Number.isFinite(number) ? number : fallback;
 }
 
@@ -335,6 +548,28 @@ function formatDateTime(value) {
     return String(value);
 }
 
+function formatDateLabel(value) {
+    if (!value) {
+        return "–";
+    }
+
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) {
+        return cleanString(value) || "–";
+    }
+
+    return new Intl.DateTimeFormat("de-CH", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+    }).format(date);
+}
+
+function getDefaultEndDate() {
+    return new Date().toISOString().slice(0, 10);
+}
+
 function formatNumber(value, digits = 2) {
     const number = Number(value);
 
@@ -362,59 +597,90 @@ function formatInteger(value) {
 
 function getOrderId(order, index) {
     return (
-        order?.orderId ||
-        order?.id ||
-        order?.order_id ||
-        order?.orderNumber ||
+        cleanString(order?.orderId) ||
+        cleanString(order?.id) ||
+        cleanString(order?.order_id) ||
+        cleanString(order?.orderNumber) ||
+        cleanString(order?.ExtId) ||
+        cleanString(order?.extId) ||
+        cleanString(order?.externalId) ||
         `order-${index}`
     );
 }
 
 function getOrderSide(order) {
     return (
-        order?.side ||
-        order?.action ||
-        order?.buySell ||
-        order?.direction ||
-        order?.bs ||
+        cleanString(order?.side) ||
+        cleanString(order?.action) ||
+        cleanString(order?.buySell) ||
+        cleanString(order?.direction) ||
+        cleanString(order?.Direction) ||
+        cleanString(order?.OrderDirection) ||
+        cleanString(order?.orderDirection) ||
+        cleanString(order?.bs) ||
         "–"
     );
 }
 
 function getOrderInstrument(order) {
     return (
-        order?.instrument ||
-        order?.symbol ||
-        order?.contract ||
-        order?.market ||
-        order?.product ||
-        "–"
+        pickBestContract([
+            order?.instrument,
+            order?.symbol,
+            order?.contract,
+            order?.market,
+            order?.product,
+            order?.SecurityId,
+            order?.securityId,
+        ]) || "–"
     );
 }
 
 function getOrderQty(order) {
     return (
-        order?.quantity ||
-        order?.qty ||
-        order?.filledQty ||
-        order?.size ||
-        order?.contracts ||
+        order?.quantity ??
+        order?.qty ??
+        order?.filledQty ??
+        order?.QuantityToFill ??
+        order?.quantityToFill ??
+        order?.Volume ??
+        order?.volume ??
+        order?.size ??
+        order?.contracts ??
         0
     );
 }
 
 function getOrderStatus(order) {
-    return order?.status || order?.orderStatus || order?.state || "–";
+    return (
+        cleanString(order?.status) ||
+        cleanString(order?.orderStatus) ||
+        cleanString(order?.state) ||
+        cleanString(order?.State) ||
+        "–"
+    );
+}
+
+function getOrderPrice(order) {
+    return (
+        order?.price ??
+        order?.Price ??
+        order?.limitPrice ??
+        order?.avgFillPrice ??
+        order?.avgPrice ??
+        0
+    );
 }
 
 function getOrderTime(order) {
     return (
-        order?.timestamp ||
-        order?.createdAt ||
-        order?.submittedAt ||
-        order?.updatedAt ||
-        order?.time ||
-        order?.date ||
+        cleanString(order?.timestamp) ||
+        cleanString(order?.createdAt) ||
+        cleanString(order?.submittedAt) ||
+        cleanString(order?.updatedAt) ||
+        cleanString(order?.time) ||
+        cleanString(order?.Time) ||
+        cleanString(order?.date) ||
         ""
     );
 }
@@ -440,6 +706,7 @@ function mapOrderRows(entries = EMPTY_LIST, sourceLabel = "CSV") {
         side: getOrderSide(order),
         qty: getOrderQty(order),
         status: getOrderStatus(order),
+        price: getOrderPrice(order),
         time: getOrderTime(order),
         raw: order,
     }));
@@ -448,42 +715,147 @@ function mapOrderRows(entries = EMPTY_LIST, sourceLabel = "CSV") {
 function buildSimulationRows(simulationTrades = EMPTY_LIST) {
     return simulationTrades.map((trade, index) => ({
         id:
-            trade?.id ||
-            trade?.tradeId ||
-            trade?.orderId ||
+            cleanString(trade?.id) ||
+            cleanString(trade?.tradeId) ||
+            cleanString(trade?.orderId) ||
             `sim-${index}`,
         source: "SIM",
         instrument:
-            trade?.instrument ||
-            trade?.symbol ||
-            trade?.contract ||
-            trade?.product ||
-            "–",
+            pickBestContract([
+                trade?.instrument,
+                trade?.symbol,
+                trade?.contract,
+                trade?.product,
+            ]) || "–",
         side:
-            trade?.side ||
-            trade?.direction ||
-            trade?.action ||
+            cleanString(trade?.side) ||
+            cleanString(trade?.direction) ||
+            cleanString(trade?.action) ||
             "–",
         qty:
-            trade?.quantity ||
-            trade?.qty ||
-            trade?.contracts ||
+            trade?.quantity ??
+            trade?.qty ??
+            trade?.contracts ??
             0,
-        status: trade?.status || "Simuliert",
+        status: cleanString(trade?.status) || "Simuliert",
+        price: trade?.price ?? trade?.entryPrice ?? 0,
         time:
-            trade?.timestamp ||
-            trade?.createdAt ||
-            trade?.time ||
-            trade?.date ||
+            cleanString(trade?.timestamp) ||
+            cleanString(trade?.createdAt) ||
+            cleanString(trade?.time) ||
+            cleanString(trade?.date) ||
             "",
         raw: trade,
     }));
 }
 
-function resolveFeedLabel(provider, liveCount, importedCount, appCount, simCount) {
+function normalizeAtasHistoryOrder(order, index) {
+    const id =
+        cleanString(order?.orderId) ||
+        cleanString(order?.id) ||
+        cleanString(order?.tradeId) ||
+        cleanString(order?.ExtId) ||
+        `atas-history-order-${index}`;
+
+    const instrument =
+        pickBestContract([
+            order?.instrument,
+            order?.symbol,
+            order?.contract,
+            order?.SecurityId,
+            order?.securityId,
+        ]) || "–";
+
+    const side =
+        cleanString(order?.side) ||
+        cleanString(order?.direction) ||
+        cleanString(order?.Direction) ||
+        cleanString(order?.orderDirection) ||
+        "–";
+
+    const qty =
+        order?.qty ??
+        order?.quantity ??
+        order?.QuantityToFill ??
+        order?.volume ??
+        order?.Volume ??
+        0;
+
+    const status =
+        cleanString(order?.status) ||
+        cleanString(order?.state) ||
+        cleanString(order?.State) ||
+        "–";
+
+    const price =
+        order?.price ??
+        order?.Price ??
+        order?.limitPrice ??
+        order?.avgPrice ??
+        0;
+
+    const time =
+        cleanString(order?.timestamp) ||
+        cleanString(order?.time) ||
+        cleanString(order?.Time) ||
+        cleanString(order?.createdAt) ||
+        "";
+
+    return {
+        id,
+        source: "atas-history-orders",
+        instrument,
+        side,
+        qty,
+        status,
+        price,
+        time,
+        raw: order,
+    };
+}
+
+function dedupeOrderRows(rows) {
+    const map = new Map();
+
+    rows.forEach((row, index) => {
+        if (!row) {
+            return;
+        }
+
+        const key =
+            cleanString(row.id) ||
+            [
+                cleanString(row.instrument),
+                cleanString(row.side),
+                cleanString(row.qty),
+                cleanString(row.status),
+                cleanString(row.price),
+                cleanString(row.time),
+                index,
+            ].join("|");
+
+        if (!key) {
+            return;
+        }
+
+        map.set(key, row);
+    });
+
+    return Array.from(map.values());
+}
+
+function resolveFeedLabel(provider, liveCount, historyCount, importedCount, appCount, simCount, historyLoading) {
     const providerLabel = formatProviderLabel(provider);
 
+    if (historyLoading) {
+        return `${providerLabel} Orders laden`;
+    }
+
     if (normalizeProvider(provider) === "atas") {
+        if (historyCount > 0) {
+            return `${providerLabel} History aktiv`;
+        }
+
         if (liveCount > 0) {
             return `${providerLabel} Feed aktiv`;
         }
@@ -514,8 +886,16 @@ function resolveFeedLabel(provider, liveCount, importedCount, appCount, simCount
     return "Keine Orders geladen";
 }
 
-function resolveFeedColor(provider, liveCount, importedCount, appCount, simCount) {
+function resolveFeedColor(provider, liveCount, historyCount, importedCount, appCount, simCount, historyLoading) {
+    if (historyLoading) {
+        return COLORS.yellow;
+    }
+
     if (normalizeProvider(provider) === "atas") {
+        if (historyCount > 0) {
+            return COLORS.purple;
+        }
+
         if (liveCount > 0) {
             return COLORS.purple;
         }
@@ -586,7 +966,8 @@ function resolveStatusTone(status) {
         text.includes("open") ||
         text.includes("pending") ||
         text.includes("submitted") ||
-        text.includes("partial")
+        text.includes("partial") ||
+        text.includes("active")
     ) {
         return COLORS.yellow;
     }
@@ -617,21 +998,19 @@ function resolveSourceTone(source) {
 }
 
 function resolveInstrumentSummary(rows) {
-    const instruments = rows
-        .map((row) => cleanString(row.instrument))
-        .filter(Boolean);
+    const instruments = reduceContractsWithMicroPriority(
+        rows.map((row) => row?.instrument)
+    );
 
-    const uniqueInstruments = [...new Set(instruments)];
-
-    if (uniqueInstruments.length === 0) {
+    if (instruments.length === 0) {
         return "Keine Symbole";
     }
 
-    if (uniqueInstruments.length <= 3) {
-        return uniqueInstruments.join(", ");
+    if (instruments.length <= 3) {
+        return instruments.join(", ");
     }
 
-    return `${uniqueInstruments.slice(0, 3).join(", ")} +${uniqueInstruments.length - 3}`;
+    return `${instruments.slice(0, 3).join(", ")} +${instruments.length - 3}`;
 }
 
 function resolveLastOrderTime(rows) {
@@ -765,13 +1144,14 @@ export default function OrdersPanel({
     );
 
     const providerLabel = formatProviderLabel(provider);
+    const isAtasProvider = normalizeProvider(provider) === "atas";
 
     const providerStatus = cleanString(
         liveSnapshot?.dataProviderStatus || resolvedAccount?.dataProviderStatus
     ).toLowerCase();
 
     const forceAtasZeroState = useMemo(() => {
-        if (normalizeProvider(provider) !== "atas") {
+        if (!isAtasProvider) {
             return false;
         }
 
@@ -785,7 +1165,7 @@ export default function OrdersPanel({
             providerStatus === "error" ||
             providerStatus === "not_connected"
         );
-    }, [provider, liveSnapshot, providerStatus]);
+    }, [isAtasProvider, liveSnapshot, providerStatus]);
 
     const csvMatchAccountId = useMemo(() => {
         if (forceAtasZeroState) {
@@ -822,8 +1202,17 @@ export default function OrdersPanel({
             resolvedAccount,
             liveSnapshot,
             provider
-        ) || (normalizeProvider(provider) === "atas" ? "Kein ATAS Account" : "Keine Trading Ref");
-    }, [forceAtasZeroState, resolvedAccount, liveSnapshot, provider]);
+        ) || (isAtasProvider ? "Kein ATAS Account" : "Keine Trading Ref");
+    }, [forceAtasZeroState, resolvedAccount, liveSnapshot, provider, isAtasProvider]);
+
+    const [historyStartDate, setHistoryStartDate] = useState(ATAS_HISTORY_START_DATE);
+    const [historyEndDate, setHistoryEndDate] = useState(getDefaultEndDate);
+    const [atasHistoryState, setAtasHistoryState] = useState({
+        loading: false,
+        error: "",
+        orders: EMPTY_LIST,
+        readAt: "",
+    });
 
     const [localImports, setLocalImports] = useState(() => {
         return loadParsedImportsForProvider(effectiveAccountId, provider);
@@ -831,7 +1220,7 @@ export default function OrdersPanel({
 
     useEffect(() => {
         if (typeof window === "undefined") {
-            return;
+            return undefined;
         }
 
         const loadImports = () => {
@@ -859,6 +1248,71 @@ export default function OrdersPanel({
             window.removeEventListener("focus", loadImports);
         };
     }, [effectiveAccountId, provider]);
+
+    useEffect(() => {
+        if (!isAtasProvider || forceAtasZeroState || !csvMatchAccountId) {
+            setAtasHistoryState({
+                loading: false,
+                error: "",
+                orders: EMPTY_LIST,
+                readAt: "",
+            });
+            return undefined;
+        }
+
+        const controller = new AbortController();
+
+        setAtasHistoryState((current) => ({
+            ...current,
+            loading: true,
+            error: "",
+        }));
+
+        fetchAtasHistoryOrders(
+            {
+                accountId: csvMatchAccountId,
+                start: historyStartDate || ATAS_HISTORY_START_DATE,
+                end: historyEndDate || getDefaultEndDate(),
+            },
+            controller.signal
+        )
+            .then((result) => {
+                const historyOrders = Array.isArray(result?.orders)
+                    ? result.orders.map((order, index) =>
+                        normalizeAtasHistoryOrder(order, index)
+                    )
+                    : EMPTY_LIST;
+
+                setAtasHistoryState({
+                    loading: false,
+                    error: "",
+                    orders: historyOrders,
+                    readAt: result?.readAt || "",
+                });
+            })
+            .catch((error) => {
+                if (controller.signal.aborted) {
+                    return;
+                }
+
+                setAtasHistoryState({
+                    loading: false,
+                    error: cleanString(error?.message) || "ATAS Orders History konnte nicht geladen werden.",
+                    orders: EMPTY_LIST,
+                    readAt: "",
+                });
+            });
+
+        return () => {
+            controller.abort();
+        };
+    }, [
+        isAtasProvider,
+        forceAtasZeroState,
+        csvMatchAccountId,
+        historyStartDate,
+        historyEndDate,
+    ]);
 
     const resolvedAccountImports = useMemo(() => {
         return resolveImportsForProvider(provider, resolvedAccount?.imports);
@@ -926,6 +1380,16 @@ export default function OrdersPanel({
         return toArray(mappedImportOrders?.entries);
     }, [mappedImportOrders, forceAtasZeroState]);
 
+    const historyOrders = useMemo(() => {
+        if (!isAtasProvider || forceAtasZeroState) {
+            return EMPTY_LIST;
+        }
+
+        return Array.isArray(atasHistoryState.orders)
+            ? atasHistoryState.orders
+            : EMPTY_LIST;
+    }, [isAtasProvider, forceAtasZeroState, atasHistoryState.orders]);
+
     const safeSimulationTrades = useMemo(() => {
         if (forceAtasZeroState) {
             return EMPTY_LIST;
@@ -937,16 +1401,14 @@ export default function OrdersPanel({
     const orderRows = useMemo(() => {
         let rows = EMPTY_LIST;
 
-        if (normalizeProvider(provider) === "atas") {
-            if (liveOrders.length > 0) {
-                rows = mapOrderRows(liveOrders, providerLabel);
-            } else if (importedOrders.length > 0) {
-                rows = mapOrderRows(importedOrders, `${providerLabel} Import`);
-            } else if (directOrders.length > 0) {
-                rows = mapOrderRows(directOrders, "APP");
-            } else if (safeSimulationTrades.length > 0) {
-                rows = buildSimulationRows(safeSimulationTrades);
-            }
+        if (isAtasProvider) {
+            rows = dedupeOrderRows([
+                ...historyOrders,
+                ...mapOrderRows(liveOrders, providerLabel),
+                ...mapOrderRows(importedOrders, `${providerLabel} Import`),
+                ...mapOrderRows(directOrders, "APP"),
+                ...buildSimulationRows(safeSimulationTrades),
+            ]);
         } else {
             if (importedOrders.length > 0) {
                 rows = mapOrderRows(importedOrders, providerLabel);
@@ -964,7 +1426,15 @@ export default function OrdersPanel({
         }
 
         return [...rows].sort((a, b) => parseTimestamp(b.time) - parseTimestamp(a.time));
-    }, [provider, providerLabel, liveOrders, importedOrders, directOrders, safeSimulationTrades]);
+    }, [
+        isAtasProvider,
+        historyOrders,
+        providerLabel,
+        liveOrders,
+        importedOrders,
+        directOrders,
+        safeSimulationTrades,
+    ]);
 
     const stats = useMemo(() => {
         return orderRows.reduce(
@@ -996,7 +1466,8 @@ export default function OrdersPanel({
                     status.includes("open") ||
                     status.includes("pending") ||
                     status.includes("submitted") ||
-                    status.includes("partial")
+                    status.includes("partial") ||
+                    status.includes("active")
                 ) {
                     acc.openCount += 1;
                 } else if (
@@ -1030,9 +1501,11 @@ export default function OrdersPanel({
         : resolveFeedLabel(
             provider,
             liveOrders.length,
+            historyOrders.length,
             importedOrders.length,
             directOrders.length,
-            safeSimulationTrades.length
+            safeSimulationTrades.length,
+            atasHistoryState.loading
         );
 
     const statusColor = forceAtasZeroState
@@ -1040,9 +1513,11 @@ export default function OrdersPanel({
         : resolveFeedColor(
             provider,
             liveOrders.length,
+            historyOrders.length,
             importedOrders.length,
             directOrders.length,
-            safeSimulationTrades.length
+            safeSimulationTrades.length,
+            atasHistoryState.loading
         );
 
     const lastOrderTime = useMemo(() => {
@@ -1064,7 +1539,9 @@ export default function OrdersPanel({
     }, [orderRows]);
 
     const uniqueInstruments = useMemo(() => {
-        return [...new Set(orderRows.map((row) => cleanString(row.instrument)).filter(Boolean))];
+        return reduceContractsWithMicroPriority(
+            orderRows.map((row) => row?.instrument)
+        );
     }, [orderRows]);
 
     return (
@@ -1109,7 +1586,7 @@ export default function OrdersPanel({
                             lineHeight: 1.45,
                         }}
                     >
-                        Aktiver Order Feed für den gewählten Account. Filled Orders stützen Journal. Offene Orders zeigen den Fokus für Positions.
+                        Aktiver Order Feed aus ATAS History, Live Snapshot und Import Daten für den gewählten Account.
                     </div>
 
                     <div
@@ -1157,7 +1634,7 @@ export default function OrdersPanel({
                     <div
                         style={{
                             ...badgeStyle,
-                            color: normalizeProvider(provider) === "atas" ? COLORS.purple : COLORS.cyan,
+                            color: isAtasProvider ? COLORS.purple : COLORS.cyan,
                         }}
                     >
                         {providerLabel}
@@ -1166,8 +1643,79 @@ export default function OrdersPanel({
                     <div style={badgeStyle}>
                         {formatInteger(stats.total)} Orders
                     </div>
+
+                    {isAtasProvider ? (
+                        <div style={badgeStyle}>
+                            History ab {formatDateLabel(historyStartDate)}
+                        </div>
+                    ) : null}
                 </div>
             </div>
+
+            {isAtasProvider ? (
+                <div
+                    style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))",
+                        gap: 10,
+                        marginBottom: 18,
+                        padding: 14,
+                        borderRadius: 18,
+                        border: `1px solid ${COLORS.border}`,
+                        background: COLORS.cardBgSoft,
+                    }}
+                >
+                    <label style={filterLabelStyle}>
+                        Startdatum
+                        <input
+                            type="date"
+                            value={historyStartDate}
+                            min={ATAS_HISTORY_START_DATE}
+                            onChange={(event) => setHistoryStartDate(event.target.value)}
+                            style={filterInputStyle}
+                        />
+                    </label>
+
+                    <label style={filterLabelStyle}>
+                        Enddatum
+                        <input
+                            type="date"
+                            value={historyEndDate}
+                            min={ATAS_HISTORY_START_DATE}
+                            onChange={(event) => setHistoryEndDate(event.target.value)}
+                            style={filterInputStyle}
+                        />
+                    </label>
+
+                    <div style={filterInfoStyle}>
+                        <div style={filterInfoLabelStyle}>History Orders</div>
+                        <div style={filterInfoValueStyle}>
+                            {atasHistoryState.loading
+                                ? "Lädt..."
+                                : formatInteger(historyOrders.length)}
+                        </div>
+                    </div>
+
+                    <div style={filterInfoStyle}>
+                        <div style={filterInfoLabelStyle}>Quelle</div>
+                        <div style={filterInfoValueStyle}>
+                            Orders.cdb
+                        </div>
+                    </div>
+
+                    {atasHistoryState.error ? (
+                        <div
+                            style={{
+                                ...filterInfoStyle,
+                                borderColor: "rgba(248, 113, 113, 0.34)",
+                                color: COLORS.red,
+                            }}
+                        >
+                            {atasHistoryState.error}
+                        </div>
+                    ) : null}
+                </div>
+            ) : null}
 
             <div
                 style={{
@@ -1266,7 +1814,7 @@ export default function OrdersPanel({
                                     marginTop: 4,
                                 }}
                             >
-                                Zeit, Quelle, Instrument, Side, Qty und Status im Hauptfokus
+                                Zeit, Quelle, Instrument, Side, Qty, Preis und Status
                             </div>
                         </div>
 
@@ -1282,6 +1830,9 @@ export default function OrdersPanel({
                             </span>
                             <span style={tableMetaPillStyle}>
                                 Provider {providerLabel}
+                            </span>
+                            <span style={tableMetaPillStyle}>
+                                History {formatInteger(historyOrders.length)}
                             </span>
                             <span style={tableMetaPillStyle}>
                                 Symbole {formatInteger(uniqueInstruments.length)}
@@ -1312,7 +1863,7 @@ export default function OrdersPanel({
                                 style={{
                                     width: "100%",
                                     borderCollapse: "collapse",
-                                    minWidth: 940,
+                                    minWidth: 1020,
                                 }}
                             >
                                 <thead
@@ -1326,6 +1877,7 @@ export default function OrdersPanel({
                                         <th style={thStyle}>Instrument</th>
                                         <th style={thStyle}>Side</th>
                                         <th style={thStyle}>Qty</th>
+                                        <th style={thStyle}>Preis</th>
                                         <th style={thStyle}>Status</th>
                                         <th style={thStyle}>Order ID</th>
                                     </tr>
@@ -1334,7 +1886,7 @@ export default function OrdersPanel({
                                 <tbody>
                                     {orderRows.map((row, index) => (
                                         <tr
-                                            key={row.id}
+                                            key={`${row.id}-${index}`}
                                             style={{
                                                 background:
                                                     index % 2 === 0 ? "transparent" : COLORS.rowAlt,
@@ -1371,6 +1923,8 @@ export default function OrdersPanel({
                                             </td>
 
                                             <td style={tdStyle}>{formatNumber(row.qty, 0)}</td>
+
+                                            <td style={tdStyle}>{formatNumber(row.price, 2)}</td>
 
                                             <td style={tdStyle}>
                                                 <span
@@ -1430,6 +1984,23 @@ export default function OrdersPanel({
                             <div style={metaRowStyle}>
                                 <span style={metaKeyStyle}>Symbole</span>
                                 <span style={metaValueStyle}>{instrumentSummary}</span>
+                            </div>
+
+                            <div style={metaRowStyle}>
+                                <span style={metaKeyStyle}>History Orders</span>
+                                <span style={metaValueStyle}>{formatInteger(historyOrders.length)}</span>
+                            </div>
+
+                            <div style={metaRowStyle}>
+                                <span style={metaKeyStyle}>Live Orders</span>
+                                <span style={metaValueStyle}>{formatInteger(liveOrders.length)}</span>
+                            </div>
+
+                            <div style={metaRowStyle}>
+                                <span style={metaKeyStyle}>Zeitraum</span>
+                                <span style={metaValueStyle}>
+                                    {formatDateLabel(historyStartDate)} bis {formatDateLabel(historyEndDate)}
+                                </span>
                             </div>
 
                             <div style={metaRowStyle}>
@@ -1539,9 +2110,9 @@ export default function OrdersPanel({
                                     gap: 10,
                                 }}
                             >
-                                {recentRows.map((row) => (
+                                {recentRows.map((row, index) => (
                                     <div
-                                        key={`recent-${row.id}`}
+                                        key={`recent-${row.id}-${index}`}
                                         style={recentItemStyle}
                                     >
                                         <div
@@ -1634,6 +2205,46 @@ export default function OrdersPanel({
         </section>
     );
 }
+
+const filterLabelStyle = {
+    display: "grid",
+    gap: 6,
+    color: COLORS.muted,
+    fontSize: 12,
+    fontWeight: 700,
+};
+
+const filterInputStyle = {
+    width: "100%",
+    borderRadius: 10,
+    border: `1px solid ${COLORS.border}`,
+    background: "rgba(255,255,255,0.04)",
+    color: COLORS.text,
+    padding: "9px 10px",
+    outline: "none",
+    fontSize: 12,
+};
+
+const filterInfoStyle = {
+    borderRadius: 12,
+    border: `1px solid ${COLORS.border}`,
+    background: "rgba(255,255,255,0.03)",
+    padding: 10,
+    display: "grid",
+    gap: 4,
+};
+
+const filterInfoLabelStyle = {
+    color: COLORS.muted,
+    fontSize: 11,
+    fontWeight: 700,
+};
+
+const filterInfoValueStyle = {
+    color: COLORS.text,
+    fontSize: 13,
+    fontWeight: 800,
+};
 
 const badgeStyle = {
     padding: "8px 12px",

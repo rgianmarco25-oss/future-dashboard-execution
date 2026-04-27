@@ -7,6 +7,7 @@ import { resolveAccountImportsFromSources } from "../utils/accountImports";
 import * as csvImportUtils from "../utils/csvImportUtils";
 import {
     detectAccountSize,
+    getLiveAccountSnapshot,
     saveDailyState,
     saveLiveAccountSnapshot,
 } from "../utils/storage";
@@ -134,12 +135,19 @@ function formatProviderLabel(value) {
     return provider ? provider.toUpperCase() : "Tradovate";
 }
 
-function resolvePanelProvider(props, resolvedAccount) {
+function resolvePanelProvider(props, resolvedAccount, liveSnapshot = null) {
     const candidates = [
         props?.dataProvider,
         props?.activeProvider,
         props?.provider,
         props?.sourceProvider,
+
+        liveSnapshot?.dataProvider,
+        liveSnapshot?.activeProvider,
+        liveSnapshot?.sourceProvider,
+        liveSnapshot?.source?.provider,
+        liveSnapshot?.provider,
+
         resolvedAccount?.dataProvider,
         resolvedAccount?.activeProvider,
         resolvedAccount?.sourceProvider,
@@ -152,6 +160,20 @@ function resolvePanelProvider(props, resolvedAccount) {
         if (normalized === "atas" || normalized === "tradovate") {
             return normalized;
         }
+    }
+
+    const snapshotAccountId = cleanString(liveSnapshot?.accountId).toLowerCase();
+    const snapshotAccountName = cleanString(liveSnapshot?.accountName).toLowerCase();
+    const snapshotTradingAccountId = cleanString(liveSnapshot?.tradingAccountId).toLowerCase();
+    const snapshotSourceName = cleanString(liveSnapshot?.sourceName).toLowerCase();
+
+    if (
+        snapshotAccountId === "replay" ||
+        snapshotAccountName === "replay" ||
+        snapshotTradingAccountId === "replay" ||
+        snapshotSourceName === "replay"
+    ) {
+        return "atas";
     }
 
     return "tradovate";
@@ -427,7 +449,6 @@ function pickFlexibleValue(source, keys) {
 
     return "";
 }
-
 function parseFlexibleNumber(value) {
     if (typeof value === "number") {
         return Number.isFinite(value) ? value : null;
@@ -509,6 +530,7 @@ function normalizeAccountSize(value, fallback = 0) {
 
     for (const size of standardSizes) {
         const distance = Math.abs(numeric - size);
+
         if (distance < smallestDistance) {
             smallestDistance = distance;
             closest = size;
@@ -641,6 +663,7 @@ function firstString(row, keys) {
 
     for (const key of keys) {
         const value = row[key];
+
         if (typeof value === "string" && value.trim()) {
             return value.trim();
         }
@@ -1026,7 +1049,6 @@ function getBalanceTimestamp(row) {
         ) || null
     );
 }
-
 function getBalanceValue(row) {
     if (!row || typeof row !== "object") {
         return null;
@@ -1186,7 +1208,12 @@ function buildBalanceSummary(rows) {
             let end = getBalanceValue(row);
             const change = getBalanceNetChange(row);
 
-            if ((end === null || end === undefined) && explicitStart !== null && explicitStart !== undefined && change !== null) {
+            if (
+                (end === null || end === undefined) &&
+                explicitStart !== null &&
+                explicitStart !== undefined &&
+                change !== null
+            ) {
                 end = explicitStart + change;
             }
 
@@ -1566,6 +1593,7 @@ function buildTopAlert({
     ];
 
     const redRule = rules.find((rule) => rule.status === "red");
+
     if (redRule) {
         return {
             status: "red",
@@ -1576,6 +1604,7 @@ function buildTopAlert({
     }
 
     const yellowRule = rules.find((rule) => rule.status === "yellow");
+
     if (yellowRule) {
         return {
             status: "yellow",
@@ -1589,10 +1618,9 @@ function buildTopAlert({
         status: "green",
         title: `${accountName}. Alles sauber.`,
         message: "Aktuell liegt keine kritische Regelverletzung vor.",
-        detail: "Threshold, DLL, Exposure, Payout und Inactivity sind im grünen Bereich oder nicht aktiv.",
+        detail: "Threshold, DLL, Exposure, Payout und Inactivity sind grün oder nicht aktiv.",
     };
 }
-
 function TopAlertBar({ alert }) {
     const ui = getStatusUi(alert.status);
 
@@ -2255,8 +2283,7 @@ function RiskPanelContent({
             message,
         };
     }, [riskDraft, riskSnapshot, currentBalance, liveTodayPnl]);
-
-    const persistencePayload = useMemo(() => {
+        const persistencePayload = useMemo(() => {
         const tradingDayKey = cleanString(activeTradingDayKey) || getTradingDayKey(new Date());
         const safeCurrentBalance = toNumber(currentBalance, 0);
         const safeStartBalance = toNumber(startBalance, 0);
@@ -2830,8 +2857,7 @@ function RiskPanelContent({
             </div>
         );
     }
-
-    const calculatorUi = getStatusUi(calculator.status);
+        const calculatorUi = getStatusUi(calculator.status);
 
     return (
         <div
@@ -3474,6 +3500,638 @@ function RiskPanelContent({
         </div>
     );
 }
+function AtasRiskPanelContent({
+    provider,
+    resolvedAccount,
+    resolvedAccountId,
+    scopeAccountId,
+    activeTradingDayKey,
+    liveTodayPnl,
+    currentBalance,
+    startBalance,
+    balanceDelta,
+    liveExposureUnits,
+    livePositions,
+    liveSnapshot,
+    accountOrders,
+    accountFills,
+    showCalculator = true,
+}) {
+    const [riskDraft, setRiskDraft] = useState(() => ({
+        dailyTarget: 250,
+        instrument: "MNQ",
+        side: "long",
+        entry: "",
+        stop: "",
+        target: "",
+        qty: 1,
+    }));
+
+    const providerLabel = formatProviderLabel(provider);
+    const isReplay =
+        cleanString(liveSnapshot?.accountId).toLowerCase() === "replay" ||
+        cleanString(liveSnapshot?.accountName).toLowerCase() === "replay" ||
+        cleanString(liveSnapshot?.tradingAccountId).toLowerCase() === "replay" ||
+        cleanString(liveSnapshot?.sourceName).toLowerCase() === "replay";
+
+    const modeLabel = isReplay ? "Replay" : "Desktop";
+
+    const providerStatus = cleanString(
+        liveSnapshot?.dataProviderStatus ||
+        liveSnapshot?.connectionStatus ||
+        resolvedAccount?.dataProviderStatus
+    );
+
+    const providerStatusLabel = providerStatus
+        ? providerStatus === "connected"
+            ? "Verbunden"
+            : providerStatus === "ready"
+                ? "Bereit"
+                : providerStatus === "online"
+                    ? "Online"
+                    : providerStatus
+        : "Verbunden";
+
+    const symbol = cleanString(
+        liveSnapshot?.symbol ||
+        liveSnapshot?.instrument ||
+        liveSnapshot?.contract ||
+        "–"
+    );
+
+    const positionQty = toNumber(
+        liveSnapshot?.positionQty ??
+            liveSnapshot?.qty ??
+            liveSnapshot?.quantity,
+        0
+    );
+
+    const avgPrice = toNumber(
+        liveSnapshot?.avgPrice ??
+            liveSnapshot?.averagePrice,
+        0
+    );
+
+    const openOrderCount = Array.isArray(accountOrders) ? accountOrders.length : 0;
+    const fillCount = Array.isArray(accountFills) ? accountFills.length : 0;
+
+    const calculator = useMemo(() => {
+        const instrument = getInstrumentConfig(riskDraft.instrument);
+        const side = riskDraft.side === "short" ? "short" : "long";
+        const entry = toNumber(riskDraft.entry, 0);
+        const stop = toNumber(riskDraft.stop, 0);
+        const target = toNumber(riskDraft.target, 0);
+        const qty = toSafeInteger(riskDraft.qty, 1);
+        const dailyTarget = Math.max(toNumber(riskDraft.dailyTarget, 0), 0);
+
+        const hasEntry = entry > 0;
+        const hasStop = stop > 0;
+        const hasTarget = target > 0;
+
+        const stopDistancePoints =
+            hasEntry && hasStop ? Math.abs(entry - stop) : 0;
+        const targetDistancePoints =
+            hasEntry && hasTarget ? Math.abs(target - entry) : 0;
+
+        const stopTicks =
+            stopDistancePoints > 0 ? stopDistancePoints / instrument.tickSize : 0;
+        const targetTicks =
+            targetDistancePoints > 0 ? targetDistancePoints / instrument.tickSize : 0;
+
+        const riskPerContract = stopTicks * instrument.tickValue;
+        const rewardPerContract = targetTicks * instrument.tickValue;
+        const totalRisk = riskPerContract * qty;
+        const totalReward = rewardPerContract * qty;
+        const rrRatio = totalRisk > 0 ? totalReward / totalRisk : null;
+
+        const hasDirectionError =
+            (side === "long" && ((hasStop && stop >= entry) || (hasTarget && target <= entry))) ||
+            (side === "short" && ((hasStop && stop <= entry) || (hasTarget && target >= entry)));
+
+        const hasInputError =
+            !hasEntry ||
+            !hasStop ||
+            !hasTarget ||
+            stopDistancePoints <= 0 ||
+            targetDistancePoints <= 0;
+
+        let status = "green";
+        let message = "Trade Daten sind rechnerisch sauber.";
+
+        if (hasInputError || hasDirectionError) {
+            status = "red";
+            message = "Entry, Stop, Target oder Richtung passen noch nicht.";
+        } else if ((rrRatio || 0) < 1) {
+            status = "yellow";
+            message = "CRV ist kleiner als 1R.";
+        }
+
+        const projectedBalanceAfterStop =
+            currentBalance !== null && currentBalance !== undefined
+                ? currentBalance - totalRisk
+                : null;
+
+        const projectedBalanceAfterTarget =
+            currentBalance !== null && currentBalance !== undefined
+                ? currentBalance + totalReward
+                : null;
+
+        const targetGap = Math.max(dailyTarget - Math.max(liveTodayPnl, 0), 0);
+
+        return {
+            instrument,
+            qty,
+            stopDistancePoints,
+            targetDistancePoints,
+            stopTicks,
+            targetTicks,
+            riskPerContract,
+            rewardPerContract,
+            totalRisk,
+            totalReward,
+            rrRatio,
+            projectedBalanceAfterStop,
+            projectedBalanceAfterTarget,
+            targetGap,
+            status,
+            message,
+        };
+    }, [riskDraft, currentBalance, liveTodayPnl]);
+
+    const calculatorUi = getStatusUi(calculator.status);
+
+    function handleRiskDraftChange(key, value) {
+        setRiskDraft((prev) => ({
+            ...prev,
+            [key]: value,
+        }));
+    }
+
+    function handleResetRiskDraft() {
+        setRiskDraft({
+            dailyTarget: 250,
+            instrument: "MNQ",
+            side: "long",
+            entry: "",
+            stop: "",
+            target: "",
+            qty: 1,
+        });
+    }
+
+    return (
+        <div
+            style={{
+                display: "grid",
+                gap: 14,
+            }}
+        >
+            <div
+                style={{
+                    background: COLORS.panelBg,
+                    border: `1px solid ${COLORS.border}`,
+                    borderRadius: 18,
+                    padding: 16,
+                    boxShadow: COLORS.shadow,
+                    display: "grid",
+                    gap: 12,
+                }}
+            >
+                <div
+                    style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 12,
+                        flexWrap: "wrap",
+                    }}
+                >
+                    <div>
+                        <div
+                            style={{
+                                color: COLORS.title,
+                                fontSize: 15,
+                                fontWeight: 800,
+                            }}
+                        >
+                            ATAS Snapshot
+                        </div>
+                        <div
+                            style={{
+                                color: COLORS.textSoft,
+                                fontSize: 12,
+                                marginTop: 3,
+                            }}
+                        >
+                            Direkte Anzeige aus dem ATAS Live Snapshot.
+                        </div>
+                    </div>
+
+                    <div
+                        style={{
+                            display: "flex",
+                            gap: 8,
+                            flexWrap: "wrap",
+                            justifyContent: "flex-end",
+                        }}
+                    >
+                        <div
+                            style={{
+                                border: `1px solid ${COLORS.borderStrong}`,
+                                borderRadius: 999,
+                                padding: "7px 12px",
+                                color: COLORS.cyan,
+                                background: "rgba(34,211,238,0.08)",
+                                fontSize: 11,
+                                fontWeight: 800,
+                                whiteSpace: "nowrap",
+                            }}
+                        >
+                            {providerLabel}
+                        </div>
+
+                        <div
+                            style={{
+                                border: `1px solid ${COLORS.borderStrong}`,
+                                borderRadius: 999,
+                                padding: "7px 12px",
+                                color: COLORS.purple,
+                                background: "rgba(167,139,250,0.08)",
+                                fontSize: 11,
+                                fontWeight: 800,
+                                whiteSpace: "nowrap",
+                            }}
+                        >
+                            {modeLabel}
+                        </div>
+
+                        <div
+                            style={{
+                                border: "1px solid rgba(34, 197, 94, 0.24)",
+                                borderRadius: 999,
+                                padding: "7px 12px",
+                                color: COLORS.green,
+                                background: "rgba(34, 197, 94, 0.08)",
+                                fontSize: 11,
+                                fontWeight: 800,
+                                whiteSpace: "nowrap",
+                            }}
+                        >
+                            {providerStatusLabel}
+                        </div>
+                    </div>
+                </div>
+
+                <div
+                    style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                        gap: 10,
+                    }}
+                >
+                    <InfoCard
+                        label="Provider"
+                        value={providerLabel}
+                        hint={modeLabel}
+                        color={COLORS.cyan}
+                    />
+                    <InfoCard
+                        label="Status"
+                        value={providerStatusLabel}
+                        hint="ATAS Verbindung"
+                        color={COLORS.green}
+                    />
+                    <InfoCard
+                        label="Trading Ref"
+                        value={
+                            scopeAccountId ||
+                            resolvedAccount?.tradingAccountId ||
+                            resolvedAccountId ||
+                            "Replay"
+                        }
+                        hint="ATAS Account"
+                        color={COLORS.text}
+                    />
+                    <InfoCard
+                        label="Symbol"
+                        value={symbol}
+                        hint="ATAS Kontrakt"
+                        color={COLORS.cyan}
+                    />
+                    <InfoCard
+                        label="Position Qty"
+                        value={formatDecimal(positionQty, 0)}
+                        hint={positionQty === 0 ? "Keine offene Position" : "Offene Kontrakte"}
+                        color={positionQty === 0 ? COLORS.text : COLORS.orange}
+                    />
+                    <InfoCard
+                        label="Avg Price"
+                        value={formatDecimal(avgPrice, 2)}
+                        hint="Durchschnittlicher Entry"
+                        color={COLORS.text}
+                    />
+                    <InfoCard
+                        label="Kontogrösse"
+                        value="–"
+                        hint="ATAS liefert keine Apex Kontogrösse"
+                        color={COLORS.purple}
+                    />
+                    <InfoCard
+                        label="Start Balance"
+                        value={formatCurrency(startBalance)}
+                        hint="ATAS Startwert"
+                        color={COLORS.yellow}
+                    />
+                    <InfoCard
+                        label="Live Balance"
+                        value={formatCurrency(currentBalance)}
+                        hint="ATAS Live Wert"
+                        color={COLORS.cyan}
+                    />
+                    <InfoCard
+                        label="Delta"
+                        value={balanceDelta === null ? "–" : formatSignedCurrency(balanceDelta)}
+                        hint="Aktuell minus Start"
+                        color={balanceDelta !== null && balanceDelta < 0 ? COLORS.red : COLORS.green}
+                    />
+                    <InfoCard
+                        label="Tages PnL"
+                        value={formatSignedCurrency(liveTodayPnl)}
+                        hint={`Trading Day ${formatTradingDayLabel(activeTradingDayKey)}`}
+                        color={liveTodayPnl < 0 ? COLORS.red : COLORS.green}
+                    />
+                    <InfoCard
+                        label="Exposure"
+                        value={formatExposureUnits(liveExposureUnits)}
+                        hint="Aktuelle offene Exposure"
+                        color={COLORS.green}
+                    />
+                    <InfoCard
+                        label="Orders / Fills"
+                        value={`${openOrderCount} / ${fillCount}`}
+                        hint="ATAS Snapshot Daten"
+                        color={COLORS.gold}
+                    />
+                </div>
+            </div>
+
+            {showCalculator ? (
+                <div
+                    style={{
+                        background: COLORS.panelBg,
+                        border: `1px solid ${calculatorUi.border}`,
+                        borderRadius: 18,
+                        padding: 16,
+                        boxShadow: COLORS.shadow,
+                        display: "grid",
+                        gap: 12,
+                    }}
+                >
+                    <div
+                        style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                            gap: 12,
+                            flexWrap: "wrap",
+                        }}
+                    >
+                        <div>
+                            <div
+                                style={{
+                                    color: COLORS.title,
+                                    fontSize: 15,
+                                    fontWeight: 800,
+                                }}
+                            >
+                                Riskrechner
+                            </div>
+                            <div
+                                style={{
+                                    color: COLORS.textSoft,
+                                    fontSize: 12,
+                                    marginTop: 3,
+                                }}
+                            >
+                                ATAS neutraler Trade Rechner ohne Apex Regeln.
+                            </div>
+                        </div>
+
+                        <div
+                            style={{
+                                border: `1px solid ${calculatorUi.border}`,
+                                borderRadius: 999,
+                                padding: "7px 12px",
+                                color: calculatorUi.text,
+                                background: calculatorUi.background,
+                                fontSize: 11,
+                                fontWeight: 800,
+                                whiteSpace: "nowrap",
+                            }}
+                        >
+                            {calculator.status === "green"
+                                ? "Grün"
+                                : calculator.status === "yellow"
+                                    ? "Gelb"
+                                    : "Rot"}
+                        </div>
+                    </div>
+
+                    <div
+                        style={{
+                            display: "grid",
+                            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                            gap: 10,
+                        }}
+                    >
+                        <InputField label="Tagesziel">
+                            <input
+                                type="number"
+                                step="1"
+                                value={riskDraft.dailyTarget}
+                                onChange={(event) =>
+                                    handleRiskDraftChange(
+                                        "dailyTarget",
+                                        toNumber(event.target.value, 0)
+                                    )
+                                }
+                                style={inputStyle}
+                            />
+                        </InputField>
+
+                        <InputField label="Instrument">
+                            <select
+                                value={riskDraft.instrument}
+                                onChange={(event) =>
+                                    handleRiskDraftChange(
+                                        "instrument",
+                                        cleanString(event.target.value).toUpperCase()
+                                    )
+                                }
+                                style={inputStyle}
+                            >
+                                <option value="MNQ">MNQ</option>
+                                <option value="NQ">NQ</option>
+                                <option value="MES">MES</option>
+                                <option value="ES">ES</option>
+                            </select>
+                        </InputField>
+
+                        <InputField label="Seite">
+                            <select
+                                value={riskDraft.side}
+                                onChange={(event) =>
+                                    handleRiskDraftChange(
+                                        "side",
+                                        event.target.value === "short" ? "short" : "long"
+                                    )
+                                }
+                                style={inputStyle}
+                            >
+                                <option value="long">long</option>
+                                <option value="short">short</option>
+                            </select>
+                        </InputField>
+
+                        <InputField label="Entry">
+                            <input
+                                type="number"
+                                step="0.25"
+                                value={riskDraft.entry}
+                                onChange={(event) =>
+                                    handleRiskDraftChange("entry", event.target.value)
+                                }
+                                style={inputStyle}
+                            />
+                        </InputField>
+
+                        <InputField label="Stop">
+                            <input
+                                type="number"
+                                step="0.25"
+                                value={riskDraft.stop}
+                                onChange={(event) =>
+                                    handleRiskDraftChange("stop", event.target.value)
+                                }
+                                style={inputStyle}
+                            />
+                        </InputField>
+
+                        <InputField label="Target">
+                            <input
+                                type="number"
+                                step="0.25"
+                                value={riskDraft.target}
+                                onChange={(event) =>
+                                    handleRiskDraftChange("target", event.target.value)
+                                }
+                                style={inputStyle}
+                            />
+                        </InputField>
+
+                        <InputField label="Kontrakte">
+                            <input
+                                type="number"
+                                min={1}
+                                step={1}
+                                value={riskDraft.qty}
+                                onChange={(event) =>
+                                    handleRiskDraftChange(
+                                        "qty",
+                                        toSafeInteger(event.target.value, 1)
+                                    )
+                                }
+                                style={inputStyle}
+                            />
+                        </InputField>
+                    </div>
+
+                    <div
+                        style={{
+                            display: "flex",
+                            gap: 10,
+                            flexWrap: "wrap",
+                        }}
+                    >
+                        <button
+                            type="button"
+                            onClick={handleResetRiskDraft}
+                            style={buttonStyle}
+                        >
+                            Rechner zurücksetzen
+                        </button>
+                    </div>
+
+                    <div
+                        style={{
+                            border: `1px solid ${calculatorUi.border}`,
+                            borderRadius: 13,
+                            padding: 12,
+                            background: calculatorUi.background,
+                            color: calculatorUi.text,
+                            fontSize: 14,
+                            lineHeight: 1.45,
+                            fontWeight: 700,
+                        }}
+                    >
+                        {calculator.message}
+                    </div>
+
+                    <div
+                        style={{
+                            display: "grid",
+                            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                            gap: 10,
+                        }}
+                    >
+                        <InfoCard
+                            label="Risiko pro Kontrakt"
+                            value={formatCurrency(calculator.riskPerContract)}
+                            hint={`${formatDecimal(calculator.stopTicks, 0)} Ticks`}
+                            color={COLORS.red}
+                        />
+                        <InfoCard
+                            label="Chance pro Kontrakt"
+                            value={formatCurrency(calculator.rewardPerContract)}
+                            hint={`${formatDecimal(calculator.targetTicks, 0)} Ticks`}
+                            color={COLORS.green}
+                        />
+                        <InfoCard
+                            label="Gesamtrisiko"
+                            value={formatCurrency(calculator.totalRisk)}
+                            hint={`${calculator.qty} neue Kontrakte`}
+                            color={COLORS.orange}
+                        />
+                        <InfoCard
+                            label="Gesamtziel"
+                            value={formatCurrency(calculator.totalReward)}
+                            hint={`${calculator.qty} neue Kontrakte`}
+                            color={COLORS.green}
+                        />
+                        <InfoCard
+                            label="CRV"
+                            value={formatRatio(calculator.rrRatio)}
+                            hint={calculator.instrument.label}
+                            color={COLORS.purple}
+                        />
+                        <InfoCard
+                            label="Balance nach Stop"
+                            value={formatCurrency(calculator.projectedBalanceAfterStop)}
+                            hint={`Tagesziel offen ${formatCurrency(calculator.targetGap)}`}
+                            color={COLORS.red}
+                        />
+                        <InfoCard
+                            label="Balance nach Ziel"
+                            value={formatCurrency(calculator.projectedBalanceAfterTarget)}
+                            hint={`Tagesziel offen ${formatCurrency(calculator.targetGap)}`}
+                            color={COLORS.green}
+                        />
+                    </div>
+                </div>
+            ) : null}
+        </div>
+    );
+}
 
 const inputStyle = {
     width: "100%",
@@ -3499,14 +4157,18 @@ export default function RiskPanel(props) {
     const resolvedAccount =
         props?.account || props?.activeAccount || props?.selectedAccount || null;
 
-    const provider = resolvePanelProvider(props, resolvedAccount);
-
     const resolvedAccountId =
         cleanString(props?.resolvedAccountId) ||
         cleanString(props?.accountId) ||
         cleanString(props?.activeAccountId) ||
         cleanString(props?.selectedAccountId) ||
         cleanString(resolvedAccount?.id);
+
+    const liveSnapshot = resolvedAccountId
+        ? getLiveAccountSnapshot(resolvedAccountId)
+        : null;
+
+    const provider = resolvePanelProvider(props, resolvedAccount, liveSnapshot);
 
     const scopeAccountId = resolveScopeAccountId(resolvedAccount, resolvedAccountId);
     const hasActiveAccount = hasActiveAccountContext(resolvedAccount, resolvedAccountId);
@@ -3786,13 +4448,37 @@ export default function RiskPanel(props) {
         accountCurrentBalance,
     ]);
 
+    const atasCurrentBalance = provider === "atas"
+        ? toNumber(
+            liveSnapshot?.currentBalance ??
+                liveSnapshot?.balance ??
+                liveSnapshot?.cash ??
+                liveSnapshot?.accountBalance ??
+                liveSnapshot?.cashBalance ??
+                liveSnapshot?.netLiq,
+            0
+        )
+        : 0;
+
+    const atasStartBalance = provider === "atas"
+        ? toNumber(
+            liveSnapshot?.atasStartingBalance ??
+                liveSnapshot?.atasStartBalance ??
+                liveSnapshot?.providerStartingBalance ??
+                liveSnapshot?.providerStartBalance ??
+                liveSnapshot?.snapshotStartingBalance ??
+                liveSnapshot?.snapshotStartBalance ??
+                liveSnapshot?.startingBalance ??
+                liveSnapshot?.startBalance,
+            0
+        )
+        : 0;
+
     const currentBalance =
-        balanceSummary.currentBalance !== null && balanceSummary.currentBalance !== undefined
-            ? balanceSummary.currentBalance
-            : provider === "atas"
-                ? (accountDeclaredSize !== null && accountDeclaredSize !== undefined
-                    ? accountDeclaredSize
-                    : baseDetectedAccountSize)
+        provider === "atas"
+            ? atasCurrentBalance
+            : balanceSummary.currentBalance !== null && balanceSummary.currentBalance !== undefined
+                ? balanceSummary.currentBalance
                 : accountCurrentBalance !== null && accountCurrentBalance !== undefined
                     ? accountCurrentBalance
                     : accountStartingBalance !== null && accountStartingBalance !== undefined
@@ -3802,23 +4488,27 @@ export default function RiskPanel(props) {
                             : baseDetectedAccountSize;
 
     const startBalance =
-        accountStartingBalance !== null && accountStartingBalance > 0
-            ? accountStartingBalance
-            : baseDetectedAccountSize > 0
-                ? baseDetectedAccountSize
-                : balanceSummary.startBalance !== null && balanceSummary.startBalance !== undefined
-                    ? balanceSummary.startBalance
-                    : accountDeclaredSize !== null && accountDeclaredSize !== undefined
-                        ? accountDeclaredSize
-                        : currentBalance;
+        provider === "atas"
+            ? atasStartBalance
+            : accountStartingBalance !== null && accountStartingBalance > 0
+                ? accountStartingBalance
+                : baseDetectedAccountSize > 0
+                    ? baseDetectedAccountSize
+                    : balanceSummary.startBalance !== null && balanceSummary.startBalance !== undefined
+                        ? balanceSummary.startBalance
+                        : accountDeclaredSize !== null && accountDeclaredSize !== undefined
+                            ? accountDeclaredSize
+                            : currentBalance;
 
-    const detectedAccountSize = deriveAccountSize({
-        accountId: scopeAccountId || resolvedAccountId,
-        account: resolvedAccount,
-        startBalance,
-        currentBalance,
-        fallbackSize: baseDetectedAccountSize || resolvedAccount?.accountSize,
-    });
+    const detectedAccountSize = provider === "atas"
+        ? 0
+        : deriveAccountSize({
+            accountId: scopeAccountId || resolvedAccountId,
+            account: resolvedAccount,
+            startBalance,
+            currentBalance,
+            fallbackSize: baseDetectedAccountSize || resolvedAccount?.accountSize,
+        });
 
     const liveTodayPnl =
         balanceDerivedTodayPnl !== null && balanceDerivedTodayPnl !== undefined
@@ -3839,6 +4529,28 @@ export default function RiskPanel(props) {
 
     if (!hasActiveAccount) {
         return <NeutralRiskPanel />;
+    }
+
+    if (provider === "atas") {
+        return (
+            <AtasRiskPanelContent
+                provider={provider}
+                resolvedAccount={resolvedAccount}
+                resolvedAccountId={resolvedAccountId}
+                scopeAccountId={scopeAccountId}
+                activeTradingDayKey={activeTradingDayKey}
+                liveTodayPnl={liveTodayPnl}
+                currentBalance={currentBalance}
+                startBalance={startBalance}
+                balanceDelta={balanceDelta}
+                liveExposureUnits={liveExposureUnits}
+                livePositions={livePositions}
+                liveSnapshot={liveSnapshot}
+                accountOrders={accountOrders}
+                accountFills={accountFills}
+                showCalculator={showCalculator}
+            />
+        );
     }
 
     return (

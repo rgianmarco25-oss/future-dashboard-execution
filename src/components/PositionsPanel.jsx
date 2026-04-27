@@ -40,6 +40,59 @@ const COLORS = {
     buttonText: "#04111d",
 };
 
+const MICRO_CONTRACT_PREFIXES = [
+    "MNQ",
+    "MES",
+    "MYM",
+    "M2K",
+    "MCL",
+    "MGC",
+    "M6E",
+    "M6B",
+    "M6A",
+    "M6J",
+];
+
+const CONTRACT_PREFIXES = [
+    "MNQ",
+    "NQ",
+    "MES",
+    "ES",
+    "MYM",
+    "YM",
+    "M2K",
+    "RTY",
+    "MCL",
+    "CL",
+    "MGC",
+    "GC",
+    "M6E",
+    "6E",
+    "M6B",
+    "6B",
+    "M6A",
+    "6A",
+    "M6J",
+    "6J",
+];
+
+const MICRO_TO_FULL_PREFIX = {
+    MNQ: "NQ",
+    MES: "ES",
+    MYM: "YM",
+    M2K: "RTY",
+    MCL: "CL",
+    MGC: "GC",
+    M6E: "6E",
+    M6B: "6B",
+    M6A: "6A",
+    M6J: "6J",
+};
+
+const FULL_TO_MICRO_PREFIX = Object.fromEntries(
+    Object.entries(MICRO_TO_FULL_PREFIX).map(([micro, full]) => [full, micro])
+);
+
 function cleanString(value) {
     if (value === null || value === undefined) {
         return "";
@@ -86,9 +139,450 @@ function resolvePanelProvider(props, resolvedAccount, liveSnapshot) {
         props?.activeProvider ||
         props?.dataProvider ||
         props?.sourceProvider ||
+        resolvedAccount?.dataProvider ||
         "tradovate";
 
     return getActiveProvider(resolvedAccount, liveSnapshot, fallback);
+}
+
+function parseFlexibleNumber(value) {
+    if (typeof value === "number") {
+        return Number.isFinite(value) ? value : null;
+    }
+
+    const textValue = cleanString(value);
+
+    if (!textValue) {
+        return null;
+    }
+
+    let text = textValue
+        .replace(/\s/g, "")
+        .replace(/[$€£]/g, "")
+        .replace(/USD|EUR|CHF/gi, "")
+        .replace(/'/g, "");
+
+    const negativeByParens = text.startsWith("(") && text.endsWith(")");
+    text = text.replace(/[()]/g, "");
+
+    if (!text) {
+        return null;
+    }
+
+    const hasComma = text.includes(",");
+    const hasDot = text.includes(".");
+
+    if (hasComma && hasDot) {
+        if (text.lastIndexOf(",") > text.lastIndexOf(".")) {
+            text = text.replace(/\./g, "").replace(/,/g, ".");
+        } else {
+            text = text.replace(/,/g, "");
+        }
+    } else if (hasComma && !hasDot) {
+        const lastPart = text.split(",").pop() || "";
+
+        if (lastPart.length === 1 || lastPart.length === 2) {
+            text = text.replace(/,/g, ".");
+        } else {
+            text = text.replace(/,/g, "");
+        }
+    }
+
+    const parsed = Number(text);
+
+    if (!Number.isFinite(parsed)) {
+        return null;
+    }
+
+    return negativeByParens ? -Math.abs(parsed) : parsed;
+}
+
+function toNumber(value, fallback = 0) {
+    const parsed = parseFlexibleNumber(value);
+    return parsed !== null ? parsed : fallback;
+}
+
+function formatNumber(value, decimals = 2) {
+    return new Intl.NumberFormat("de-CH", {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals,
+    }).format(toNumber(value, 0));
+}
+
+function formatInteger(value) {
+    return new Intl.NumberFormat("de-CH", {
+        maximumFractionDigits: 0,
+    }).format(toNumber(value, 0));
+}
+
+function formatCurrency(value) {
+    return toNumber(value, 0).toLocaleString("de-CH", {
+        style: "currency",
+        currency: "USD",
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+    });
+}
+
+function formatSignedCurrency(value) {
+    const numeric = toNumber(value, 0);
+    const formatted = formatCurrency(Math.abs(numeric));
+
+    return numeric >= 0 ? `+${formatted}` : `-${formatted}`;
+}
+
+function resolvePnlColor(value) {
+    const number = toNumber(value, 0);
+
+    if (number > 0) {
+        return COLORS.positive;
+    }
+
+    if (number < 0) {
+        return COLORS.negative;
+    }
+
+    return COLORS.text;
+}
+
+function getSideColor(side) {
+    const text = cleanString(side).toLowerCase();
+
+    if (text === "long" || text.includes("buy")) {
+        return COLORS.positive;
+    }
+
+    if (text === "short" || text.includes("sell")) {
+        return COLORS.warning;
+    }
+
+    return COLORS.text;
+}
+
+function getSideFromSignedQty(value) {
+    const qty = toNumber(value, 0);
+
+    if (qty > 0) {
+        return "Long";
+    }
+
+    if (qty < 0) {
+        return "Short";
+    }
+
+    return "Flat";
+}
+
+function truncateMiddle(value, maxLength = 24) {
+    const text = cleanString(value);
+
+    if (!text) {
+        return "–";
+    }
+
+    if (text.length <= maxLength) {
+        return text;
+    }
+
+    const left = Math.ceil((maxLength - 3) / 2);
+    const right = Math.floor((maxLength - 3) / 2);
+
+    return `${text.slice(0, left)}...${text.slice(text.length - right)}`;
+}
+
+function normalizeContractText(value) {
+    const text = cleanString(value).toUpperCase();
+
+    if (!text) {
+        return "";
+    }
+
+    return text
+        .replace("@CME", "")
+        .replace("@CBOT", "")
+        .replace("@NYMEX", "")
+        .replace("@COMEX", "")
+        .replace("@ICE", "")
+        .replace(/\s+/g, "")
+        .trim();
+}
+
+function extractContractSymbol(value) {
+    const normalized = normalizeContractText(value);
+
+    if (!normalized) {
+        return "";
+    }
+
+    const directPrefix = CONTRACT_PREFIXES.find((prefix) =>
+        normalized.startsWith(prefix)
+    );
+
+    if (directPrefix) {
+        return normalized;
+    }
+
+    const contractMatch = normalized.match(
+        /(MNQ|NQ|MES|ES|MYM|YM|M2K|RTY|MCL|CL|MGC|GC|M6E|6E|M6B|6B|M6A|6A|M6J|6J)[A-Z]\d{1,2}/
+    );
+
+    if (contractMatch) {
+        return contractMatch[0];
+    }
+
+    return normalized;
+}
+
+function getContractPrefix(value) {
+    const normalized = extractContractSymbol(value);
+
+    if (!normalized) {
+        return "";
+    }
+
+    return CONTRACT_PREFIXES.find((prefix) =>
+        normalized.startsWith(prefix)
+    ) || "";
+}
+
+function getContractFamilyKey(value) {
+    const prefix = getContractPrefix(value);
+
+    if (!prefix) {
+        return "";
+    }
+
+    return MICRO_TO_FULL_PREFIX[prefix] || prefix;
+}
+
+function isMicroContract(value) {
+    const normalized = extractContractSymbol(value);
+
+    return MICRO_CONTRACT_PREFIXES.some((prefix) =>
+        normalized.startsWith(prefix)
+    );
+}
+
+function reduceContractsWithMicroPriority(values) {
+    const contracts = values
+        .map(extractContractSymbol)
+        .filter(Boolean)
+        .filter((value) => value !== "–");
+
+    if (!contracts.length) {
+        return EMPTY_LIST;
+    }
+
+    const uniqueContracts = [...new Set(contracts)];
+
+    const microFamilies = new Set(
+        uniqueContracts
+            .filter(isMicroContract)
+            .map(getContractFamilyKey)
+            .filter(Boolean)
+    );
+
+    return uniqueContracts.filter((contract) => {
+        const prefix = getContractPrefix(contract);
+        const family = getContractFamilyKey(contract);
+
+        if (!prefix || !family) {
+            return true;
+        }
+
+        if (!microFamilies.has(family)) {
+            return true;
+        }
+
+        if (isMicroContract(contract)) {
+            return true;
+        }
+
+        return !FULL_TO_MICRO_PREFIX[prefix];
+    });
+}
+
+function pickBestContract(values) {
+    const contracts = reduceContractsWithMicroPriority(values);
+
+    if (!contracts.length) {
+        return "";
+    }
+
+    const microContract = contracts.find(isMicroContract);
+
+    if (microContract) {
+        return microContract;
+    }
+
+    return contracts[0];
+}
+
+function collectContractCandidatesFromRow(row) {
+    if (!row || typeof row !== "object") {
+        return [];
+    }
+
+    return [
+        row.symbol,
+        row.instrument,
+        row.contract,
+        row.product,
+        row.securityId,
+        row.SecurityId,
+        row.SecurityID,
+    ];
+}
+
+function resolveSnapshotDisplayContract(snapshot, resolvedAccount = null) {
+    const fillRows = [
+        ...(Array.isArray(snapshot?.fills) ? snapshot.fills : EMPTY_LIST),
+        ...(Array.isArray(snapshot?.fillHistory) ? snapshot.fillHistory : EMPTY_LIST),
+    ];
+
+    const orderRows = [
+        ...(Array.isArray(snapshot?.orders) ? snapshot.orders : EMPTY_LIST),
+        ...(Array.isArray(snapshot?.orderHistory) ? snapshot.orderHistory : EMPTY_LIST),
+        ...(Array.isArray(snapshot?.openOrders) ? snapshot.openOrders : EMPTY_LIST),
+    ];
+
+    const positionRows = [
+        ...(Array.isArray(snapshot?.positions) ? snapshot.positions : EMPTY_LIST),
+        ...(Array.isArray(snapshot?.openPositions) ? snapshot.openPositions : EMPTY_LIST),
+        ...(Array.isArray(snapshot?.livePositions) ? snapshot.livePositions : EMPTY_LIST),
+    ];
+
+    const historyRows = [
+        ...(Array.isArray(snapshot?.positionHistory) ? snapshot.positionHistory : EMPTY_LIST),
+        ...(Array.isArray(snapshot?.positionsHistory) ? snapshot.positionsHistory : EMPTY_LIST),
+        ...(Array.isArray(snapshot?.historyEntries) ? snapshot.historyEntries : EMPTY_LIST),
+    ];
+
+    const rowCandidates = [
+        snapshot?.lastFill,
+        snapshot?.lastOrder,
+        ...fillRows,
+        ...positionRows,
+        ...historyRows,
+        ...orderRows,
+    ].flatMap(collectContractCandidatesFromRow);
+
+    const baseCandidates = [
+        ...rowCandidates,
+        snapshot?.symbol,
+        snapshot?.instrument,
+        snapshot?.contract,
+        snapshot?.product,
+        resolvedAccount?.symbol,
+        resolvedAccount?.instrument,
+        resolvedAccount?.contract,
+        resolvedAccount?.product,
+    ];
+
+    return pickBestContract(baseCandidates);
+}
+
+function tradeMatchesFilter(trade, filterText) {
+    const normalizedFilter = cleanString(filterText).toLowerCase();
+
+    if (!normalizedFilter) {
+        return true;
+    }
+
+    const haystack = [
+        trade?.tradeId,
+        trade?.symbol,
+        trade?.side,
+        trade?.entryTime,
+        trade?.exitTime,
+    ]
+        .map((value) => cleanString(value).toLowerCase())
+        .join(" ");
+
+    return haystack.includes(normalizedFilter);
+}
+
+function positionMatchesFilter(position, filterText) {
+    const normalizedFilter = cleanString(filterText).toLowerCase();
+
+    if (!normalizedFilter) {
+        return true;
+    }
+
+    const haystack = [
+        position?.tradeId,
+        position?.symbol,
+        position?.side,
+        position?.openedAt,
+    ]
+        .map((value) => cleanString(value).toLowerCase())
+        .join(" ");
+
+    return haystack.includes(normalizedFilter);
+}
+
+function historyMatchesFilter(entry, filterText) {
+    const normalizedFilter = cleanString(filterText).toLowerCase();
+
+    if (!normalizedFilter) {
+        return true;
+    }
+
+    const haystack = [
+        entry?.positionId,
+        entry?.pairId,
+        entry?.account,
+        entry?.contract,
+        entry?.product,
+        entry?.tradeDate,
+        entry?.timestamp,
+        entry?.buyFillId,
+        entry?.sellFillId,
+    ]
+        .map((value) => cleanString(value).toLowerCase())
+        .join(" ");
+
+    return haystack.includes(normalizedFilter);
+}
+
+function buildFlexibleSource(source) {
+    const map = {};
+
+    if (!source || typeof source !== "object") {
+        return map;
+    }
+
+    Object.keys(source).forEach((key) => {
+        const normalizedKey = cleanString(key).toLowerCase().replace(/[^a-z0-9]/g, "");
+
+        if (!normalizedKey) {
+            return;
+        }
+
+        if (map[normalizedKey] === undefined) {
+            map[normalizedKey] = source[key];
+        }
+    });
+
+    return map;
+}
+
+function pickFlexibleValue(source, keys) {
+    for (const key of keys) {
+        const normalizedKey = cleanString(key).toLowerCase().replace(/[^a-z0-9]/g, "");
+
+        if (!normalizedKey) {
+            continue;
+        }
+
+        const value = source[normalizedKey];
+
+        if (value !== undefined && value !== null && value !== "") {
+            return value;
+        }
+    }
+
+    return "";
 }
 
 function hasImportRows(importEntry) {
@@ -243,31 +737,15 @@ function getImportEventNames(provider) {
     const names = new Set([
         "tradovate-csv-imports-updated",
         "csv-imports-updated",
+        "future-dashboard-storage",
+        "atas-bridge-accounts-updated",
+        "atas-bridge-status-updated",
     ]);
 
     const normalizedProvider = normalizeProvider(provider);
 
     if (normalizedProvider) {
         names.add(`${normalizedProvider}-csv-imports-updated`);
-    }
-
-    if (typeof csvImportUtils.getCsvImportEventName === "function") {
-        const attempts = [
-            () => csvImportUtils.getCsvImportEventName({ provider: normalizedProvider }),
-            () => csvImportUtils.getCsvImportEventName(normalizedProvider),
-            () => csvImportUtils.getCsvImportEventName(),
-        ];
-
-        attempts.forEach((attempt) => {
-            try {
-                const value = cleanString(attempt());
-                if (value) {
-                    names.add(value);
-                }
-            } catch {
-                return;
-            }
-        });
     }
 
     return Array.from(names);
@@ -277,13 +755,14 @@ function callImportBuilder(builderName, imports, accountId, provider) {
     const builder = csvImportUtils?.[builderName];
 
     if (typeof builder !== "function") {
-        return { entries: EMPTY_LIST };
+        return { entries: EMPTY_LIST, fileName: "" };
     }
 
     const attempts = [
         () => builder(imports, accountId, { provider }),
         () => builder(imports, accountId, provider),
         () => builder(imports, accountId),
+        () => builder(imports),
     ];
 
     for (const attempt of attempts) {
@@ -291,299 +770,32 @@ function callImportBuilder(builderName, imports, accountId, provider) {
             const result = attempt();
 
             if (result && typeof result === "object") {
-                return result;
+                return {
+                    entries: Array.isArray(result.entries) ? result.entries : EMPTY_LIST,
+                    fileName: cleanString(result.fileName || result.name || ""),
+                };
             }
         } catch {
             continue;
         }
     }
 
-    return { entries: EMPTY_LIST };
+    return { entries: EMPTY_LIST, fileName: "" };
 }
 
-function parseFlexibleNumber(value) {
-    if (typeof value === "number") {
-        return Number.isFinite(value) ? value : null;
-    }
+function normalizeLiveOpenTrade(entry, index, fallbackContract = "") {
+    const symbol = pickBestContract([
+        ...collectContractCandidatesFromRow(entry),
+        fallbackContract,
+    ]) || "–";
 
-    const textValue = cleanString(value);
-
-    if (!textValue) {
-        return null;
-    }
-
-    let text = textValue
-        .replace(/\s/g, "")
-        .replace(/[$€£]/g, "")
-        .replace(/USD|EUR|CHF/gi, "")
-        .replace(/'/g, "");
-
-    const negativeByParens = text.startsWith("(") && text.endsWith(")");
-    text = text.replace(/[()]/g, "");
-
-    if (!text) {
-        return null;
-    }
-
-    const hasComma = text.includes(",");
-    const hasDot = text.includes(".");
-
-    if (hasComma && hasDot) {
-        if (text.lastIndexOf(",") > text.lastIndexOf(".")) {
-            text = text.replace(/\./g, "").replace(/,/g, ".");
-        } else {
-            text = text.replace(/,/g, "");
-        }
-    } else if (hasComma && !hasDot) {
-        const lastPart = text.split(",").pop() || "";
-
-        if (lastPart.length === 1 || lastPart.length === 2) {
-            text = text.replace(/,/g, ".");
-        } else {
-            text = text.replace(/,/g, "");
-        }
-    }
-
-    const parsed = Number(text);
-
-    if (!Number.isFinite(parsed)) {
-        return null;
-    }
-
-    return negativeByParens ? -Math.abs(parsed) : parsed;
-}
-
-function toNumber(value, fallback = 0) {
-    const parsed = parseFlexibleNumber(value);
-    return parsed !== null ? parsed : fallback;
-}
-
-function formatNumber(value, decimals = 2) {
-    return new Intl.NumberFormat("de-CH", {
-        minimumFractionDigits: decimals,
-        maximumFractionDigits: decimals,
-    }).format(toNumber(value, 0));
-}
-
-function formatInteger(value) {
-    return new Intl.NumberFormat("de-CH", {
-        maximumFractionDigits: 0,
-    }).format(toNumber(value, 0));
-}
-
-function tradeMatchesFilter(trade, filterText) {
-    const normalizedFilter = cleanString(filterText).toLowerCase();
-
-    if (!normalizedFilter) {
-        return true;
-    }
-
-    const haystack = [
-        trade?.tradeId,
-        trade?.symbol,
-        trade?.side,
-        trade?.entryTime,
-        trade?.exitTime,
-    ]
-        .map((value) => cleanString(value).toLowerCase())
-        .join(" ");
-
-    return haystack.includes(normalizedFilter);
-}
-
-function positionMatchesFilter(position, filterText) {
-    const normalizedFilter = cleanString(filterText).toLowerCase();
-
-    if (!normalizedFilter) {
-        return true;
-    }
-
-    const haystack = [
-        position?.tradeId,
-        position?.symbol,
-        position?.side,
-        position?.openedAt,
-    ]
-        .map((value) => cleanString(value).toLowerCase())
-        .join(" ");
-
-    return haystack.includes(normalizedFilter);
-}
-
-function positionHistoryMatchesFilter(entry, filterText) {
-    const normalizedFilter = cleanString(filterText).toLowerCase();
-
-    if (!normalizedFilter) {
-        return true;
-    }
-
-    const haystack = [
-        entry?.positionId,
-        entry?.pairId,
-        entry?.account,
-        entry?.contract,
-        entry?.product,
-        entry?.tradeDate,
-        entry?.timestamp,
-        entry?.buyFillId,
-        entry?.sellFillId,
-    ]
-        .map((value) => cleanString(value).toLowerCase())
-        .join(" ");
-
-    return haystack.includes(normalizedFilter);
-}
-
-function getSideColor(side) {
-    const text = cleanString(side).toLowerCase();
-
-    if (text === "long" || text.includes("buy")) {
-        return COLORS.positive;
-    }
-
-    if (text === "short" || text.includes("sell")) {
-        return COLORS.warning;
-    }
-
-    return COLORS.text;
-}
-
-function truncateMiddle(value, maxLength = 24) {
-    const text = cleanString(value);
-
-    if (!text) {
-        return "–";
-    }
-
-    if (text.length <= maxLength) {
-        return text;
-    }
-
-    const left = Math.ceil((maxLength - 3) / 2);
-    const right = Math.floor((maxLength - 3) / 2);
-
-    return `${text.slice(0, left)}...${text.slice(text.length - right)}`;
-}
-
-function resolveFeedLabel(provider, fillCount, openPositionCount, historyCount) {
-    const providerLabel = formatProviderLabel(provider);
-    const providerStatus = cleanString(
-    liveSnapshot?.dataProviderStatus || resolvedAccount?.dataProviderStatus
-).toLowerCase();
-
-    if (openPositionCount > 0) {
-        return "Live Positionen aktiv";
-    }
-
-    if (historyCount > 0) {
-        return `${providerLabel} History aktiv`;
-    }
-
-    if (fillCount > 0) {
-        return `${providerLabel} Fills aktiv`;
-    }
-
-    return "Keine Positionsdaten";
-}
-
-function resolveFeedColor(provider, fillCount, openPositionCount, historyCount) {
-    if (openPositionCount > 0) {
-        return COLORS.title;
-    }
-
-    if (historyCount > 0) {
-        return normalizeProvider(provider) === "atas"
-            ? COLORS.purple
-            : COLORS.cyan;
-    }
-
-    if (fillCount > 0) {
-        return COLORS.warning;
-    }
-
-    return COLORS.muted;
-}
-
-function resolveLastActivityTime(openTrades, positions, historyEntries) {
-    const values = [
-        ...(Array.isArray(openTrades)
-            ? openTrades.map((trade) => trade?.entryTime || trade?.exitTime || "")
-            : EMPTY_LIST),
-        ...(Array.isArray(positions)
-            ? positions.map((position) => position?.openedAt || "")
-            : EMPTY_LIST),
-        ...(Array.isArray(historyEntries)
-            ? historyEntries.map((entry) => entry?.timestamp || entry?.tradeDate || "")
-            : EMPTY_LIST),
-    ]
-        .map((value) => {
-            const time = new Date(value).getTime();
-            return Number.isFinite(time) ? time : null;
-        })
-        .filter((value) => value !== null);
-
-    if (values.length === 0) {
-        return "";
-    }
-
-    return new Date(Math.max(...values)).toISOString();
-}
-
-function resolveSymbolSummary(openTrades, positions, historyEntries) {
-    const values = [
-        ...(Array.isArray(openTrades)
-            ? openTrades.map((trade) => trade?.symbol)
-            : EMPTY_LIST),
-        ...(Array.isArray(positions)
-            ? positions.map((position) => position?.symbol)
-            : EMPTY_LIST),
-        ...(Array.isArray(historyEntries)
-            ? historyEntries.map((entry) => entry?.contract || entry?.product)
-            : EMPTY_LIST),
-    ]
-        .map(cleanString)
-        .filter(Boolean);
-
-    const uniqueValues = [...new Set(values)];
-
-    if (uniqueValues.length === 0) {
-        return "Keine Symbole";
-    }
-
-    if (uniqueValues.length <= 3) {
-        return uniqueValues.join(", ");
-    }
-
-    return `${uniqueValues.slice(0, 3).join(", ")} +${uniqueValues.length - 3}`;
-}
-
-function resolvePnlColor(value) {
-    const number = toNumber(value, 0);
-
-    if (number > 0) {
-        return COLORS.positive;
-    }
-
-    if (number < 0) {
-        return COLORS.negative;
-    }
-
-    return COLORS.text;
-}
-
-function normalizeLiveOpenTrade(entry, index) {
     return {
         tradeId:
             cleanString(entry?.tradeId) ||
             cleanString(entry?.positionId) ||
             cleanString(entry?.id) ||
             `live-trade-${index}`,
-        symbol:
-            cleanString(entry?.symbol) ||
-            cleanString(entry?.instrument) ||
-            cleanString(entry?.contract) ||
-            cleanString(entry?.product) ||
-            "–",
+        symbol,
         side:
             cleanString(entry?.side) ||
             cleanString(entry?.direction) ||
@@ -635,11 +847,12 @@ function normalizeLiveOpenTrade(entry, index) {
     };
 }
 
-function normalizeLivePosition(entry, index) {
+function normalizeLivePosition(entry, index, fallbackContract = "") {
     const rawSignedQuantity =
         entry?.signedQuantity ??
         entry?.netQty ??
         entry?.netPosition ??
+        entry?.positionQty ??
         null;
 
     const baseQuantity =
@@ -647,7 +860,9 @@ function normalizeLivePosition(entry, index) {
         entry?.qty ??
         entry?.openQty ??
         entry?.contracts ??
-        (rawSignedQuantity !== null ? Math.abs(toNumber(rawSignedQuantity, 0)) : 0);
+        (rawSignedQuantity !== null && rawSignedQuantity !== undefined
+            ? Math.abs(toNumber(rawSignedQuantity, 0))
+            : 0);
 
     const sideText = cleanString(
         entry?.side ||
@@ -667,30 +882,36 @@ function normalizeLivePosition(entry, index) {
         }
     }
 
+    const finalSignedQty = toNumber(signedQuantity, 0);
+
+    const symbol = pickBestContract([
+        ...collectContractCandidatesFromRow(entry),
+        fallbackContract,
+    ]) || "–";
+
     return {
         tradeId:
             cleanString(entry?.tradeId) ||
             cleanString(entry?.positionId) ||
             cleanString(entry?.id) ||
             `live-position-${index}`,
-        symbol:
-            cleanString(entry?.symbol) ||
-            cleanString(entry?.instrument) ||
-            cleanString(entry?.contract) ||
-            cleanString(entry?.product) ||
-            "–",
+        symbol,
         side:
             cleanString(entry?.side) ||
             cleanString(entry?.direction) ||
-            cleanString(entry?.action) ||
-            "–",
-        quantity: baseQuantity,
-        signedQuantity,
+            getSideFromSignedQty(finalSignedQty),
+        quantity: Math.abs(toNumber(baseQuantity, Math.abs(finalSignedQty))),
+        signedQuantity: finalSignedQty,
         avgPrice:
             entry?.avgPrice ??
             entry?.avgEntryPrice ??
             entry?.entryPrice ??
             entry?.price ??
+            0,
+        unrealizedPnL:
+            entry?.unrealizedPnL ??
+            entry?.unrealizedPnl ??
+            entry?.openPnl ??
             0,
         openedAt:
             entry?.openedAt ||
@@ -699,10 +920,56 @@ function normalizeLivePosition(entry, index) {
             entry?.time ||
             entry?.createdAt ||
             "",
+        source: cleanString(entry?.source || "live-snapshot"),
     };
 }
 
-function normalizeLiveHistoryEntry(entry, index) {
+function normalizeAtasSnapshotPosition(snapshot, fallbackContract = "") {
+    const positionQty = toNumber(
+        snapshot?.positionQty ?? snapshot?.qty ?? snapshot?.quantity ?? snapshot?.netQty,
+        0
+    );
+
+    if (positionQty === 0) {
+        return null;
+    }
+
+    const symbol = pickBestContract([
+        fallbackContract,
+        snapshot?.symbol,
+        snapshot?.instrument,
+        snapshot?.contract,
+        snapshot?.product,
+        snapshot?.lastFill?.symbol,
+        snapshot?.lastFill?.instrument,
+        snapshot?.lastFill?.contract,
+        snapshot?.lastFill?.product,
+    ]) || "–";
+
+    return normalizeLivePosition(
+        {
+            id: `atas-${symbol}-${positionQty}`,
+            tradeId: `ATAS-${symbol}`,
+            symbol,
+            signedQuantity: positionQty,
+            quantity: Math.abs(positionQty),
+            side: getSideFromSignedQty(positionQty),
+            avgPrice: snapshot?.avgPrice ?? snapshot?.averagePrice ?? 0,
+            unrealizedPnL: snapshot?.unrealizedPnL ?? snapshot?.unrealizedPnl ?? 0,
+            timestamp: snapshot?.lastSyncAt || snapshot?.timestamp || snapshot?.receivedAt || "",
+            source: "atas-snapshot",
+        },
+        0,
+        symbol
+    );
+}
+
+function normalizeLiveHistoryEntry(entry, index, fallbackContract = "") {
+    const contract = pickBestContract([
+        ...collectContractCandidatesFromRow(entry),
+        fallbackContract,
+    ]) || "–";
+
     return {
         id:
             cleanString(entry?.id) ||
@@ -720,16 +987,14 @@ function normalizeLiveHistoryEntry(entry, index) {
         account:
             cleanString(entry?.account) ||
             "",
-        contract:
-            cleanString(entry?.contract) ||
-            cleanString(entry?.instrument) ||
-            cleanString(entry?.symbol) ||
-            "–",
+        contract,
         product:
-            cleanString(entry?.product) ||
-            cleanString(entry?.market) ||
-            cleanString(entry?.symbol) ||
-            "–",
+            pickBestContract([
+                entry?.product,
+                entry?.market,
+                entry?.symbol,
+                contract,
+            ]) || contract,
         tradeDate:
             cleanString(entry?.tradeDate) ||
             cleanString(entry?.date) ||
@@ -776,7 +1041,7 @@ function normalizeLiveHistoryEntry(entry, index) {
     };
 }
 
-function getLiveSnapshotOpenTrades(snapshot) {
+function getLiveSnapshotOpenTrades(snapshot, fallbackContract = "") {
     if (!snapshot || typeof snapshot !== "object") {
         return EMPTY_LIST;
     }
@@ -789,14 +1054,16 @@ function getLiveSnapshotOpenTrades(snapshot) {
 
     for (const source of sources) {
         if (Array.isArray(source) && source.length) {
-            return source.map((entry, index) => normalizeLiveOpenTrade(entry, index));
+            return source.map((entry, index) =>
+                normalizeLiveOpenTrade(entry, index, fallbackContract)
+            );
         }
     }
 
     return EMPTY_LIST;
 }
 
-function getLiveSnapshotPositions(snapshot) {
+function getLiveSnapshotPositions(snapshot, fallbackContract = "") {
     if (!snapshot || typeof snapshot !== "object") {
         return EMPTY_LIST;
     }
@@ -809,14 +1076,26 @@ function getLiveSnapshotPositions(snapshot) {
 
     for (const source of sources) {
         if (Array.isArray(source) && source.length) {
-            return source.map((entry, index) => normalizeLivePosition(entry, index));
+            const normalizedPositions = source
+                .map((entry, index) =>
+                    normalizeLivePosition(entry, index, fallbackContract)
+                )
+                .filter((position) => {
+                    return toNumber(position?.signedQuantity, 0) !== 0;
+                });
+
+            if (normalizedPositions.length > 0) {
+                return normalizedPositions;
+            }
         }
     }
 
-    return EMPTY_LIST;
+    const atasPosition = normalizeAtasSnapshotPosition(snapshot, fallbackContract);
+
+    return atasPosition ? [atasPosition] : EMPTY_LIST;
 }
 
-function getLiveSnapshotHistory(snapshot) {
+function getLiveSnapshotHistory(snapshot, fallbackContract = "") {
     if (!snapshot || typeof snapshot !== "object") {
         return EMPTY_LIST;
     }
@@ -829,7 +1108,9 @@ function getLiveSnapshotHistory(snapshot) {
 
     for (const source of sources) {
         if (Array.isArray(source) && source.length) {
-            return source.map((entry, index) => normalizeLiveHistoryEntry(entry, index));
+            return source.map((entry, index) =>
+                normalizeLiveHistoryEntry(entry, index, fallbackContract)
+            );
         }
     }
 
@@ -860,8 +1141,164 @@ function hasLiveAtasIdentity(snapshot) {
         cleanString(snapshot?.atasAccountId) ||
         cleanString(snapshot?.atasAccountName) ||
         cleanString(snapshot?.dataProviderAccountId) ||
-        cleanString(snapshot?.dataProviderAccountName)
+        cleanString(snapshot?.dataProviderAccountName) ||
+        cleanString(snapshot?.symbol)
     );
+}
+
+function resolveFeedLabel(provider, fillCount, openPositionCount, historyCount, hasSnapshotIdentity) {
+    const providerLabel = formatProviderLabel(provider);
+
+    if (openPositionCount > 0) {
+        return "Live Position aktiv";
+    }
+
+    if (historyCount > 0) {
+        return `${providerLabel} History aktiv`;
+    }
+
+    if (fillCount > 0) {
+        return `${providerLabel} Fills aktiv`;
+    }
+
+    if (normalizeProvider(provider) === "atas" && hasSnapshotIdentity) {
+        return "ATAS Snapshot aktiv";
+    }
+
+    return "Keine Positionsdaten";
+}
+
+function resolveFeedColor(provider, fillCount, openPositionCount, historyCount, hasSnapshotIdentity) {
+    if (openPositionCount > 0) {
+        return COLORS.title;
+    }
+
+    if (historyCount > 0) {
+        return normalizeProvider(provider) === "atas"
+            ? COLORS.purple
+            : COLORS.cyan;
+    }
+
+    if (fillCount > 0) {
+        return COLORS.warning;
+    }
+
+    if (normalizeProvider(provider) === "atas" && hasSnapshotIdentity) {
+        return COLORS.positive;
+    }
+
+    return COLORS.muted;
+}
+
+function resolveLastActivityTime(openTrades, positions, historyEntries, liveSnapshot) {
+    const values = [
+        liveSnapshot?.lastSyncAt,
+        liveSnapshot?.timestamp,
+        liveSnapshot?.receivedAt,
+        ...(Array.isArray(openTrades)
+            ? openTrades.map((trade) => trade?.entryTime || trade?.exitTime || "")
+            : EMPTY_LIST),
+        ...(Array.isArray(positions)
+            ? positions.map((position) => position?.openedAt || "")
+            : EMPTY_LIST),
+        ...(Array.isArray(historyEntries)
+            ? historyEntries.map((entry) => entry?.timestamp || entry?.tradeDate || "")
+            : EMPTY_LIST),
+    ]
+        .map((value) => {
+            const time = new Date(value).getTime();
+            return Number.isFinite(time) ? time : null;
+        })
+        .filter((value) => value !== null);
+
+    if (values.length === 0) {
+        return "";
+    }
+
+    return new Date(Math.max(...values)).toISOString();
+}
+
+function resolveSymbolSummary(openTrades, positions, historyEntries, liveSnapshot, resolvedAccount, displayContract = "") {
+    const values = [
+        displayContract,
+        liveSnapshot?.symbol,
+        liveSnapshot?.instrument,
+        liveSnapshot?.contract,
+        liveSnapshot?.product,
+        resolvedAccount?.symbol,
+        resolvedAccount?.instrument,
+        resolvedAccount?.contract,
+        resolvedAccount?.product,
+        ...(Array.isArray(openTrades)
+            ? openTrades.map((trade) => trade?.symbol)
+            : EMPTY_LIST),
+        ...(Array.isArray(positions)
+            ? positions.map((position) => position?.symbol)
+            : EMPTY_LIST),
+        ...(Array.isArray(historyEntries)
+            ? historyEntries.map((entry) => entry?.contract || entry?.product)
+            : EMPTY_LIST),
+    ];
+
+    const uniqueValues = reduceContractsWithMicroPriority(values);
+
+    if (uniqueValues.length === 0) {
+        return "Keine Symbole";
+    }
+
+    if (uniqueValues.length <= 3) {
+        return uniqueValues.join(", ");
+    }
+
+    return `${uniqueValues.slice(0, 3).join(", ")} +${uniqueValues.length - 3}`;
+}
+
+function applyDisplayContractToOpenTrades(openTrades, displayContract) {
+    const contract = extractContractSymbol(displayContract);
+
+    if (!contract) {
+        return openTrades;
+    }
+
+    return openTrades.map((trade) => ({
+        ...trade,
+        symbol: pickBestContract([trade?.symbol, contract]) || trade?.symbol,
+    }));
+}
+
+function applyDisplayContractToPositions(positions, displayContract) {
+    const contract = extractContractSymbol(displayContract);
+
+    if (!contract) {
+        return positions;
+    }
+
+    return positions.map((position) => ({
+        ...position,
+        symbol: pickBestContract([position?.symbol, contract]) || position?.symbol,
+    }));
+}
+
+function applyDisplayContractToHistory(historyEntries, displayContract) {
+    const contract = extractContractSymbol(displayContract);
+
+    if (!contract) {
+        return historyEntries;
+    }
+
+    return historyEntries.map((entry) => {
+        const nextContract = pickBestContract([
+            entry?.contract,
+            entry?.product,
+            contract,
+        ]);
+
+        return {
+            ...entry,
+            contract: nextContract || entry?.contract,
+            product: nextContract || entry?.product,
+        };
+    });
 }
 
 function TradeIdButton({ tradeId, onSelect }) {
@@ -989,13 +1426,21 @@ export default function PositionsPanel({
         ""
     );
 
+    const [refreshTick, setRefreshTick] = useState(0);
+    const [tradeFilter, setTradeFilter] = useState("");
+    const [localImports, setLocalImports] = useState({});
+
     const liveSnapshot = useMemo(() => {
         if (!resolvedAppAccountId) {
             return null;
         }
 
         return getLiveAccountSnapshot(resolvedAppAccountId) || null;
-    }, [resolvedAppAccountId]);
+    }, [resolvedAppAccountId, refreshTick]);
+
+    const displayContract = useMemo(() => {
+        return resolveSnapshotDisplayContract(liveSnapshot, resolvedAccount);
+    }, [liveSnapshot, resolvedAccount]);
 
     const provider = resolvePanelProvider(
         {
@@ -1008,22 +1453,30 @@ export default function PositionsPanel({
 
     const providerLabel = formatProviderLabel(provider);
 
-   const forceAtasZeroState = useMemo(() => {
-    if (normalizeProvider(provider) !== "atas") {
-        return false;
-    }
+    const providerStatus = cleanString(
+        liveSnapshot?.dataProviderStatus ||
+        liveSnapshot?.connectionStatus ||
+        resolvedAccount?.dataProviderStatus ||
+        ""
+    ).toLowerCase();
 
-    if (hasLiveAtasIdentity(liveSnapshot)) {
-        return false;
-    }
+    const forceAtasZeroState = useMemo(() => {
+        if (normalizeProvider(provider) !== "atas") {
+            return false;
+        }
 
-    return (
-        !providerStatus ||
-        providerStatus === "disconnected" ||
-        providerStatus === "error" ||
-        providerStatus === "not_connected"
-    );
-}, [provider, liveSnapshot, providerStatus]);
+        if (hasLiveAtasIdentity(liveSnapshot)) {
+            return false;
+        }
+
+        return (
+            !providerStatus ||
+            providerStatus === "disconnected" ||
+            providerStatus === "error" ||
+            providerStatus === "not_connected" ||
+            providerStatus === "offline"
+        );
+    }, [provider, liveSnapshot, providerStatus]);
 
     const scopeAccountId = useMemo(() => {
         if (forceAtasZeroState) {
@@ -1067,11 +1520,6 @@ export default function PositionsPanel({
         );
     }, [forceAtasZeroState, resolvedAccount, liveSnapshot, provider]);
 
-    const [tradeFilter, setTradeFilter] = useState("");
-    const [localImports, setLocalImports] = useState(() => {
-        return loadParsedImportsForProvider(resolvedAppAccountId, provider);
-    });
-
     useEffect(() => {
         const unsubscribe = subscribeTradeSelection((tradeId) => {
             setTradeFilter(cleanString(tradeId));
@@ -1082,12 +1530,37 @@ export default function PositionsPanel({
 
     useEffect(() => {
         if (typeof window === "undefined") {
-            return;
+            return undefined;
+        }
+
+        const handleRefresh = () => {
+            setRefreshTick((current) => current + 1);
+        };
+
+        window.addEventListener("future-dashboard-storage", handleRefresh);
+        window.addEventListener("atas-bridge-accounts-updated", handleRefresh);
+        window.addEventListener("atas-bridge-status-updated", handleRefresh);
+        window.addEventListener("storage", handleRefresh);
+        window.addEventListener("focus", handleRefresh);
+
+        return () => {
+            window.removeEventListener("future-dashboard-storage", handleRefresh);
+            window.removeEventListener("atas-bridge-accounts-updated", handleRefresh);
+            window.removeEventListener("atas-bridge-status-updated", handleRefresh);
+            window.removeEventListener("storage", handleRefresh);
+            window.removeEventListener("focus", handleRefresh);
+        };
+    }, []);
+
+    useEffect(() => {
+        if (typeof window === "undefined") {
+            return undefined;
         }
 
         const loadImports = () => {
             const nextImports = loadParsedImportsForProvider(resolvedAppAccountId, provider);
             setLocalImports(nextImports);
+            setRefreshTick((current) => current + 1);
         };
 
         const eventNames = getImportEventNames(provider);
@@ -1141,34 +1614,6 @@ export default function PositionsPanel({
         importsProp,
     ]);
 
-  const effectiveFills = useMemo(() => {
-    if (forceAtasZeroState) {
-        return EMPTY_LIST;
-    }
-
-    if (normalizeProvider(provider) === "atas") {
-        if (liveSnapshotFills.length > 0) {
-            return liveSnapshotFills;
-        }
-
-        if (directFills.length > 0) {
-            return directFills;
-        }
-
-        return EMPTY_LIST;
-    }
-
-    if (directFills.length > 0) {
-        return directFills;
-    }
-
-    if (storedFills.length > 0) {
-        return storedFills;
-    }
-
-    return liveSnapshotFills;
-}, [forceAtasZeroState, provider, liveSnapshotFills, directFills, storedFills]);
-
     const positionHistoryData = useMemo(() => {
         if (forceAtasZeroState) {
             return { entries: EMPTY_LIST, fileName: "" };
@@ -1181,6 +1626,14 @@ export default function PositionsPanel({
             provider
         );
     }, [forceAtasZeroState, effectiveImports, scopeAccountId, resolvedAppAccountId, provider]);
+
+    const liveSnapshotFills = useMemo(() => {
+        if (forceAtasZeroState) {
+            return EMPTY_LIST;
+        }
+
+        return getLiveSnapshotFills(liveSnapshot);
+    }, [liveSnapshot, forceAtasZeroState]);
 
     const directFills = useMemo(() => {
         if (forceAtasZeroState) {
@@ -1199,12 +1652,8 @@ export default function PositionsPanel({
             return csvFills.map((fill) => ({ ...fill }));
         }
 
-        if (Array.isArray(importedFillsData?.entries) && importedFillsData.entries.length > 0) {
-            return importedFillsData.entries.map((fill) => ({ ...fill }));
-        }
-
         return EMPTY_LIST;
-    }, [forceAtasZeroState, importedFills, fills, csvFills, importedFillsData]);
+    }, [forceAtasZeroState, importedFills, fills, csvFills]);
 
     const storedFills = useMemo(() => {
         if (forceAtasZeroState || !resolvedAppAccountId) {
@@ -1213,16 +1662,35 @@ export default function PositionsPanel({
 
         const nextFills = getFills(resolvedAppAccountId);
         return Array.isArray(nextFills) ? nextFills : EMPTY_LIST;
-    }, [forceAtasZeroState, resolvedAppAccountId]);
+    }, [forceAtasZeroState, resolvedAppAccountId, refreshTick]);
 
-    const liveSnapshotFills = useMemo(() => {
+    const effectiveFills = useMemo(() => {
         if (forceAtasZeroState) {
             return EMPTY_LIST;
         }
 
-        return getLiveSnapshotFills(liveSnapshot);
-    }, [liveSnapshot, forceAtasZeroState]);
+        if (normalizeProvider(provider) === "atas") {
+            if (liveSnapshotFills.length > 0) {
+                return liveSnapshotFills;
+            }
 
+            if (directFills.length > 0) {
+                return directFills;
+            }
+
+            return EMPTY_LIST;
+        }
+
+        if (directFills.length > 0) {
+            return directFills;
+        }
+
+        if (storedFills.length > 0) {
+            return storedFills;
+        }
+
+        return liveSnapshotFills;
+    }, [forceAtasZeroState, provider, liveSnapshotFills, directFills, storedFills]);
 
     const analytics = useMemo(() => {
         return buildFillAnalytics({
@@ -1244,88 +1712,124 @@ export default function PositionsPanel({
             return EMPTY_LIST;
         }
 
-        return getLiveSnapshotOpenTrades(liveSnapshot);
-    }, [liveSnapshot, forceAtasZeroState]);
+        return getLiveSnapshotOpenTrades(liveSnapshot, displayContract);
+    }, [liveSnapshot, forceAtasZeroState, displayContract]);
 
     const livePositions = useMemo(() => {
         if (forceAtasZeroState) {
             return EMPTY_LIST;
         }
 
-        return getLiveSnapshotPositions(liveSnapshot);
-    }, [liveSnapshot, forceAtasZeroState]);
+        return getLiveSnapshotPositions(liveSnapshot, displayContract);
+    }, [liveSnapshot, forceAtasZeroState, displayContract]);
 
     const liveHistoryEntries = useMemo(() => {
         if (forceAtasZeroState) {
             return EMPTY_LIST;
         }
 
-        return getLiveSnapshotHistory(liveSnapshot);
-    }, [liveSnapshot, forceAtasZeroState]);
+        return getLiveSnapshotHistory(liveSnapshot, displayContract);
+    }, [liveSnapshot, forceAtasZeroState, displayContract]);
 
-    const importedHistoryEntries = Array.isArray(positionHistoryData?.entries)
-        ? positionHistoryData.entries
-        : EMPTY_LIST;
+    const importedHistoryEntries = useMemo(() => {
+        if (!Array.isArray(positionHistoryData?.entries)) {
+            return EMPTY_LIST;
+        }
+
+        return positionHistoryData.entries.map((entry, index) => {
+            const flexible = buildFlexibleSource(entry);
+            const contract = pickBestContract([
+                pickFlexibleValue(flexible, [
+                    "contract",
+                    "instrument",
+                    "symbol",
+                    "securityid",
+                    "product",
+                ]),
+                displayContract,
+            ]);
+
+            return normalizeLiveHistoryEntry(
+                {
+                    ...entry,
+                    contract: contract || entry?.contract,
+                    product: contract || entry?.product,
+                },
+                index,
+                displayContract
+            );
+        });
+    }, [positionHistoryData?.entries, displayContract]);
 
     const openTrades = useMemo(() => {
         if (forceAtasZeroState) {
             return EMPTY_LIST;
         }
 
+        let rows = EMPTY_LIST;
+
         if (normalizeProvider(provider) === "atas") {
-            if (liveOpenTrades.length > 0) {
-                return liveOpenTrades;
-            }
-
-            return analyticsOpenTrades;
+            rows = liveOpenTrades.length > 0 ? liveOpenTrades : analyticsOpenTrades;
+        } else {
+            rows = analyticsOpenTrades.length > 0 ? analyticsOpenTrades : liveOpenTrades;
         }
 
-        if (analyticsOpenTrades.length > 0) {
-            return analyticsOpenTrades;
-        }
-
-        return liveOpenTrades;
-    }, [forceAtasZeroState, provider, liveOpenTrades, analyticsOpenTrades]);
+        return applyDisplayContractToOpenTrades(rows, displayContract);
+    }, [
+        forceAtasZeroState,
+        provider,
+        liveOpenTrades,
+        analyticsOpenTrades,
+        displayContract,
+    ]);
 
     const positions = useMemo(() => {
         if (forceAtasZeroState) {
             return EMPTY_LIST;
         }
 
+        let rows = EMPTY_LIST;
+
         if (normalizeProvider(provider) === "atas") {
-            if (livePositions.length > 0) {
-                return livePositions;
-            }
-
-            return analyticsPositions;
+            rows = livePositions;
+        } else {
+            rows = analyticsPositions.length > 0 ? analyticsPositions : livePositions;
         }
 
-        if (analyticsPositions.length > 0) {
-            return analyticsPositions;
-        }
-
-        return livePositions;
-    }, [forceAtasZeroState, provider, livePositions, analyticsPositions]);
+        return applyDisplayContractToPositions(rows, displayContract);
+    }, [
+        forceAtasZeroState,
+        provider,
+        livePositions,
+        analyticsPositions,
+        displayContract,
+    ]);
 
     const historyEntries = useMemo(() => {
         if (forceAtasZeroState) {
             return EMPTY_LIST;
         }
 
+        let rows = EMPTY_LIST;
+
         if (normalizeProvider(provider) === "atas") {
-            if (liveHistoryEntries.length > 0) {
-                return liveHistoryEntries;
-            }
-
-            return importedHistoryEntries;
+            rows = liveHistoryEntries.length > 0
+                ? liveHistoryEntries
+                : importedHistoryEntries;
+        } else {
+            rows = importedHistoryEntries.length > 0
+                ? importedHistoryEntries
+                : liveHistoryEntries;
         }
 
-        if (importedHistoryEntries.length > 0) {
-            return importedHistoryEntries;
-        }
-
-        return liveHistoryEntries;
-    }, [forceAtasZeroState, provider, liveHistoryEntries, importedHistoryEntries]);
+        return applyDisplayContractToHistory(rows, displayContract);
+    }, [
+        forceAtasZeroState,
+        provider,
+        liveHistoryEntries,
+        importedHistoryEntries,
+        displayContract,
+    ]);
 
     const fillCount = Array.isArray(effectiveFills) ? effectiveFills.length : 0;
 
@@ -1349,27 +1853,13 @@ export default function PositionsPanel({
 
     const filteredPositionHistory = useMemo(() => {
         return [...historyEntries]
-            .filter((entry) => positionHistoryMatchesFilter(entry, tradeFilter))
+            .filter((entry) => historyMatchesFilter(entry, tradeFilter))
             .sort((a, b) => {
                 const aTime = new Date(a?.timestamp || a?.tradeDate || 0).getTime();
                 const bTime = new Date(b?.timestamp || b?.tradeDate || 0).getTime();
                 return bTime - aTime;
             });
     }, [historyEntries, tradeFilter]);
-
-    const openTradesById = useMemo(() => {
-        const map = {};
-
-        filteredOpenTrades.forEach((trade) => {
-            const tradeId = cleanString(trade?.tradeId);
-
-            if (tradeId) {
-                map[tradeId] = trade;
-            }
-        });
-
-        return map;
-    }, [filteredOpenTrades]);
 
     const totalOpenQty = useMemo(() => {
         return filteredPositions.reduce((sum, position) => {
@@ -1383,27 +1873,46 @@ export default function PositionsPanel({
         }, 0);
     }, [filteredPositions]);
 
+    const totalUnrealizedPnl = useMemo(() => {
+        return filteredPositions.reduce((sum, position) => {
+            return sum + toNumber(position?.unrealizedPnL, 0);
+        }, 0);
+    }, [filteredPositions]);
+
     const totalHistoryPnl = useMemo(() => {
         return filteredPositionHistory.reduce((sum, entry) => {
             return sum + toNumber(entry?.pnl, 0);
         }, 0);
     }, [filteredPositionHistory]);
 
+    const hasSnapshotIdentity = hasLiveAtasIdentity(liveSnapshot);
+
     const lastActivityTime = useMemo(() => {
         return resolveLastActivityTime(
             filteredOpenTrades,
             filteredPositions,
-            filteredPositionHistory
+            filteredPositionHistory,
+            liveSnapshot
         );
-    }, [filteredOpenTrades, filteredPositions, filteredPositionHistory]);
+    }, [filteredOpenTrades, filteredPositions, filteredPositionHistory, liveSnapshot]);
 
     const symbolSummary = useMemo(() => {
         return resolveSymbolSummary(
             filteredOpenTrades,
             filteredPositions,
-            filteredPositionHistory
+            filteredPositionHistory,
+            liveSnapshot,
+            resolvedAccount,
+            displayContract
         );
-    }, [filteredOpenTrades, filteredPositions, filteredPositionHistory]);
+    }, [
+        filteredOpenTrades,
+        filteredPositions,
+        filteredPositionHistory,
+        liveSnapshot,
+        resolvedAccount,
+        displayContract,
+    ]);
 
     const statusLabel = forceAtasZeroState
         ? "Keine Positionsdaten"
@@ -1411,7 +1920,8 @@ export default function PositionsPanel({
             provider,
             fillCount,
             filteredPositions.length,
-            filteredPositionHistory.length
+            filteredPositionHistory.length,
+            hasSnapshotIdentity
         );
 
     const statusColor = forceAtasZeroState
@@ -1420,7 +1930,8 @@ export default function PositionsPanel({
             provider,
             fillCount,
             filteredPositions.length,
-            filteredPositionHistory.length
+            filteredPositionHistory.length,
+            hasSnapshotIdentity
         );
 
     const recentHistoryEntries = useMemo(() => {
@@ -1475,7 +1986,7 @@ export default function PositionsPanel({
                             lineHeight: 1.45,
                         }}
                     >
-                        Offene Positionen, offene Trades und Position History im gemeinsamen Fokus für den aktiven Account.
+                        Offene Positionen, ATAS Snapshot und Position History für den aktiven Account.
                     </div>
 
                     <div
@@ -1567,6 +2078,30 @@ export default function PositionsPanel({
                 </div>
 
                 <div style={summaryCardStyle}>
+                    <div style={summaryLabelStyle}>Signed Qty</div>
+                    <div
+                        style={{
+                            ...summaryValueStyle,
+                            color: totalSignedQty === 0 ? COLORS.text : COLORS.warning,
+                        }}
+                    >
+                        {formatNumber(totalSignedQty, 4)}
+                    </div>
+                </div>
+
+                <div style={summaryCardStyle}>
+                    <div style={summaryLabelStyle}>Unrealized PnL</div>
+                    <div
+                        style={{
+                            ...summaryValueStyle,
+                            color: resolvePnlColor(totalUnrealizedPnl),
+                        }}
+                    >
+                        {formatSignedCurrency(totalUnrealizedPnl)}
+                    </div>
+                </div>
+
+                <div style={summaryCardStyle}>
                     <div style={summaryLabelStyle}>History PnL</div>
                     <div
                         style={{
@@ -1574,7 +2109,7 @@ export default function PositionsPanel({
                             color: resolvePnlColor(totalHistoryPnl),
                         }}
                     >
-                        {formatNumber(totalHistoryPnl, 2)}
+                        {formatSignedCurrency(totalHistoryPnl)}
                     </div>
                 </div>
             </div>
@@ -1632,7 +2167,7 @@ export default function PositionsPanel({
                                         marginTop: 4,
                                     }}
                                 >
-                                    Symbol, Side, Qty, Avg Price, Opened und Trade ID im Hauptfokus
+                                    ATAS Snapshot zeigt Positionen, sobald positionQty nicht 0 ist.
                                 </div>
                             </div>
 
@@ -1647,13 +2182,13 @@ export default function PositionsPanel({
                                     Provider {providerLabel}
                                 </span>
                                 <span style={tableMetaPillStyle}>
-                                    Fills {formatInteger(fillCount)}
+                                    Live Fills {formatInteger(fillCount)}
                                 </span>
                                 <span style={tableMetaPillStyle}>
                                     Signed Qty {formatNumber(totalSignedQty, 4)}
                                 </span>
                                 <span style={tableMetaPillStyle}>
-                                    History Rows {formatInteger(filteredPositionHistory.length)}
+                                    Symbol {symbolSummary}
                                 </span>
                             </div>
                         </div>
@@ -1666,7 +2201,9 @@ export default function PositionsPanel({
                                     fontSize: 14,
                                 }}
                             >
-                                Keine offenen Positionen für den aktuellen Filter gefunden.
+                                {normalizeProvider(provider) === "atas"
+                                    ? "Keine offene ATAS Position. Snapshot ist aktiv, positionQty steht aktuell auf 0."
+                                    : "Keine offenen Positionen für den aktuellen Filter gefunden."}
                             </div>
                         ) : (
                             <div
@@ -1681,29 +2218,23 @@ export default function PositionsPanel({
                                         minWidth: 980,
                                     }}
                                 >
-                                    <thead
-                                        style={{
-                                            background: COLORS.tableHead,
-                                        }}
-                                    >
+                                    <thead style={{ background: COLORS.tableHead }}>
                                         <tr>
                                             <th style={headerCellStyle}>Symbol</th>
                                             <th style={headerCellStyle}>Side</th>
                                             <th style={headerCellStyle}>Qty</th>
                                             <th style={headerCellStyle}>Signed Qty</th>
                                             <th style={headerCellStyle}>Ø Price</th>
+                                            <th style={headerCellStyle}>Unrealized</th>
                                             <th style={headerCellStyle}>Opened</th>
                                             <th style={headerCellStyle}>Trade ID</th>
-                                            <th style={headerCellStyle}>Entry Qty</th>
-                                            <th style={headerCellStyle}>Closed Qty</th>
+                                            <th style={headerCellStyle}>Quelle</th>
                                         </tr>
                                     </thead>
 
                                     <tbody>
                                         {filteredPositions.map((position, index) => {
                                             const sideColor = getSideColor(position?.side);
-                                            const linkedTrade =
-                                                openTradesById[cleanString(position?.tradeId)] || null;
 
                                             return (
                                                 <tr
@@ -1744,6 +2275,16 @@ export default function PositionsPanel({
                                                         {formatNumber(position?.avgPrice, 4)}
                                                     </td>
 
+                                                    <td
+                                                        style={{
+                                                            ...bodyCellStyle,
+                                                            color: resolvePnlColor(position?.unrealizedPnL),
+                                                            fontWeight: 700,
+                                                        }}
+                                                    >
+                                                        {formatSignedCurrency(position?.unrealizedPnL)}
+                                                    </td>
+
                                                     <td style={bodyCellStyle}>
                                                         {formatDateTime(position?.openedAt)}
                                                     </td>
@@ -1755,15 +2296,7 @@ export default function PositionsPanel({
                                                     </td>
 
                                                     <td style={bodyCellStyle}>
-                                                        {linkedTrade
-                                                            ? formatNumber(linkedTrade?.entryQty, 4)
-                                                            : "–"}
-                                                    </td>
-
-                                                    <td style={bodyCellStyle}>
-                                                        {linkedTrade
-                                                            ? formatNumber(linkedTrade?.closedQty, 4)
-                                                            : "–"}
+                                                        {position?.source || "snapshot"}
                                                     </td>
                                                 </tr>
                                             );
@@ -1812,7 +2345,7 @@ export default function PositionsPanel({
                                         marginTop: 4,
                                     }}
                                 >
-                                    Timestamp, Contract, Product, Net Pos, Paired Qty und PnL im Hauptfokus
+                                    Position History aus CSV, Live Snapshot oder ATAS Daten.
                                 </div>
                             </div>
 
@@ -1830,7 +2363,7 @@ export default function PositionsPanel({
                                     Datei {positionHistoryData?.fileName || "keine"}
                                 </span>
                                 <span style={tableMetaPillStyle}>
-                                    PnL {formatNumber(totalHistoryPnl, 2)}
+                                    PnL {formatSignedCurrency(totalHistoryPnl)}
                                 </span>
                             </div>
                         </div>
@@ -1846,11 +2379,7 @@ export default function PositionsPanel({
                                 Keine Position History für den aktuellen Filter gefunden.
                             </div>
                         ) : (
-                            <div
-                                style={{
-                                    overflowX: "auto",
-                                }}
-                            >
+                            <div style={{ overflowX: "auto" }}>
                                 <table
                                     style={{
                                         width: "100%",
@@ -1858,11 +2387,7 @@ export default function PositionsPanel({
                                         minWidth: 980,
                                     }}
                                 >
-                                    <thead
-                                        style={{
-                                            background: COLORS.tableHead,
-                                        }}
-                                    >
+                                    <thead style={{ background: COLORS.tableHead }}>
                                         <tr>
                                             <th style={headerCellStyle}>Timestamp</th>
                                             <th style={headerCellStyle}>Contract</th>
@@ -1925,7 +2450,7 @@ export default function PositionsPanel({
                                                         fontWeight: 700,
                                                     }}
                                                 >
-                                                    {formatNumber(entry?.pnl, 2)}
+                                                    {formatSignedCurrency(entry?.pnl)}
                                                 </td>
 
                                                 <td style={bodyCellStyle}>
@@ -2033,7 +2558,7 @@ export default function PositionsPanel({
                             </div>
 
                             <div style={metaRowStyle}>
-                                <span style={metaKeyStyle}>Fills gesamt</span>
+                                <span style={metaKeyStyle}>Live Fills</span>
                                 <span style={metaValueStyle}>{formatInteger(fillCount)}</span>
                             </div>
 
@@ -2056,12 +2581,7 @@ export default function PositionsPanel({
                     <div style={sideCardStyle}>
                         <div style={sideCardTitleStyle}>Live Fokus</div>
 
-                        <div
-                            style={{
-                                display: "grid",
-                                gap: 10,
-                            }}
-                        >
+                        <div style={{ display: "grid", gap: 10 }}>
                             <div style={statusRowCardStyle}>
                                 <div style={statusRowHeadStyle}>
                                     <span style={statusRowLabelStyle}>Offene Positionen</span>
@@ -2100,18 +2620,18 @@ export default function PositionsPanel({
 
                             <div style={statusRowCardStyle}>
                                 <div style={statusRowHeadStyle}>
-                                    <span style={statusRowLabelStyle}>History PnL</span>
+                                    <span style={statusRowLabelStyle}>Unrealized PnL</span>
                                     <span
                                         style={{
                                             ...statusRowValueStyle,
-                                            color: resolvePnlColor(totalHistoryPnl),
+                                            color: resolvePnlColor(totalUnrealizedPnl),
                                         }}
                                     >
-                                        {formatNumber(totalHistoryPnl, 2)}
+                                        {formatSignedCurrency(totalUnrealizedPnl)}
                                     </span>
                                 </div>
                                 <div style={statusRowSubTextStyle}>
-                                    Gefilterte Position History
+                                    Aus ATAS Snapshot oder Live Positionen
                                 </div>
                             </div>
                         </div>
@@ -2130,12 +2650,7 @@ export default function PositionsPanel({
                                 Keine offenen Trades vorhanden.
                             </div>
                         ) : (
-                            <div
-                                style={{
-                                    display: "grid",
-                                    gap: 10,
-                                }}
-                            >
+                            <div style={{ display: "grid", gap: 10 }}>
                                 {filteredOpenTrades.slice(0, 5).map((trade) => (
                                     <OpenTradeCard
                                         key={trade?.tradeId || `${trade?.symbol}_${trade?.entryTime}`}
@@ -2160,12 +2675,7 @@ export default function PositionsPanel({
                                 Keine History Aktivität vorhanden.
                             </div>
                         ) : (
-                            <div
-                                style={{
-                                    display: "grid",
-                                    gap: 10,
-                                }}
-                            >
+                            <div style={{ display: "grid", gap: 10 }}>
                                 {recentHistoryEntries.map((entry, index) => (
                                     <div
                                         key={entry?.id || `${entry?.positionId}_${index}`}
@@ -2197,7 +2707,7 @@ export default function PositionsPanel({
                                                     flexShrink: 0,
                                                 }}
                                             >
-                                                {formatNumber(entry?.pnl, 2)}
+                                                {formatSignedCurrency(entry?.pnl)}
                                             </span>
                                         </div>
 

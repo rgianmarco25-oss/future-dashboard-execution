@@ -141,6 +141,278 @@ function getStartingBalanceFromHistory(rows) {
     return 0
 }
 
+function normalizeAccountText(value) {
+    return cleanString(value).toUpperCase().replace(/\s+/g, "")
+}
+
+function isReplayAccountText(value) {
+    return normalizeAccountText(value).includes("REPLAY")
+}
+
+function isPaAccountText(value) {
+    const text = normalizeAccountText(value)
+
+    return (
+        text.startsWith("PA-APEX") ||
+        text.startsWith("PA_APEX") ||
+        text.startsWith("PAAPEX")
+    )
+}
+
+function isEvalAccountText(value) {
+    const text = normalizeAccountText(value)
+
+    return (
+        text.startsWith("APEX-") ||
+        text.startsWith("APEX_") ||
+        text.startsWith("APEX")
+    )
+}
+
+function hasIntradayText(value) {
+    const text = normalizeAccountText(value)
+
+    return (
+        text.includes("INTRADAY") ||
+        text.includes("INTRA") ||
+        text.includes("PAINTRADAY") ||
+        text.includes("EVALINTRADAY")
+    )
+}
+
+function hasEodText(value) {
+    const text = normalizeAccountText(value)
+
+    return (
+        text.includes("EOD") ||
+        text.includes("ENDOFDAY") ||
+        text.includes("END_OF_DAY")
+    )
+}
+
+function detectAccountSizeFromText(value) {
+    const text = normalizeAccountText(value)
+
+    if (!text) {
+        return 0
+    }
+
+    if (/(^|[^0-9])150K([^0-9]|$)/i.test(text) || text.includes("150000")) {
+        return 150000
+    }
+
+    if (/(^|[^0-9])100K([^0-9]|$)/i.test(text) || text.includes("100000")) {
+        return 100000
+    }
+
+    if (/(^|[^0-9])50K([^0-9]|$)/i.test(text) || text.includes("50000")) {
+        return 50000
+    }
+
+    if (/(^|[^0-9])25K([^0-9]|$)/i.test(text) || text.includes("25000")) {
+        return 25000
+    }
+
+    return 0
+}
+
+function detectAccountSizeFromBalance(value) {
+    const balance = toNumber(value, 0)
+
+    if (balance <= 0) {
+        return 0
+    }
+
+    const sizes = [25000, 50000, 100000, 150000]
+
+    let bestSize = 0
+    let bestDistance = Number.POSITIVE_INFINITY
+
+    sizes.forEach((size) => {
+        const distance = Math.abs(balance - size)
+
+        if (distance < bestDistance) {
+            bestDistance = distance
+            bestSize = size
+        }
+    })
+
+    return bestSize
+}
+
+function resolveAccountSize(account, snapshot, accountRef, startingBalance, currentBalance) {
+    const textSize = detectAccountSizeFromText(
+        [
+            accountRef,
+            account?.displayName,
+            account?.tradingAccountId,
+            account?.tradingAccountName,
+            account?.dataProviderAccountId,
+            account?.dataProviderAccountName,
+            account?.atasAccountId,
+            account?.atasAccountName,
+            snapshot?.accountSize,
+            snapshot?.accountName,
+            snapshot?.accountId,
+        ].join(" ")
+    )
+
+    if (textSize > 0) {
+        return textSize
+    }
+
+    const directSize = toNumber(snapshot?.accountSize || account?.accountSize, 0)
+
+    if ([25000, 50000, 100000, 150000].includes(directSize)) {
+        return directSize
+    }
+
+    const balanceSize = detectAccountSizeFromBalance(
+        currentBalance || startingBalance || snapshot?.balance || account?.currentBalance
+    )
+
+    if (balanceSize > 0) {
+        return balanceSize
+    }
+
+    return 50000
+}
+
+function resolveProviderAccountRef(account, snapshot = {}, options = {}) {
+    return cleanString(
+        snapshot.atasAccountId ||
+        snapshot.dataProviderAccountId ||
+        snapshot.accountId ||
+        snapshot.accountName ||
+        options.atasAccountId ||
+        options.atasAccountName ||
+        account?.atasAccountId ||
+        account?.dataProviderAccountId ||
+        account?.tradingAccountId ||
+        account?.displayName ||
+        account?.id
+    )
+}
+
+function resolveProviderAccountName(account, snapshot = {}, options = {}) {
+    return cleanString(
+        snapshot.atasAccountName ||
+        snapshot.dataProviderAccountName ||
+        snapshot.accountName ||
+        snapshot.accountId ||
+        options.atasAccountName ||
+        options.atasAccountId ||
+        account?.atasAccountName ||
+        account?.dataProviderAccountName ||
+        account?.tradingAccountName ||
+        account?.displayName ||
+        account?.id
+    )
+}
+
+function resolveAccountStatus(account, accountPhase, isReplay) {
+    const currentStatus = cleanString(account?.accountStatus).toLowerCase()
+
+    if (
+        currentStatus === "passed" ||
+        currentStatus === "failed" ||
+        currentStatus === "archived"
+    ) {
+        return currentStatus
+    }
+
+    if (isReplay) {
+        return currentStatus || "open"
+    }
+
+    if (accountPhase === "pa") {
+        return currentStatus || "active"
+    }
+
+    return currentStatus || "open"
+}
+
+function inferAtasAccountProfile(account, snapshot = {}, options = {}) {
+    const providerRef = resolveProviderAccountRef(account, snapshot, options)
+    const providerName = resolveProviderAccountName(account, snapshot, options)
+    const fallbackRef = providerRef || providerName || cleanString(account?.id)
+    const joinedText = [
+        providerRef,
+        providerName,
+        account?.displayName,
+        account?.tradingAccountId,
+        account?.tradingAccountName,
+        account?.dataProviderAccountId,
+        account?.dataProviderAccountName,
+        account?.atasAccountId,
+        account?.atasAccountName,
+    ].join(" ")
+
+    const replay = isReplayAccountText(joinedText)
+    const pa = isPaAccountText(joinedText)
+    const evalAccount = isEvalAccountText(joinedText)
+
+    let accountPhase = cleanString(account?.accountPhase).toLowerCase()
+    let productType = cleanString(account?.productType).toLowerCase()
+
+    if (pa) {
+        accountPhase = "pa"
+    } else if (evalAccount || replay) {
+        accountPhase = "eval"
+    } else if (accountPhase !== "pa" && accountPhase !== "eval") {
+        accountPhase = "eval"
+    }
+
+    if (hasIntradayText(joinedText)) {
+        productType = "intraday"
+    } else if (hasEodText(joinedText)) {
+        productType = "eod"
+    } else if (evalAccount || pa || replay) {
+        productType = "eod"
+    } else if (productType !== "eod" && productType !== "intraday") {
+        productType = "eod"
+    }
+
+    const startingBalance = toNumber(
+        snapshot.startingBalance ||
+        snapshot.balance ||
+        snapshot.currentBalance ||
+        account?.startingBalance,
+        0
+    )
+
+    const currentBalance = toNumber(
+        snapshot.currentBalance ||
+        snapshot.balance ||
+        account?.currentBalance,
+        startingBalance
+    )
+
+    const accountSize = resolveAccountSize(
+        account,
+        snapshot,
+        fallbackRef,
+        startingBalance,
+        currentBalance
+    )
+
+    const tradingRef = fallbackRef
+    const displayName = replay ? "Replay" : tradingRef
+
+    return {
+        replay,
+        accountPhase,
+        productType,
+        accountStatus: resolveAccountStatus(account, accountPhase, replay),
+        accountSize,
+        displayName,
+        providerRef: tradingRef,
+        providerName: providerName || tradingRef,
+        tradingAccountId: tradingRef,
+        tradingAccountName: tradingRef,
+    }
+}
+
 function getWorkingOrderCount(orders) {
     return toArray(orders).filter((order) => {
         const status = cleanString(
@@ -410,33 +682,30 @@ function buildFallbackMockSnapshot(account, options = {}) {
     const balanceHistory = buildMockBalanceHistory(account)
     const startingBalance = getStartingBalanceFromHistory(balanceHistory) || 25000
     const currentBalance = getLatestBalanceFromHistory(balanceHistory) || startingBalance
+    const profile = inferAtasAccountProfile(
+        account,
+        {
+            startingBalance,
+            currentBalance,
+            balance: currentBalance,
+        },
+        options
+    )
 
     return {
         dataProvider: "atas",
         dataProviderType: "desktop",
         dataProviderStatus: "connected",
-        atasAccountId: cleanString(
-            options.atasAccountId ||
-            account?.atasAccountId ||
-            account?.dataProviderAccountId ||
-            account?.displayName ||
-            account?.id
-        ),
-        atasAccountName: cleanString(
-            options.atasAccountName ||
-            account?.atasAccountName ||
-            account?.dataProviderAccountName ||
-            account?.displayName
-        ),
-        tradingAccountId: cleanString(
-            account?.tradingAccountId ||
-            account?.tradovateAccountId
-        ),
-        tradingAccountName: cleanString(
-            account?.tradingAccountName ||
-            account?.tradovateAccountName ||
-            account?.displayName
-        ),
+        displayName: profile.displayName,
+        accountPhase: profile.accountPhase,
+        productType: profile.productType,
+        accountStatus: profile.accountStatus,
+        atasAccountId: profile.providerRef,
+        atasAccountName: profile.providerName,
+        dataProviderAccountId: profile.providerRef,
+        dataProviderAccountName: profile.providerName,
+        tradingAccountId: profile.tradingAccountId,
+        tradingAccountName: profile.tradingAccountName,
         lastSyncAt,
         orders,
         fills,
@@ -444,7 +713,7 @@ function buildFallbackMockSnapshot(account, options = {}) {
         startingBalance,
         currentBalance,
         balance: currentBalance,
-        accountSize: toNumber(account?.accountSize, startingBalance),
+        accountSize: profile.accountSize,
         openOrderCount: getWorkingOrderCount(orders),
         openPositionCount: 0,
         dailyState: {
@@ -456,7 +725,7 @@ function buildFallbackMockSnapshot(account, options = {}) {
             dailyPnL: currentBalance - startingBalance,
             realizedPnL: currentBalance - startingBalance,
             unrealizedPnL: 0,
-            drawdownLimit: toNumber(account?.startingBalance, startingBalance) - 1000,
+            drawdownLimit: profile.accountSize - 1000,
             maxDailyLoss: 500,
             openOrderCount: getWorkingOrderCount(orders),
             openPositionCount: 0,
@@ -478,14 +747,12 @@ function unwrapAdapterResult(result) {
 
 function resolveAdapterSyncFunction() {
     const candidates = [
-        atasAdapter.syncAtasAccount,
-        atasAdapter.runAtasSync,
-        atasAdapter.runSync,
         atasAdapter.syncAccount,
-        atasAdapter.getAtasSnapshot,
-        atasAdapter.readAtasSnapshot,
-        atasAdapter.buildMockAtasSnapshot,
-        atasAdapter.getMockAtasSnapshot,
+        atasAdapter.fetchAccountSnapshot,
+        atasAdapter.getAccountSnapshot,
+        atasAdapter.readAccountSnapshot,
+        atasAdapter.getMockSnapshot,
+        atasAdapter.buildMockSnapshot,
     ]
 
     return candidates.find((candidate) => typeof candidate === "function") || null
@@ -529,6 +796,7 @@ function normalizeAtasSnapshot(account, snapshot = {}, options = {}) {
     const lastSyncAt = cleanString(
         snapshot.lastSyncAt ||
         snapshot.syncedAt ||
+        snapshot.timestamp ||
         nowIso()
     )
 
@@ -545,6 +813,8 @@ function normalizeAtasSnapshot(account, snapshot = {}, options = {}) {
         getStartingBalanceFromHistory(balanceHistory) ||
         account?.startingBalance ||
         account?.accountSize ||
+        snapshot.balance ||
+        snapshot.currentBalance ||
         0
     )
 
@@ -555,13 +825,24 @@ function normalizeAtasSnapshot(account, snapshot = {}, options = {}) {
         startingBalance
     )
 
+    const profile = inferAtasAccountProfile(
+        account,
+        {
+            ...snapshot,
+            startingBalance,
+            currentBalance,
+            balance: currentBalance,
+        },
+        options
+    )
+
     const openOrderCount = toNumber(
         snapshot.openOrderCount,
         getWorkingOrderCount(orders)
     )
 
     const openPositionCount = toNumber(
-        snapshot.openPositionCount,
+        snapshot.openPositionCount ?? snapshot.positionQty,
         0
     )
 
@@ -569,32 +850,16 @@ function normalizeAtasSnapshot(account, snapshot = {}, options = {}) {
         dataProvider: "atas",
         dataProviderType: cleanString(snapshot.dataProviderType || "desktop") || "desktop",
         dataProviderStatus: "connected",
-        atasAccountId: cleanString(
-            snapshot.atasAccountId ||
-            snapshot.dataProviderAccountId ||
-            options.atasAccountId ||
-            account?.atasAccountId ||
-            account?.dataProviderAccountId
-        ),
-        atasAccountName: cleanString(
-            snapshot.atasAccountName ||
-            snapshot.dataProviderAccountName ||
-            options.atasAccountName ||
-            account?.atasAccountName ||
-            account?.dataProviderAccountName ||
-            account?.displayName
-        ),
-        tradingAccountId: cleanString(
-            snapshot.tradingAccountId ||
-            account?.tradingAccountId ||
-            account?.tradovateAccountId
-        ),
-        tradingAccountName: cleanString(
-            snapshot.tradingAccountName ||
-            account?.tradingAccountName ||
-            account?.tradovateAccountName ||
-            account?.displayName
-        ),
+        displayName: profile.displayName,
+        accountPhase: profile.accountPhase,
+        productType: profile.productType,
+        accountStatus: profile.accountStatus,
+        atasAccountId: profile.providerRef,
+        atasAccountName: profile.providerName,
+        dataProviderAccountId: profile.providerRef,
+        dataProviderAccountName: profile.providerName,
+        tradingAccountId: profile.tradingAccountId,
+        tradingAccountName: profile.tradingAccountName,
         lastSyncAt,
         orders,
         fills,
@@ -604,10 +869,12 @@ function normalizeAtasSnapshot(account, snapshot = {}, options = {}) {
         startingBalance,
         currentBalance,
         balance: currentBalance,
-        accountSize: toNumber(
-            snapshot.accountSize,
-            account?.accountSize || startingBalance
-        ),
+        accountSize: profile.accountSize,
+        symbol: cleanString(snapshot.symbol || snapshot.contract || snapshot.instrument),
+        positionQty: toNumber(snapshot.positionQty, openPositionCount),
+        avgPrice: toNumber(snapshot.avgPrice, 0),
+        realizedPnL: toNumber(snapshot.realizedPnL, 0),
+        unrealizedPnL: toNumber(snapshot.unrealizedPnL, 0),
         dailyState: {
             ...(snapshot.dailyState || {}),
             sessionKey: cleanString(
@@ -639,7 +906,7 @@ function normalizeAtasSnapshot(account, snapshot = {}, options = {}) {
             ),
             realizedPnL: toNumber(
                 snapshot?.dailyState?.realizedPnL ?? snapshot.realizedPnL,
-                currentBalance - startingBalance
+                toNumber(snapshot.realizedPnL, currentBalance - startingBalance)
             ),
             unrealizedPnL: toNumber(
                 snapshot?.dailyState?.unrealizedPnL ?? snapshot.unrealizedPnL,
@@ -698,6 +965,28 @@ function buildErrorMessage(error) {
     return "ATAS Sync Fehler."
 }
 
+function buildAccountUpdateFromSnapshot(snapshot) {
+    return {
+        displayName: snapshot.displayName,
+        accountPhase: snapshot.accountPhase,
+        productType: snapshot.productType,
+        accountStatus: snapshot.accountStatus,
+        accountSize: snapshot.accountSize,
+        dataProvider: "atas",
+        dataProviderType: "desktop",
+        dataProviderStatus: snapshot.dataProviderStatus || "connected",
+        dataProviderAccountId: snapshot.dataProviderAccountId,
+        dataProviderAccountName: snapshot.dataProviderAccountName,
+        atasAccountId: snapshot.atasAccountId,
+        atasAccountName: snapshot.atasAccountName,
+        tradingAccountId: snapshot.tradingAccountId,
+        tradingAccountName: snapshot.tradingAccountName,
+        currentBalance: snapshot.currentBalance,
+        startingBalance: snapshot.startingBalance,
+        lastSyncAt: snapshot.lastSyncAt,
+    }
+}
+
 export async function syncAtasAccount(accountId, options = {}) {
     const safeAccountId = cleanString(accountId)
 
@@ -722,22 +1011,23 @@ export async function syncAtasAccount(accountId, options = {}) {
     }
 
     const syncStartedAt = nowIso()
+    const startingProfile = inferAtasAccountProfile(account, {}, options)
 
     updateAccount(safeAccountId, {
+        displayName: startingProfile.displayName,
+        accountPhase: startingProfile.accountPhase,
+        productType: startingProfile.productType,
+        accountStatus: startingProfile.accountStatus,
+        accountSize: startingProfile.accountSize,
         dataProvider: "atas",
         dataProviderType: "desktop",
         dataProviderStatus: "syncing",
-        dataProviderAccountId: cleanString(
-            options.atasAccountId ||
-            account?.atasAccountId ||
-            account?.dataProviderAccountId
-        ),
-        dataProviderAccountName: cleanString(
-            options.atasAccountName ||
-            account?.atasAccountName ||
-            account?.dataProviderAccountName ||
-            account?.displayName
-        ),
+        dataProviderAccountId: startingProfile.providerRef,
+        dataProviderAccountName: startingProfile.providerName,
+        atasAccountId: startingProfile.providerRef,
+        atasAccountName: startingProfile.providerName,
+        tradingAccountId: startingProfile.tradingAccountId,
+        tradingAccountName: startingProfile.tradingAccountName,
         lastSyncAt: syncStartedAt,
     })
 
@@ -745,7 +1035,9 @@ export async function syncAtasAccount(accountId, options = {}) {
         const rawSnapshot = await readSnapshotFromAdapter(account, options)
         const normalizedSnapshot = normalizeAtasSnapshot(account, rawSnapshot, options)
 
+        updateAccount(safeAccountId, buildAccountUpdateFromSnapshot(normalizedSnapshot))
         saveProviderSyncSnapshot(safeAccountId, normalizedSnapshot, "atas")
+        updateAccount(safeAccountId, buildAccountUpdateFromSnapshot(normalizedSnapshot))
 
         const liveSnapshot = getLiveAccountSnapshot(safeAccountId)
 

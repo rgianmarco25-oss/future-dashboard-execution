@@ -1,5 +1,13 @@
 import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as atasSyncUtils from "./utils/atasSync";
+import {
+    ATAS_BRIDGE_ACCOUNTS_EVENT,
+    ATAS_BRIDGE_STATUS_EVENT,
+    resetAtasBridgePollingState,
+    startAtasBridgePolling,
+    stopAtasBridgePolling,
+} from "./utils/atasBridgeSync";
+
 import Dashboard from "./pages/Dashboard";
 import { getRiskStatusForAccount } from "./utils/accountRiskStatus";
 import {
@@ -36,6 +44,7 @@ import {
     setActiveAccountId as persistActiveAccountId,
     subscribeStorage,
     unlinkEvalFromPaAccount,
+    updateAccount,
 } from "./utils/storage";
 
 const IS_DEV = import.meta.env.DEV;
@@ -56,20 +65,20 @@ const SHELL_GAP = 10;
 
 const DASHBOARD_VIEWS = IS_DEV
     ? [
-        { key: "overview", label: "Übersicht" },
-        { key: "balance", label: "Balance" },
-        { key: "accounts", label: "Accounts" },
-        { key: "trades", label: "Trades" },
-        { key: "analysis", label: "Analyse" },
-        { key: "imports", label: "Import" },
-    ]
+          { key: "overview", label: "Übersicht" },
+          { key: "balance", label: "Balance" },
+          { key: "accounts", label: "Accounts" },
+          { key: "trades", label: "Trades" },
+          { key: "analysis", label: "Analyse" },
+          { key: "imports", label: "Import" },
+      ]
     : [
-        { key: "overview", label: "Übersicht" },
-        { key: "balance", label: "Balance" },
-        { key: "accounts", label: "Accounts" },
-        { key: "trades", label: "Trades" },
-        { key: "imports", label: "Import" },
-    ];
+          { key: "overview", label: "Übersicht" },
+          { key: "balance", label: "Balance" },
+          { key: "accounts", label: "Accounts" },
+          { key: "trades", label: "Trades" },
+          { key: "imports", label: "Import" },
+      ];
 
 const SIDEBAR_SECTIONS = [
     {
@@ -200,17 +209,44 @@ function toNumber(value, fallback = 0) {
         return fallback;
     }
 
-    const normalized = text.includes(",") && text.includes(".")
-        ? text.lastIndexOf(",") > text.lastIndexOf(".")
-            ? text.replace(/\./g, "").replace(/,/g, ".")
-            : text.replace(/,/g, "")
-        : text.includes(",")
-            ? text.replace(/,/g, ".")
-            : text;
+    const normalized =
+        text.includes(",") && text.includes(".")
+            ? text.lastIndexOf(",") > text.lastIndexOf(".")
+                ? text.replace(/\./g, "").replace(/,/g, ".")
+                : text.replace(/,/g, "")
+            : text.includes(",")
+                ? text.replace(/,/g, ".")
+                : text;
 
     const parsed = Number(normalized);
 
     return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function toBoolean(value, fallback = false) {
+    if (typeof value === "boolean") {
+        return value;
+    }
+
+    if (typeof value === "number") {
+        return value !== 0;
+    }
+
+    const text = cleanString(value).toLowerCase();
+
+    if (!text) {
+        return fallback;
+    }
+
+    if (["true", "yes", "ja", "1", "reached", "erreicht", "passed"].includes(text)) {
+        return true;
+    }
+
+    if (["false", "no", "nein", "0", "offen", "open"].includes(text)) {
+        return false;
+    }
+
+    return fallback;
 }
 
 function formatCurrency(value) {
@@ -246,6 +282,24 @@ function formatDateTime(value) {
     }).format(date);
 }
 
+function formatDateOnly(value) {
+    if (!value) {
+        return "–";
+    }
+
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) {
+        return cleanString(value) || "–";
+    }
+
+    return new Intl.DateTimeFormat("de-CH", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+    }).format(date);
+}
+
 function createLocalId() {
     if (typeof crypto !== "undefined" && crypto.randomUUID) {
         return crypto.randomUUID();
@@ -265,11 +319,15 @@ function normalizePhaseLabel(value) {
 function normalizeProductTypeValue(value) {
     const raw = cleanString(value).toLowerCase();
 
+    if (raw.includes("intraday") || raw.includes("intra")) {
+        return "intraday";
+    }
+
     if (raw.includes("eod")) {
         return "eod";
     }
 
-    return "intraday";
+    return "eod";
 }
 
 function normalizeProductTypeLabel(value) {
@@ -306,10 +364,7 @@ function getInitialProviderView() {
         return "";
     }
 
-    const saved = cleanString(
-        window.localStorage.getItem(STORAGE_PROVIDER_VIEW_KEY)
-    );
-
+    const saved = cleanString(window.localStorage.getItem(STORAGE_PROVIDER_VIEW_KEY));
     return saved ? normalizeDataProvider(saved) : "";
 }
 
@@ -330,7 +385,6 @@ function persistProviderView(provider) {
         normalizeDataProvider(next)
     );
 }
-
 function normalizeMatchText(value) {
     return cleanString(value).toLowerCase().replace(/[^a-z0-9]/g, "");
 }
@@ -360,6 +414,7 @@ function buildAccountMatchKeys(account) {
 
     return [...new Set(rawKeys.map(normalizeMatchText).filter(Boolean))];
 }
+
 function hasSameAccountShape(leftAccount, rightAccount) {
     if (!leftAccount || !rightAccount) {
         return false;
@@ -439,20 +494,20 @@ function decorateAccountWithDataProvider(account) {
 
     const provider = normalizeDataProvider(
         account?.dataProvider ||
-        account?.source?.provider ||
-        "tradovate"
+            account?.source?.provider ||
+            "tradovate"
     );
 
     const type = normalizeDataProviderType(
         account?.dataProviderType ||
-        account?.source?.type,
+            account?.source?.type,
         provider
     );
 
     const defaultStatus = provider === "atas" ? "disconnected" : "ready";
     const status = normalizeDataProviderStatus(
         account?.dataProviderStatus ||
-        account?.source?.status,
+            account?.source?.status,
         defaultStatus
     );
 
@@ -460,25 +515,25 @@ function decorateAccountWithDataProvider(account) {
 
     const tradovateAccountId = cleanString(
         account?.tradovateAccountId ||
-        account?.tradingAccountId ||
-        account?.apexId ||
-        account?.accountId
+            account?.tradingAccountId ||
+            account?.apexId ||
+            account?.accountId
     );
 
     const tradovateAccountName = cleanString(
         account?.tradovateAccountName ||
-        account?.tradingAccountName ||
-        tradovateAccountId
+            account?.tradingAccountName ||
+            tradovateAccountId
     );
 
     const atasAccountId = cleanString(
         account?.atasAccountId ||
-        (sourceProvider === "atas" ? account?.source?.accountId : "")
+            (sourceProvider === "atas" ? account?.source?.accountId : "")
     );
 
     const atasAccountName = cleanString(
         account?.atasAccountName ||
-        (sourceProvider === "atas" ? account?.source?.accountName : "")
+            (sourceProvider === "atas" ? account?.source?.accountName : "")
     );
 
     const strictSourceAccountId =
@@ -526,10 +581,7 @@ function decorateAccountWithDataProvider(account) {
             status,
             accountId: strictSourceAccountId,
             accountName: strictSourceAccountName,
-            lastSyncAt: cleanString(
-                account?.lastSyncAt ||
-                source?.lastSyncAt
-            ),
+            lastSyncAt: cleanString(account?.lastSyncAt || source?.lastSyncAt),
         },
     };
 }
@@ -541,8 +593,8 @@ function getAccountProvider(account) {
 
     return normalizeDataProvider(
         account?.dataProvider ||
-        account?.source?.provider ||
-        "tradovate"
+            account?.source?.provider ||
+            "tradovate"
     );
 }
 
@@ -754,6 +806,180 @@ function getRiskColors(state) {
         border: "rgba(148, 163, 184, 0.20)",
         text: "#cbd5e1",
         label: "Neutral",
+    };
+}
+
+function normalizeRuleStatusState(value) {
+    const text = cleanString(value).toLowerCase();
+
+    if (
+        text.includes("bestanden") ||
+        text.includes("passed") ||
+        text.includes("success") ||
+        text.includes("target_reached") ||
+        text.includes("passed_possible")
+    ) {
+        return "green";
+    }
+
+    if (
+        text.includes("abgelaufen") ||
+        text.includes("expired") ||
+        text.includes("failed") ||
+        text.includes("fail")
+    ) {
+        return "red";
+    }
+
+    if (
+        text.includes("warn") ||
+        text.includes("gelb") ||
+        text.includes("warning")
+    ) {
+        return "yellow";
+    }
+
+    if (
+        text.includes("aktiv") ||
+        text.includes("active") ||
+        text.includes("open") ||
+        text.includes("running")
+    ) {
+        return "blue";
+    }
+
+    return "neutral";
+}
+
+function getRuleStatusColors(state) {
+    if (state === "green") {
+        return {
+            dot: COLORS.green,
+            bg: "rgba(34, 197, 94, 0.12)",
+            border: "rgba(34, 197, 94, 0.26)",
+            text: "#bbf7d0",
+        };
+    }
+
+    if (state === "red") {
+        return {
+            dot: COLORS.red,
+            bg: "rgba(239, 68, 68, 0.12)",
+            border: "rgba(239, 68, 68, 0.28)",
+            text: "#fecaca",
+        };
+    }
+
+    if (state === "yellow") {
+        return {
+            dot: COLORS.yellow,
+            bg: "rgba(245, 158, 11, 0.12)",
+            border: "rgba(245, 158, 11, 0.28)",
+            text: "#fde68a",
+        };
+    }
+
+    if (state === "blue") {
+        return {
+            dot: COLORS.cyan,
+            bg: "rgba(34, 211, 238, 0.12)",
+            border: "rgba(34, 211, 238, 0.28)",
+            text: "#cffafe",
+        };
+    }
+
+    return {
+        dot: COLORS.textSoft,
+        bg: "rgba(148, 163, 184, 0.10)",
+        border: "rgba(148, 163, 184, 0.20)",
+        text: "#cbd5e1",
+    };
+}
+function buildHeaderRuleMeta(account, snapshot = null, zeroState = false) {
+    if (!account || zeroState) {
+        return {
+            label: "Status offen",
+            state: "neutral",
+            colors: getRuleStatusColors("neutral"),
+            targetBalance: 0,
+            targetReached: false,
+            accessExpired: false,
+            accessStartDate: "",
+            accessEndDate: "",
+        };
+    }
+
+    const centralStatus = cleanString(
+        snapshot?.computedRuleStatus ??
+            account?.computedRuleStatus ??
+            ""
+    );
+
+    const centralLabel = cleanString(
+        snapshot?.computedRuleStatusLabel ??
+            account?.computedRuleStatusLabel ??
+            ""
+    );
+
+    const statusText = `${centralStatus} ${centralLabel}`.toLowerCase();
+
+    const targetReached =
+        toBoolean(snapshot?.targetReached ?? account?.targetReached, false) ||
+        statusText.includes("target_reached") ||
+        statusText.includes("passed_possible") ||
+        statusText.includes("bestanden möglich");
+
+    const accessExpired =
+        toBoolean(snapshot?.accessExpired ?? account?.accessExpired, false) ||
+        statusText.includes("expired") ||
+        statusText.includes("zeit abgelaufen") ||
+        statusText.includes("abgelaufen");
+
+    const targetBalance = toNumber(
+        snapshot?.targetBalance ??
+            account?.targetBalance ??
+            snapshot?.ruleTargetBalance ??
+            account?.ruleTargetBalance,
+        0
+    );
+
+    const accessStartDate = cleanString(
+        snapshot?.accessStartDate ||
+            account?.accessStartDate ||
+            account?.startDate ||
+            ""
+    );
+
+    const accessEndDate = cleanString(
+        snapshot?.accessEndDate ||
+            account?.accessEndDate ||
+            account?.endDate ||
+            ""
+    );
+
+    const fallbackLabel = accessExpired
+        ? "Zeit abgelaufen"
+        : targetReached
+            ? "Bestanden möglich"
+            : "Aktiv";
+
+    const label = centralLabel || fallbackLabel;
+
+    const state = accessExpired
+        ? "red"
+        : targetReached
+            ? "green"
+            : normalizeRuleStatusState(centralStatus || label);
+
+    return {
+        label,
+        state,
+        colors: getRuleStatusColors(state),
+        targetBalance,
+        targetReached,
+        accessExpired,
+        accessStartDate,
+        accessEndDate,
     };
 }
 
@@ -1041,6 +1267,7 @@ function useViewportWidth() {
 
     return viewportWidth;
 }
+
 function toDateOrNull(value) {
     if (value instanceof Date && !Number.isNaN(value.getTime())) {
         return value;
@@ -1082,7 +1309,6 @@ function toDateOrNull(value) {
 
     return Number.isNaN(date.getTime()) ? null : date;
 }
-
 function buildFlexibleSource(source) {
     const map = {};
 
@@ -1106,17 +1332,30 @@ function buildFlexibleSource(source) {
 }
 
 function pickFlexibleValue(source, keys) {
-    for (const key of keys) {
-        const normalizedKey = cleanString(key).toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (!source || typeof source !== "object") {
+        return "";
+    }
 
-        if (!normalizedKey) {
+    if (!Array.isArray(keys)) {
+        return "";
+    }
+
+    for (const key of keys) {
+        if (!key) {
             continue;
         }
 
-        const value = source[normalizedKey];
+        const directValue = source[key];
 
-        if (value !== undefined && value !== null && value !== "") {
-            return value;
+        if (directValue !== undefined && directValue !== null && String(directValue).trim() !== "") {
+            return directValue;
+        }
+
+        const normalizedKey = cleanString(key).toLowerCase().replace(/[^a-z0-9]/g, "");
+        const mappedValue = source[normalizedKey];
+
+        if (mappedValue !== undefined && mappedValue !== null && String(mappedValue).trim() !== "") {
+            return mappedValue;
         }
     }
 
@@ -1218,9 +1457,7 @@ function getAtasSyncRunner() {
     const candidates = [
         atasSyncUtils.runAtasSync,
         atasSyncUtils.syncAtasAccount,
-        atasSyncUtils.executeAtasSync,
         atasSyncUtils.testAtasSync,
-        atasSyncUtils.startAtasSync,
         atasSyncUtils.default,
     ];
 
@@ -1244,10 +1481,12 @@ function normalizeAtasSyncSnapshot(account, result) {
     const positionHistory = Array.isArray(safeResult.positionHistory)
         ? safeResult.positionHistory
         : [];
+
     const currentBalance = toNumber(
         safeResult.currentBalance ?? safeResult.balance ?? safeResult.netLiquidity,
         toNumber(account?.currentBalance, 0)
     );
+
     const startingBalance = toNumber(
         safeResult.startingBalance,
         toNumber(account?.startingBalance, 0)
@@ -1257,53 +1496,90 @@ function normalizeAtasSyncSnapshot(account, result) {
         dataProvider: "atas",
         dataProviderType: cleanString(
             safeResult.dataProviderType ||
-            safeResult.providerType ||
-            account?.dataProviderType ||
-            "desktop"
+                safeResult.providerType ||
+                account?.dataProviderType ||
+                "desktop"
         ),
         dataProviderStatus: cleanString(
             safeResult.dataProviderStatus ||
-            safeResult.status ||
-            "connected"
+                safeResult.status ||
+                "connected"
         ),
         dataProviderAccountId: cleanString(
             safeResult.dataProviderAccountId ||
-            safeResult.providerAccountId ||
-            safeResult.accountId ||
-            account?.atasAccountId ||
-            ""
+                safeResult.providerAccountId ||
+                safeResult.accountId ||
+                account?.atasAccountId ||
+                ""
         ),
         dataProviderAccountName: cleanString(
             safeResult.dataProviderAccountName ||
-            safeResult.providerAccountName ||
-            safeResult.accountName ||
-            account?.atasAccountName ||
-            ""
+                safeResult.providerAccountName ||
+                safeResult.accountName ||
+                account?.atasAccountName ||
+                ""
         ),
         atasAccountId: cleanString(
             safeResult.atasAccountId ||
-            safeResult.dataProviderAccountId ||
-            safeResult.providerAccountId ||
-            account?.atasAccountId ||
-            ""
+                safeResult.dataProviderAccountId ||
+                safeResult.providerAccountId ||
+                account?.atasAccountId ||
+                ""
         ),
         atasAccountName: cleanString(
             safeResult.atasAccountName ||
-            safeResult.dataProviderAccountName ||
-            safeResult.providerAccountName ||
-            account?.atasAccountName ||
-            ""
+                safeResult.dataProviderAccountName ||
+                safeResult.providerAccountName ||
+                account?.atasAccountName ||
+                ""
         ),
         tradingAccountId: "",
         tradingAccountName: "",
         lastSyncAt: cleanString(
             safeResult.lastSyncAt ||
-            safeResult.syncedAt ||
-            new Date().toISOString()
+                safeResult.syncedAt ||
+                new Date().toISOString()
         ),
         accountSize: toNumber(
             safeResult.accountSize,
             toNumber(account?.accountSize, 0)
+        ),
+        computedRuleStatus: cleanString(
+            safeResult.computedRuleStatus ||
+                account?.computedRuleStatus ||
+                ""
+        ),
+        computedRuleStatusLabel: cleanString(
+            safeResult.computedRuleStatusLabel ||
+                account?.computedRuleStatusLabel ||
+                ""
+        ),
+        targetBalance: toNumber(
+            safeResult.targetBalance ??
+                account?.targetBalance ??
+                safeResult.ruleTargetBalance ??
+                account?.ruleTargetBalance,
+            0
+        ),
+        targetReached: toBoolean(
+            safeResult.targetReached ?? account?.targetReached,
+            false
+        ),
+        accessExpired: toBoolean(
+            safeResult.accessExpired ?? account?.accessExpired,
+            false
+        ),
+        accessStartDate: cleanString(
+            safeResult.accessStartDate ||
+                account?.accessStartDate ||
+                account?.startDate ||
+                ""
+        ),
+        accessEndDate: cleanString(
+            safeResult.accessEndDate ||
+                account?.accessEndDate ||
+                account?.endDate ||
+                ""
         ),
         startingBalance,
         currentBalance,
@@ -1354,6 +1630,536 @@ function unwrapAtasSyncResult(result) {
     };
 }
 
+function buildAtasBridgeMatchKeys(account) {
+    if (!account || typeof account !== "object") {
+        return [];
+    }
+
+    const rawKeys = [
+        account?.accountId,
+        account?.accountName,
+        account?.displayName,
+        account?.name,
+        account?.atasAccountId,
+        account?.atasAccountName,
+        account?.dataProviderAccountId,
+        account?.dataProviderAccountName,
+        account?.source?.accountId,
+        account?.source?.accountName,
+    ];
+
+    return [...new Set(rawKeys.map(normalizeMatchText).filter(Boolean))];
+}
+
+function normalizeAtasBridgeConnectionStatus(value) {
+    const raw = cleanString(value).toLowerCase();
+
+    if (raw === "online" || raw === "connected" || raw === "ready") {
+        return "connected";
+    }
+
+    if (raw === "syncing") {
+        return "syncing";
+    }
+
+    return "disconnected";
+}
+
+function normalizeApexBridgeText(value) {
+    return cleanString(value).toUpperCase().replace(/\s+/g, "");
+}
+
+function getAtasBridgeAccountRef(bridgeAccount) {
+    return cleanString(
+        bridgeAccount?.tradingAccountId ||
+            bridgeAccount?.accountId ||
+            bridgeAccount?.atasAccountId ||
+            bridgeAccount?.dataProviderAccountId ||
+            bridgeAccount?.accountName ||
+            bridgeAccount?.displayName ||
+            ""
+    );
+}
+
+function isAllowedApexAtasBridgeAccount(bridgeAccount) {
+    const text = [
+        bridgeAccount?.accountId,
+        bridgeAccount?.accountName,
+        bridgeAccount?.displayName,
+        bridgeAccount?.tradingAccountId,
+        bridgeAccount?.tradingAccountName,
+        bridgeAccount?.dataProviderAccountId,
+        bridgeAccount?.dataProviderAccountName,
+        bridgeAccount?.atasAccountId,
+        bridgeAccount?.atasAccountName,
+    ]
+        .join(" ")
+        .toUpperCase()
+        .replace(/\s+/g, "");
+
+    return (
+        text.includes("APEX-") ||
+        text.includes("APEX_") ||
+        text.includes("PA-APEX") ||
+        text.includes("PA_APEX") ||
+        text.includes("PAAPEX")
+    );
+}
+
+function inferAtasBridgePhaseValue(bridgeAccount) {
+    const text = normalizeApexBridgeText(
+        [
+            bridgeAccount?.accountId,
+            bridgeAccount?.accountName,
+            bridgeAccount?.displayName,
+            bridgeAccount?.tradingAccountId,
+            bridgeAccount?.tradingAccountName,
+            bridgeAccount?.dataProviderAccountId,
+            bridgeAccount?.dataProviderAccountName,
+            bridgeAccount?.atasAccountId,
+            bridgeAccount?.atasAccountName,
+            bridgeAccount?.accountPhase,
+            bridgeAccount?.phase,
+        ].join(" ")
+    );
+
+    if (
+        text.includes("PA-APEX") ||
+        text.includes("PA_APEX") ||
+        text.includes("PAAPEX")
+    ) {
+        return "pa";
+    }
+
+    return "eval";
+}
+
+function inferAtasBridgeProductTypeValue(bridgeAccount) {
+    const text = cleanString(
+        [
+            bridgeAccount?.productType,
+            bridgeAccount?.mode,
+            bridgeAccount?.accountMode,
+            bridgeAccount?.accountId,
+            bridgeAccount?.accountName,
+            bridgeAccount?.displayName,
+            bridgeAccount?.tradingAccountId,
+            bridgeAccount?.tradingAccountName,
+        ].join(" ")
+    ).toLowerCase();
+
+    if (text.includes("intraday") || text.includes("intra")) {
+        return "intraday";
+    }
+
+    return "eod";
+}
+
+function resolveAtasBridgeAccountSize(bridgeAccount) {
+    const directSize = toNumber(bridgeAccount?.accountSize, 0);
+
+    if ([25000, 50000, 100000, 150000].includes(directSize)) {
+        return directSize;
+    }
+
+    const textSize = detectAccountSize(
+        [
+            bridgeAccount?.accountId,
+            bridgeAccount?.accountName,
+            bridgeAccount?.displayName,
+            bridgeAccount?.tradingAccountId,
+            bridgeAccount?.tradingAccountName,
+            bridgeAccount?.dataProviderAccountId,
+            bridgeAccount?.dataProviderAccountName,
+            bridgeAccount?.atasAccountId,
+            bridgeAccount?.atasAccountName,
+        ].join(" ")
+    );
+
+    if (textSize) {
+        return textSize;
+    }
+
+    const balance = toNumber(
+        bridgeAccount?.currentBalance ||
+            bridgeAccount?.balance ||
+            bridgeAccount?.cash,
+        0
+    );
+
+    if (balance >= 145000) {
+        return 150000;
+    }
+
+    if (balance >= 95000) {
+        return 100000;
+    }
+
+    if (balance >= 45000) {
+        return 50000;
+    }
+
+    if (balance >= 20000) {
+        return 25000;
+    }
+
+    return 50000;
+}
+function buildAtasBridgeAccountPatch(bridgeAccount, existingAccount = null) {
+    const accountRef = getAtasBridgeAccountRef(bridgeAccount);
+    const accountName = accountRef || cleanString(bridgeAccount?.displayName) || "ATAS Account";
+    const accountPhase = inferAtasBridgePhaseValue(bridgeAccount);
+    const productType = inferAtasBridgeProductTypeValue(bridgeAccount);
+    const accountSize = resolveAtasBridgeAccountSize(bridgeAccount);
+    const balance = toNumber(
+        bridgeAccount?.currentBalance ||
+            bridgeAccount?.balance ||
+            bridgeAccount?.cash,
+        0
+    );
+
+    const existingStatus = cleanString(existingAccount?.accountStatus).toLowerCase();
+    const lockedStatus =
+        existingStatus === "passed" ||
+        existingStatus === "failed" ||
+        existingStatus === "archived";
+
+    const accountStatus = lockedStatus
+        ? existingStatus
+        : accountPhase === "pa"
+            ? "active"
+            : "open";
+
+    const lastSyncAt = cleanString(
+        bridgeAccount?.lastSyncAt ||
+            bridgeAccount?.receivedAt ||
+            bridgeAccount?.timestamp ||
+            new Date().toISOString()
+    );
+
+    return {
+        displayName: accountName,
+        dataProvider: "atas",
+        dataProviderType: "desktop",
+        dataProviderStatus: "connected",
+        dataProviderAccountId: accountRef,
+        dataProviderAccountName: accountName,
+        provider: "APEX",
+        providerType: "desktop",
+        accountPhase,
+        accountStatus,
+        productType,
+        accountSize,
+        tradingAccountId: accountRef,
+        tradingAccountName: accountName,
+        tradingAccountKey: accountRef,
+        atasAccountId: accountRef,
+        atasAccountName: accountName,
+        currentBalance: balance,
+        startingBalance: toNumber(existingAccount?.startingBalance, balance),
+        symbol: cleanString(
+            bridgeAccount?.symbol ||
+                bridgeAccount?.instrument ||
+                bridgeAccount?.contract ||
+                bridgeAccount?.product ||
+                ""
+        ),
+        instrument: cleanString(
+            bridgeAccount?.instrument ||
+                bridgeAccount?.symbol ||
+                bridgeAccount?.contract ||
+                ""
+        ),
+        contract: cleanString(
+            bridgeAccount?.contract ||
+                bridgeAccount?.symbol ||
+                bridgeAccount?.instrument ||
+                ""
+        ),
+        product: cleanString(
+            bridgeAccount?.product ||
+                bridgeAccount?.symbol ||
+                ""
+        ),
+        positionQty: toNumber(bridgeAccount?.positionQty, 0),
+        avgPrice: toNumber(bridgeAccount?.avgPrice, 0),
+        realizedPnL: toNumber(bridgeAccount?.realizedPnL, 0),
+        unrealizedPnL: toNumber(bridgeAccount?.unrealizedPnL, 0),
+        lastSyncAt,
+        source: {
+            provider: "atas",
+            type: "desktop",
+            status: "connected",
+            accountId: accountRef,
+            accountName,
+            lastSyncAt,
+        },
+    };
+}
+
+function findBestAtasBridgeTargetAccount(bridgeAccount, accounts, preferredAccount = null) {
+    const atasAccounts = filterAccountsByProvider(accounts, "atas");
+
+    if (!atasAccounts.length) {
+        return null;
+    }
+
+    const bridgeKeys = buildAtasBridgeMatchKeys(bridgeAccount);
+
+    if (!bridgeKeys.length) {
+        return null;
+    }
+
+    if (
+        preferredAccount &&
+        getAccountProvider(preferredAccount) === "atas"
+    ) {
+        const preferredKeys = buildAccountMatchKeys(preferredAccount);
+
+        if (preferredKeys.some((key) => bridgeKeys.includes(key))) {
+            return (
+                atasAccounts.find((account) => account.id === preferredAccount.id) ||
+                preferredAccount
+            );
+        }
+    }
+
+    return (
+        atasAccounts.find((account) => {
+            const accountKeys = buildAccountMatchKeys(account);
+            return accountKeys.some((key) => bridgeKeys.includes(key));
+        }) || null
+    );
+}
+
+function normalizeAtasBridgeSnapshot(account, bridgeAccount, existingSnapshot = null) {
+    const previousSnapshot =
+        existingSnapshot && typeof existingSnapshot === "object"
+            ? existingSnapshot
+            : {};
+
+    const balance = toNumber(
+        bridgeAccount?.balance ?? bridgeAccount?.currentBalance ?? bridgeAccount?.cash,
+        toNumber(previousSnapshot?.currentBalance, toNumber(account?.currentBalance, 0))
+    );
+
+    const startingBalance = toNumber(
+        bridgeAccount?.startingBalance,
+        toNumber(
+            previousSnapshot?.startingBalance,
+            toNumber(account?.startingBalance, balance)
+        )
+    );
+
+    const positionQty = toNumber(
+        bridgeAccount?.positionQty,
+        toNumber(previousSnapshot?.positionQty, 0)
+    );
+
+    const avgPrice = toNumber(
+        bridgeAccount?.avgPrice,
+        toNumber(previousSnapshot?.avgPrice, 0)
+    );
+
+    const realizedPnL = toNumber(bridgeAccount?.realizedPnL, 0);
+    const unrealizedPnL = toNumber(bridgeAccount?.unrealizedPnL, 0);
+
+    const bridgeOrders = Array.isArray(bridgeAccount?.orders)
+        ? bridgeAccount.orders
+        : [];
+
+    const bridgeFills = Array.isArray(bridgeAccount?.fills)
+        ? bridgeAccount.fills
+        : [];
+
+    const bridgeLastFill =
+        bridgeAccount?.lastFill && typeof bridgeAccount.lastFill === "object"
+            ? bridgeAccount.lastFill
+            : null;
+
+    const previousOrders = Array.isArray(previousSnapshot?.orders)
+        ? previousSnapshot.orders
+        : [];
+
+    const previousFills = Array.isArray(previousSnapshot?.fills)
+        ? previousSnapshot.fills
+        : [];
+
+    const nextOrders = bridgeOrders.length ? bridgeOrders : previousOrders;
+    const nextFills = bridgeFills.length
+        ? bridgeFills
+        : bridgeLastFill
+            ? [bridgeLastFill]
+            : previousFills;
+
+    const nextLastFill = bridgeLastFill || nextFills[nextFills.length - 1] || null;
+
+    return {
+        dataProvider: "atas",
+        dataProviderType: cleanString(
+            bridgeAccount?.dataProviderType ||
+                previousSnapshot?.dataProviderType ||
+                account?.dataProviderType ||
+                "desktop"
+        ),
+        dataProviderStatus: normalizeAtasBridgeConnectionStatus(
+            bridgeAccount?.connectionStatus || bridgeAccount?.status
+        ),
+        dataProviderAccountId: cleanString(
+            bridgeAccount?.accountId ||
+                previousSnapshot?.dataProviderAccountId ||
+                account?.atasAccountId ||
+                ""
+        ),
+        dataProviderAccountName: cleanString(
+            bridgeAccount?.accountName ||
+                bridgeAccount?.displayName ||
+                previousSnapshot?.dataProviderAccountName ||
+                account?.atasAccountName ||
+                ""
+        ),
+        atasAccountId: cleanString(
+            bridgeAccount?.accountId ||
+                previousSnapshot?.atasAccountId ||
+                account?.atasAccountId ||
+                ""
+        ),
+        atasAccountName: cleanString(
+            bridgeAccount?.accountName ||
+                bridgeAccount?.displayName ||
+                previousSnapshot?.atasAccountName ||
+                account?.atasAccountName ||
+                ""
+        ),
+        tradingAccountId: cleanString(
+            bridgeAccount?.tradingAccountId ||
+                account?.tradingAccountId ||
+                ""
+        ),
+        tradingAccountName: cleanString(
+            bridgeAccount?.tradingAccountName ||
+                account?.tradingAccountName ||
+                ""
+        ),
+        lastSyncAt: cleanString(
+            bridgeAccount?.lastSyncAt ||
+                bridgeAccount?.receivedAt ||
+                bridgeAccount?.timestamp ||
+                new Date().toISOString()
+        ),
+        accountPhase: cleanString(account?.accountPhase || bridgeAccount?.accountPhase || "eval"),
+        productType: cleanString(account?.productType || bridgeAccount?.productType || "eod"),
+        accountStatus: cleanString(account?.accountStatus || bridgeAccount?.accountStatus || "open"),
+        accountSize: toNumber(
+            bridgeAccount?.accountSize,
+            toNumber(account?.accountSize, 0)
+        ),
+        computedRuleStatus: cleanString(
+            previousSnapshot?.computedRuleStatus ||
+                account?.computedRuleStatus ||
+                ""
+        ),
+        computedRuleStatusLabel: cleanString(
+            previousSnapshot?.computedRuleStatusLabel ||
+                account?.computedRuleStatusLabel ||
+                ""
+        ),
+        targetBalance: toNumber(
+            previousSnapshot?.targetBalance ??
+                account?.targetBalance ??
+                previousSnapshot?.ruleTargetBalance ??
+                account?.ruleTargetBalance,
+            0
+        ),
+        targetReached: toBoolean(
+            previousSnapshot?.targetReached ?? account?.targetReached,
+            false
+        ),
+        accessExpired: toBoolean(
+            previousSnapshot?.accessExpired ?? account?.accessExpired,
+            false
+        ),
+        accessStartDate: cleanString(
+            previousSnapshot?.accessStartDate ||
+                account?.accessStartDate ||
+                account?.startDate ||
+                ""
+        ),
+        accessEndDate: cleanString(
+            previousSnapshot?.accessEndDate ||
+                account?.accessEndDate ||
+                account?.endDate ||
+                ""
+        ),
+        startingBalance,
+        currentBalance: balance,
+        balance,
+        dailyPnL: realizedPnL + unrealizedPnL,
+        realizedPnL,
+        unrealizedPnL,
+        drawdownLimit: toNumber(
+            previousSnapshot?.drawdownLimit,
+            toNumber(account?.drawdownLimit, 0)
+        ),
+        maxDailyLoss: toNumber(
+            previousSnapshot?.maxDailyLoss,
+            toNumber(account?.maxDailyLoss, 0)
+        ),
+        liquidationPrice: toNumber(previousSnapshot?.liquidationPrice, 0),
+        openOrderCount: toNumber(
+            bridgeAccount?.openOrderCount,
+            nextOrders.length
+        ),
+        openPositionCount: positionQty !== 0 ? 1 : 0,
+        sessionKey: cleanString(previousSnapshot?.sessionKey || ""),
+        tradingDate: cleanString(previousSnapshot?.tradingDate || ""),
+        symbol: cleanString(
+            bridgeAccount?.symbol ||
+                bridgeAccount?.instrument ||
+                bridgeAccount?.contract ||
+                bridgeAccount?.product ||
+                previousSnapshot?.symbol ||
+                previousSnapshot?.instrument ||
+                previousSnapshot?.contract ||
+                ""
+        ),
+        instrument: cleanString(
+            bridgeAccount?.instrument ||
+                bridgeAccount?.symbol ||
+                previousSnapshot?.instrument ||
+                previousSnapshot?.symbol ||
+                ""
+        ),
+        contract: cleanString(
+            bridgeAccount?.contract ||
+                bridgeAccount?.symbol ||
+                previousSnapshot?.contract ||
+                previousSnapshot?.symbol ||
+                ""
+        ),
+        currency: cleanString(
+            bridgeAccount?.currency || previousSnapshot?.currency || "USD"
+        ),
+        positionQty,
+        avgPrice,
+        source: cleanString(
+            bridgeAccount?.source || previousSnapshot?.source || "atas-bridge"
+        ),
+        orders: nextOrders,
+        fills: nextFills,
+        lastFill: nextLastFill,
+        balanceHistory: Array.isArray(previousSnapshot?.balanceHistory)
+            ? previousSnapshot.balanceHistory
+            : [],
+        performance: Array.isArray(previousSnapshot?.performance)
+            ? previousSnapshot.performance
+            : [],
+        positionHistory: Array.isArray(previousSnapshot?.positionHistory)
+            ? previousSnapshot.positionHistory
+            : [],
+    };
+}
+
 async function runAtasSyncForAccount(account) {
     const runner = getAtasSyncRunner();
 
@@ -1370,7 +2176,6 @@ async function runAtasSyncForAccount(account) {
         snapshot: normalizeAtasSyncSnapshot(account, parsedResult.snapshot),
     };
 }
-
 class DashboardErrorBoundary extends Component {
     constructor(props) {
         super(props);
@@ -1568,7 +2373,7 @@ function TradingMark() {
                     placeItems: "center",
                     background: "rgba(34, 211, 238, 0.10)",
                     border: `1px solid ${COLORS.borderStrong}`,
-                    boxShadow: `0 0 24px rgba(34,211,238,0.18)`,
+                    boxShadow: "0 0 24px rgba(34,211,238,0.18)",
                     color: COLORS.gold,
                     fontSize: 22,
                     fontWeight: 900,
@@ -1743,6 +2548,7 @@ function SidebarCalendarPanel({ calendarState }) {
         </div>
     );
 }
+
 function ShellSidebar({
     activeView,
     onChangeView,
@@ -1760,7 +2566,7 @@ function ShellSidebar({
                 width: SIDEBAR_WIDTH,
                 minWidth: SIDEBAR_WIDTH,
                 background: "rgba(0,0,0,0.38)",
-                borderRight: `1px solid rgba(82, 82, 91, 0.38)`,
+                borderRight: "1px solid rgba(82, 82, 91, 0.38)",
                 padding: "14px 10px 20px",
                 position: "sticky",
                 top: STICKY_TOP,
@@ -1867,10 +2673,11 @@ function ShellSidebar({
                                                     gap: 10,
                                                     padding: "7px 10px",
                                                     borderRadius: 7,
-                                                    border: `1px solid ${isActive
+                                                    border: `1px solid ${
+                                                        isActive
                                                             ? "rgba(34,211,238,0.24)"
                                                             : "transparent"
-                                                        }`,
+                                                    }`,
                                                     background: isActive
                                                         ? "linear-gradient(90deg, rgba(255,255,255,0.08) 0%, rgba(34,211,238,0.14) 100%)"
                                                         : "transparent",
@@ -1951,7 +2758,6 @@ function MiddleSection({ title, subtitle = "", children }) {
         </div>
     );
 }
-
 function HeaderProviderSwitch({ provider, onChange }) {
     const trackRef = useRef(null);
     const isAtas = normalizeDataProvider(provider) === "atas";
@@ -2111,7 +2917,6 @@ function MiddleControlColumn({
 }) {
     const provider = normalizeDataProvider(currentProvider || activeAccount?.dataProvider);
     const isAtasActive = provider === "atas";
-    const zeroState = shouldUseAtasZeroState(activeAccount, activeLiveSnapshot, provider);
 
     const providerLabel = getProviderLabel(provider);
     const providerTypeLabel = activeAccount
@@ -2127,25 +2932,6 @@ function MiddleControlColumn({
         : provider === "atas"
             ? "Kein ATAS Account"
             : "Kein Tradovate Account";
-
-    const ordersCount = !activeAccount || zeroState
-        ? 0
-        : Array.isArray(activeLiveSnapshot?.orders)
-            ? activeLiveSnapshot.orders.length
-            : 0;
-
-    const fillsCount = !activeAccount || zeroState
-        ? 0
-        : Array.isArray(activeLiveSnapshot?.fills)
-            ? activeLiveSnapshot.fills.length
-            : 0;
-
-    const balanceValue = !activeAccount || zeroState
-        ? 0
-        : toNumber(
-            activeLiveSnapshot?.currentBalance,
-            toNumber(activeAccount?.currentBalance, 0)
-        );
 
     return (
         <div
@@ -2436,92 +3222,6 @@ function MiddleControlColumn({
                             </div>
                         </div>
 
-                        <div
-                            style={{
-                                display: "grid",
-                                gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-                                gap: 8,
-                            }}
-                        >
-                            <div
-                                style={{
-                                    borderRadius: 10,
-                                    border: `1px solid ${COLORS.border}`,
-                                    background: "rgba(255,255,255,0.03)",
-                                    padding: 10,
-                                    display: "grid",
-                                    gap: 4,
-                                }}
-                            >
-                                <div
-                                    style={{
-                                        color: COLORS.textSoft,
-                                        fontSize: 10,
-                                        textTransform: "uppercase",
-                                        letterSpacing: "0.08em",
-                                    }}
-                                >
-                                    Status
-                                </div>
-                                <div
-                                    style={{
-                                        color: provider === "atas" ? COLORS.green : COLORS.text,
-                                        fontSize: 13,
-                                        fontWeight: 800,
-                                    }}
-                                >
-                                    {providerStatusLabel}
-                                </div>
-                                <div
-                                    style={{
-                                        color: COLORS.textSoft,
-                                        fontSize: 10,
-                                    }}
-                                >
-                                    {activeAccount ? formatDateTime(activeAccount?.lastSyncAt) : "Kein Sync"}
-                                </div>
-                            </div>
-
-                            <div
-                                style={{
-                                    borderRadius: 10,
-                                    border: `1px solid ${COLORS.border}`,
-                                    background: "rgba(255,255,255,0.03)",
-                                    padding: 10,
-                                    display: "grid",
-                                    gap: 4,
-                                }}
-                            >
-                                <div
-                                    style={{
-                                        color: COLORS.textSoft,
-                                        fontSize: 10,
-                                        textTransform: "uppercase",
-                                        letterSpacing: "0.08em",
-                                    }}
-                                >
-                                    Orders / Fills
-                                </div>
-                                <div
-                                    style={{
-                                        color: COLORS.gold,
-                                        fontSize: 13,
-                                        fontWeight: 800,
-                                    }}
-                                >
-                                    {ordersCount} / {fillsCount}
-                                </div>
-                                <div
-                                    style={{
-                                        color: COLORS.textSoft,
-                                        fontSize: 10,
-                                    }}
-                                >
-                                    Balance {formatCurrency(balanceValue)}
-                                </div>
-                            </div>
-                        </div>
-
                         <button
                             type="button"
                             onClick={onRunAtasSync}
@@ -2536,24 +3236,6 @@ function MiddleControlColumn({
                         >
                             {atasSyncState.isRunning ? "ATAS Sync läuft..." : "ATAS Sync testen"}
                         </button>
-
-                        {atasSyncState.message ? (
-                            <div
-                                style={{
-                                    borderRadius: 10,
-                                    border: `1px solid ${atasSyncState.error ? "rgba(239, 68, 68, 0.35)" : COLORS.border}`,
-                                    background: atasSyncState.error
-                                        ? "rgba(239, 68, 68, 0.10)"
-                                        : "rgba(255,255,255,0.03)",
-                                    padding: 10,
-                                    color: atasSyncState.error ? "#fecaca" : COLORS.text,
-                                    fontSize: 11,
-                                    lineHeight: 1.5,
-                                }}
-                            >
-                                {atasSyncState.message}
-                            </div>
-                        ) : null}
                     </MiddleSection>
                 ) : null}
             </div>
@@ -2563,8 +3245,9 @@ function MiddleControlColumn({
 
 function ShellTopbar({
     activeAccount,
+    activeLiveSnapshot,
     topLiveMetrics,
-    activeRiskColors,
+    headerRuleMeta,
     currentProvider,
     onSetAccountDataProvider,
 }) {
@@ -2580,15 +3263,39 @@ function ShellTopbar({
     }).format(new Date());
 
     const providerLabel = getProviderLabel(provider);
+
     const providerTypeLabel = activeAccount
-        ? getProviderTypeLabel(activeAccount?.dataProviderType, provider)
+        ? getProviderTypeLabel(
+              activeLiveSnapshot?.dataProviderType || activeAccount?.dataProviderType,
+              provider
+          )
         : getProviderTypeLabel("", provider);
 
     const providerStatusLabel = activeAccount
-        ? getProviderStatusLabel(activeAccount?.dataProviderStatus)
+        ? getProviderStatusLabel(
+              activeLiveSnapshot?.dataProviderStatus ||
+                  activeAccount?.dataProviderStatus
+          )
         : getProviderStatusLabel(provider === "atas" ? "disconnected" : "ready");
 
-    const headerAccountLabel = getHeaderAccountLabelFromProvider(provider);
+    const headerAccountLabel =
+        getAccountDisplayName(activeAccount, activeLiveSnapshot) ||
+        getHeaderAccountLabelFromProvider(provider);
+
+    const ruleMeta =
+        headerRuleMeta ||
+        buildHeaderRuleMeta(activeAccount, activeLiveSnapshot, false);
+
+    const ruleColors = ruleMeta.colors || getRuleStatusColors("neutral");
+
+    const targetBalanceLabel =
+        ruleMeta.targetBalance > 0
+            ? formatCurrency(ruleMeta.targetBalance)
+            : "–";
+
+    const accessEndLabel = ruleMeta.accessEndDate
+        ? formatDateOnly(ruleMeta.accessEndDate)
+        : "–";
 
     return (
         <header
@@ -2689,42 +3396,15 @@ function ShellTopbar({
 
                 <span style={{ color: "rgba(113,113,122,0.8)" }}>|</span>
 
-                <span
-                    style={{
-                        color: COLORS.cyan,
-                        maxWidth: 120,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                    }}
-                >
-                    {providerLabel}
-                </span>
-
-                <span
-                    style={{
-                        color: "rgba(161,161,170,0.9)",
-                        maxWidth: 90,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                    }}
-                >
-                    {providerTypeLabel}
-                </span>
-
-                <span
-                    style={{
-                        color: "rgba(161,161,170,0.9)",
-                        maxWidth: 130,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                    }}
-                >
-                    {providerStatusLabel}
-                </span>
+                <span style={{ color: COLORS.cyan }}>{providerLabel}</span>
+                <span>{providerTypeLabel}</span>
+                <span>{providerStatusLabel}</span>
 
                 <span style={{ color: "rgba(113,113,122,0.8)" }}>|</span>
 
                 <span>Balance {formatCurrency(topLiveMetrics.currentBalance)}</span>
+                <span>Ziel {targetBalanceLabel}</span>
+                <span>Ende {accessEndLabel}</span>
 
                 <span
                     style={{
@@ -2733,9 +3413,9 @@ function ShellTopbar({
                         gap: 6,
                         padding: "4px 8px",
                         borderRadius: 999,
-                        border: `1px solid ${activeRiskColors.border}`,
-                        background: activeRiskColors.bg,
-                        color: activeRiskColors.text,
+                        border: `1px solid ${ruleColors.border}`,
+                        background: ruleColors.bg,
+                        color: ruleColors.text,
                     }}
                 >
                     <span
@@ -2743,10 +3423,10 @@ function ShellTopbar({
                             width: 6,
                             height: 6,
                             borderRadius: "999px",
-                            background: activeRiskColors.dot,
+                            background: ruleColors.dot,
                         }}
                     />
-                    {activeRiskColors.label}
+                    {ruleMeta.label}
                 </span>
             </div>
         </header>
@@ -2774,6 +3454,7 @@ function AppLayout({
     onRunAtasSync,
     activeAccount,
     activeLiveSnapshot,
+    headerRuleMeta,
     atasSyncState,
     activeRiskColors,
     topLiveMetrics,
@@ -2821,21 +3502,11 @@ function AppLayout({
             >
                 <div
                     style={{
-                        position: "absolute",
-                        inset: 0,
-                        background:
-                            "radial-gradient(circle at 18% 30%, rgba(34,211,238,0.10) 0%, rgba(34,211,238,0.00) 30%), radial-gradient(circle at 74% 22%, rgba(250,204,21,0.08) 0%, rgba(250,204,21,0.00) 25%)",
-                        pointerEvents: "none",
-                    }}
-                />
-
-                <div
-                    style={{
                         maxWidth: `${HERO_MAX_WIDTH}px`,
                         margin: "0 auto",
                         padding: "24px 22px 34px",
                         display: "grid",
-                        gridTemplateColumns: `220px minmax(0, 1fr) 220px`,
+                        gridTemplateColumns: "220px minmax(0, 1fr) 220px",
                         alignItems: "center",
                         gap: 18,
                         position: "relative",
@@ -2860,7 +3531,7 @@ function AppLayout({
                                 borderRadius: 18,
                                 border: `1px solid ${COLORS.borderStrong}`,
                                 background: "rgba(12, 28, 56, 0.72)",
-                                boxShadow: `0 0 24px rgba(34,211,238,0.18)`,
+                                boxShadow: "0 0 24px rgba(34,211,238,0.18)",
                                 textAlign: "center",
                             }}
                         >
@@ -2975,8 +3646,9 @@ function AppLayout({
                     >
                         <ShellTopbar
                             activeAccount={activeAccount}
+                            activeLiveSnapshot={activeLiveSnapshot}
                             topLiveMetrics={topLiveMetrics}
-                            activeRiskColors={activeRiskColors}
+                            headerRuleMeta={headerRuleMeta}
                             currentProvider={currentProvider}
                             onSetAccountDataProvider={onSetAccountDataProvider}
                         />
@@ -3002,6 +3674,8 @@ function AppLayout({
                             >
                                 <Dashboard
                                     activeAccount={activeAccount}
+                                    activeLiveSnapshot={activeLiveSnapshot}
+                                    headerRuleMeta={headerRuleMeta}
                                     activeAccountId={activeAccountId}
                                     accounts={accounts}
                                     accountGroups={accountGroups}
@@ -3065,6 +3739,164 @@ export default function App() {
     }, []);
 
     useEffect(() => {
+        if (typeof window === "undefined") {
+            return undefined;
+        }
+
+        resetAtasBridgePollingState();
+
+        const stopPolling = startAtasBridgePolling(2000);
+
+        return () => {
+            stopPolling?.();
+            stopAtasBridgePolling();
+            resetAtasBridgePollingState();
+        };
+    }, []);
+
+    const storedActiveAccount =
+        accounts.find((account) => account.id === storedActiveAccountId) || null;
+
+    useEffect(() => {
+        if (typeof window === "undefined") {
+            return undefined;
+        }
+
+        const handleAtasBridgeAccountsUpdated = (event) => {
+            const bridgeAccounts = Array.isArray(event?.detail?.accounts)
+                ? event.detail.accounts.filter(isAllowedApexAtasBridgeAccount)
+                : EMPTY_LIST;
+
+            if (!bridgeAccounts.length) {
+                return;
+            }
+
+            let didPersist = false;
+            let preferredNextActiveId = null;
+
+            bridgeAccounts.forEach((bridgeAccount) => {
+                const bridgePatch = buildAtasBridgeAccountPatch(bridgeAccount, null);
+
+                const targetAccount = findBestAtasBridgeTargetAccount(
+                    bridgePatch,
+                    accounts,
+                    storedActiveAccount
+                );
+
+                if (!targetAccount?.id) {
+                    const localId = createLocalId();
+
+                    const newAtasAccount = {
+                        id: localId,
+                        ...bridgePatch,
+                        createdAt: new Date().toISOString(),
+                    };
+
+                    addAccount?.(newAtasAccount);
+
+                    const nextSnapshot = normalizeAtasBridgeSnapshot(
+                        newAtasAccount,
+                        {
+                            ...bridgeAccount,
+                            ...bridgePatch,
+                        },
+                        null
+                    );
+
+                    saveProviderSyncSnapshot(newAtasAccount.id, nextSnapshot, "atas");
+
+                    preferredNextActiveId = newAtasAccount.id;
+                    persistActiveAccountId?.(newAtasAccount.id);
+                    didPersist = true;
+
+                    return;
+                }
+
+                const existingSnapshot = getLiveAccountSnapshot(targetAccount.id);
+                const nextPatch = buildAtasBridgeAccountPatch(bridgeAccount, targetAccount);
+                const mergedAccount = {
+                    ...targetAccount,
+                    ...nextPatch,
+                };
+
+                updateAccount?.(targetAccount.id, nextPatch);
+
+                const nextSnapshot = normalizeAtasBridgeSnapshot(
+                    mergedAccount,
+                    {
+                        ...bridgeAccount,
+                        ...nextPatch,
+                    },
+                    existingSnapshot
+                );
+
+                saveProviderSyncSnapshot(targetAccount.id, nextSnapshot, "atas");
+
+                preferredNextActiveId = targetAccount.id;
+                persistActiveAccountId?.(targetAccount.id);
+                didPersist = true;
+            });
+
+            if (!didPersist) {
+                return;
+            }
+
+            setAtasSyncState((current) =>
+                current.isRunning
+                    ? current
+                    : {
+                          isRunning: false,
+                          message: "",
+                          error: false,
+                      }
+            );
+
+            setProviderView("atas");
+            reloadAppState(preferredNextActiveId);
+        };
+
+        const handleAtasBridgeStatusUpdated = (event) => {
+            const status = event?.detail || {};
+
+            if (status?.ok) {
+                return;
+            }
+
+            setAtasSyncState((current) =>
+                current.isRunning
+                    ? current
+                    : {
+                          isRunning: false,
+                          message: cleanString(status?.error) || "ATAS Bridge nicht erreichbar.",
+                          error: true,
+                      }
+            );
+        };
+
+        window.addEventListener(
+            ATAS_BRIDGE_ACCOUNTS_EVENT,
+            handleAtasBridgeAccountsUpdated
+        );
+
+        window.addEventListener(
+            ATAS_BRIDGE_STATUS_EVENT,
+            handleAtasBridgeStatusUpdated
+        );
+
+        return () => {
+            window.removeEventListener(
+                ATAS_BRIDGE_ACCOUNTS_EVENT,
+                handleAtasBridgeAccountsUpdated
+            );
+
+            window.removeEventListener(
+                ATAS_BRIDGE_STATUS_EVENT,
+                handleAtasBridgeStatusUpdated
+            );
+        };
+    }, [accounts, storedActiveAccount, reloadAppState]);
+
+    useEffect(() => {
         persistDashboardView(activeDashboardView);
     }, [activeDashboardView]);
 
@@ -3079,9 +3911,6 @@ export default function App() {
 
         persistActiveAccountId?.(storedActiveAccountId);
     }, [storedActiveAccountId]);
-
-    const storedActiveAccount =
-        accounts.find((account) => account.id === storedActiveAccountId) || null;
 
     const currentProvider = useMemo(() => {
         if (providerView) {
@@ -3132,6 +3961,14 @@ export default function App() {
         );
     }, [activeAccount, activeLiveSnapshot, currentProvider]);
 
+    const headerRuleMeta = useMemo(() => {
+        return buildHeaderRuleMeta(
+            activeAccount,
+            activeLiveSnapshot,
+            activeAccountZeroState
+        );
+    }, [activeAccount, activeLiveSnapshot, activeAccountZeroState]);
+
     const activeRiskStatus = useMemo(() => {
         if (!activeAccount?.id) {
             return {
@@ -3159,9 +3996,9 @@ export default function App() {
         : activeAccountZeroState
             ? EMPTY_LIST
             : (() => {
-                const rows = getAccountBalanceHistory(activeAccount.id) || EMPTY_LIST;
-                return Array.isArray(rows) ? rows : EMPTY_LIST;
-            })();
+                  const rows = getAccountBalanceHistory(activeAccount.id) || EMPTY_LIST;
+                  return Array.isArray(rows) ? rows : EMPTY_LIST;
+              })();
 
     const sidebarCalendarState = useMemo(() => {
         return buildSidebarCalendarState(activeAccountBalanceHistory);
@@ -3201,23 +4038,25 @@ export default function App() {
             ? activeLiveSnapshot.fills
             : getFills(activeAccount.id) || EMPTY_LIST;
 
-        const activeProvider = normalizeDataProvider(activeAccount?.dataProvider || currentProvider);
+        const activeProvider = normalizeDataProvider(
+            activeAccount?.dataProvider || currentProvider
+        );
 
         const startBalanceRaw = activeProvider === "atas"
             ? toNumber(activeLiveSnapshot?.startingBalance, 0)
             : (
-                toNumber(activeLiveSnapshot?.startingBalance, 0) ||
-                toNumber(activeAccount?.startingBalance, 0) ||
-                toNumber(activeAccount?.accountSize, 0)
-            );
+                  toNumber(activeLiveSnapshot?.startingBalance, 0) ||
+                  toNumber(activeAccount?.startingBalance, 0) ||
+                  toNumber(activeAccount?.accountSize, 0)
+              );
 
         const currentBalanceRaw = activeProvider === "atas"
             ? toNumber(activeLiveSnapshot?.currentBalance, 0)
             : (
-                toNumber(activeLiveSnapshot?.currentBalance, 0) ||
-                toNumber(activeAccount?.currentBalance, 0) ||
-                startBalanceRaw
-            );
+                  toNumber(activeLiveSnapshot?.currentBalance, 0) ||
+                  toNumber(activeAccount?.currentBalance, 0) ||
+                  startBalanceRaw
+              );
 
         return {
             orderCount: orders.length,
@@ -3226,7 +4065,7 @@ export default function App() {
             currentBalance: currentBalanceRaw,
             delta: currentBalanceRaw - startBalanceRaw,
         };
-    }, [activeAccount, activeLiveSnapshot, activeAccountZeroState]);
+    }, [activeAccount, activeLiveSnapshot, activeAccountZeroState, currentProvider]);
 
     const accountGroups = useMemo(() => {
         const rawGroups = getAccountGroups?.() || EMPTY_LIST;
@@ -3265,8 +4104,8 @@ export default function App() {
 
         const selectedMode = normalizeProductTypeValue(
             selectedEvalAccount?.productType ||
-            selectedEvalAccount?.mode ||
-            selectedEvalAccount?.challengeMode
+                selectedEvalAccount?.mode ||
+                selectedEvalAccount?.challengeMode
         );
 
         return allPaAccounts.filter((account) => {
@@ -3314,6 +4153,8 @@ export default function App() {
             ...current,
             activeAccountId: accountId,
         }));
+
+        persistActiveAccountId?.(accountId);
 
         if (nextAccount) {
             setProviderView(getAccountProvider(nextAccount));
@@ -3398,6 +4239,7 @@ export default function App() {
             detectAccountSize(smartDraft.size) ||
             detectAccountSize(trimmedName) ||
             0;
+
         const providerType = normalizeDataProviderType("", normalizedDataProvider);
         const providerStatus = normalizeDataProviderStatus(
             "",
@@ -3405,7 +4247,6 @@ export default function App() {
         );
 
         const isAtasAccount = normalizedDataProvider === "atas";
-
         const localId = createLocalId();
 
         const initialTradovateAccountId = isAtasAccount ? "" : trimmedName;
@@ -3418,10 +4259,8 @@ export default function App() {
         const initialAtasAccountId = "";
         const initialAtasAccountName = "";
 
-        const initialProviderAccountId =
-            isAtasAccount ? "" : trimmedName;
-        const initialProviderAccountName =
-            isAtasAccount ? "" : trimmedName;
+        const initialProviderAccountId = isAtasAccount ? "" : trimmedName;
+        const initialProviderAccountName = isAtasAccount ? "" : trimmedName;
 
         const seedSource = buildProviderSourceFromAccount(
             {
@@ -3542,6 +4381,7 @@ export default function App() {
         setDashboardResetKey((current) => current + 1);
 
         if (matchedAccount?.id) {
+            persistActiveAccountId?.(matchedAccount.id);
             setAppState((current) => ({
                 ...current,
                 activeAccountId: matchedAccount.id,
@@ -3686,6 +4526,7 @@ export default function App() {
             onRunAtasSync={handleRunAtasSync}
             activeAccount={activeAccount}
             activeLiveSnapshot={activeLiveSnapshot}
+            headerRuleMeta={headerRuleMeta}
             atasSyncState={atasSyncState}
             activeRiskColors={activeRiskColors}
             topLiveMetrics={topLiveMetrics}

@@ -11,8 +11,13 @@ import {
     getStrictProviderTradingRef,
     shouldUseAtasZeroState,
 } from "../utils/providerDisplay";
+import {
+    fetchAtasHistoryTrades,
+    getAtasHistoryStartDate,
+} from "../utils/atasBridgeApi";
 
 const EMPTY_LIST = [];
+const ATAS_HISTORY_START_DATE = getAtasHistoryStartDate();
 
 const COLORS = {
     panelBg: "#050816",
@@ -34,6 +39,59 @@ const COLORS = {
     rowAlt: "rgba(15, 23, 42, 0.35)",
     accentGlow: "rgba(125, 211, 252, 0.12)",
 };
+
+const MICRO_CONTRACT_PREFIXES = [
+    "MNQ",
+    "MES",
+    "MYM",
+    "M2K",
+    "MCL",
+    "MGC",
+    "M6E",
+    "M6B",
+    "M6A",
+    "M6J",
+];
+
+const CONTRACT_PREFIXES = [
+    "MNQ",
+    "NQ",
+    "MES",
+    "ES",
+    "MYM",
+    "YM",
+    "M2K",
+    "RTY",
+    "MCL",
+    "CL",
+    "MGC",
+    "GC",
+    "M6E",
+    "6E",
+    "M6B",
+    "6B",
+    "M6A",
+    "6A",
+    "M6J",
+    "6J",
+];
+
+const MICRO_TO_FULL_PREFIX = {
+    MNQ: "NQ",
+    MES: "ES",
+    MYM: "YM",
+    M2K: "RTY",
+    MCL: "CL",
+    MGC: "GC",
+    M6E: "6E",
+    M6B: "6B",
+    M6A: "6A",
+    M6J: "6J",
+};
+
+const FULL_TO_MICRO_PREFIX = Object.fromEntries(
+    Object.entries(MICRO_TO_FULL_PREFIX).map(([micro, full]) => [full, micro])
+);
 
 function cleanString(value) {
     if (value === null || value === undefined) {
@@ -114,6 +172,168 @@ function formatInteger(value) {
     return new Intl.NumberFormat("de-CH", {
         maximumFractionDigits: 0,
     }).format(num);
+}
+
+function formatDateLabel(value) {
+    if (!value) {
+        return "–";
+    }
+
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) {
+        return cleanString(value) || "–";
+    }
+
+    return new Intl.DateTimeFormat("de-CH", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+    }).format(date);
+}
+
+function toTimeMs(value) {
+    const text = cleanString(value);
+
+    if (!text) {
+        return 0;
+    }
+
+    const time = new Date(text).getTime();
+
+    return Number.isFinite(time) ? time : 0;
+}
+
+function normalizeContractText(value) {
+    const text = cleanString(value).toUpperCase();
+
+    if (!text) {
+        return "";
+    }
+
+    return text
+        .replace("@CME", "")
+        .replace("@CBOT", "")
+        .replace("@NYMEX", "")
+        .replace("@COMEX", "")
+        .replace("@ICE", "")
+        .replace("@SIM", "")
+        .replace(".SIM", "")
+        .replace("-SIM", "")
+        .replace("_SIM", "")
+        .replace(/\s+/g, "")
+        .trim();
+}
+
+function extractContractSymbol(value) {
+    const normalized = normalizeContractText(value);
+
+    if (!normalized) {
+        return "";
+    }
+
+    const contractMatch = normalized.match(
+        /(MNQ|NQ|MES|ES|MYM|YM|M2K|RTY|MCL|CL|MGC|GC|M6E|6E|M6B|6B|M6A|6A|M6J|6J)[A-Z]\d{1,2}/
+    );
+
+    if (contractMatch) {
+        return contractMatch[0];
+    }
+
+    const directPrefix = CONTRACT_PREFIXES.find((prefix) =>
+        normalized.startsWith(prefix)
+    );
+
+    if (directPrefix) {
+        return normalized;
+    }
+
+    return normalized;
+}
+
+function getContractPrefix(value) {
+    const normalized = extractContractSymbol(value);
+
+    if (!normalized) {
+        return "";
+    }
+
+    return CONTRACT_PREFIXES.find((prefix) =>
+        normalized.startsWith(prefix)
+    ) || "";
+}
+
+function getContractFamilyKey(value) {
+    const prefix = getContractPrefix(value);
+
+    if (!prefix) {
+        return "";
+    }
+
+    return MICRO_TO_FULL_PREFIX[prefix] || prefix;
+}
+
+function isMicroContract(value) {
+    const normalized = extractContractSymbol(value);
+
+    return MICRO_CONTRACT_PREFIXES.some((prefix) =>
+        normalized.startsWith(prefix)
+    );
+}
+
+function reduceContractsWithMicroPriority(values) {
+    const contracts = values
+        .map(extractContractSymbol)
+        .filter(Boolean)
+        .filter((value) => value !== "–");
+
+    if (!contracts.length) {
+        return EMPTY_LIST;
+    }
+
+    const uniqueContracts = [...new Set(contracts)];
+
+    const microFamilies = new Set(
+        uniqueContracts
+            .filter(isMicroContract)
+            .map(getContractFamilyKey)
+            .filter(Boolean)
+    );
+
+    return uniqueContracts.filter((contract) => {
+        const prefix = getContractPrefix(contract);
+        const family = getContractFamilyKey(contract);
+
+        if (!prefix || !family) {
+            return true;
+        }
+
+        if (!microFamilies.has(family)) {
+            return true;
+        }
+
+        if (isMicroContract(contract)) {
+            return true;
+        }
+
+        return !FULL_TO_MICRO_PREFIX[prefix];
+    });
+}
+
+function pickBestContract(values) {
+    const contracts = reduceContractsWithMicroPriority(values);
+
+    if (!contracts.length) {
+        return "";
+    }
+
+    const microContract = contracts.find(isMicroContract);
+
+    if (microContract) {
+        return microContract;
+    }
+
+    return contracts[0];
 }
 
 function hasImportRows(importEntry) {
@@ -325,7 +545,6 @@ function callImportBuilder(builderName, imports, accountId, provider) {
 
     return { entries: EMPTY_LIST };
 }
-
 function resolveLastTradeTime(closedTrades, fills) {
     const tradeTimes = Array.isArray(closedTrades)
         ? closedTrades
@@ -366,7 +585,12 @@ function resolveSymbolSummary(closedTrades, fills) {
 
     if (Array.isArray(closedTrades)) {
         for (const trade of closedTrades) {
-            const symbol = cleanString(trade?.symbol);
+            const symbol = pickBestContract([
+                trade?.symbol,
+                trade?.instrument,
+                trade?.contract,
+                trade?.product,
+            ]);
 
             if (symbol) {
                 symbols.push(symbol);
@@ -376,10 +600,15 @@ function resolveSymbolSummary(closedTrades, fills) {
 
     if (Array.isArray(fills)) {
         for (const fill of fills) {
-            const symbol =
-                cleanString(fill?.symbol) ||
-                cleanString(fill?.instrument) ||
-                cleanString(fill?.contract);
+            const symbol = pickBestContract([
+                fill?.symbol,
+                fill?.instrument,
+                fill?.contract,
+                fill?.product,
+                fill?.securityId,
+                fill?.SecurityId,
+                fill?.SecurityID,
+            ]);
 
             if (symbol) {
                 symbols.push(symbol);
@@ -387,7 +616,7 @@ function resolveSymbolSummary(closedTrades, fills) {
         }
     }
 
-    const uniqueSymbols = [...new Set(symbols)];
+    const uniqueSymbols = reduceContractsWithMicroPriority(symbols);
 
     if (uniqueSymbols.length === 0) {
         return "Keine Symbole";
@@ -446,22 +675,30 @@ function resolveWorstTrade(closedTrades) {
     }, Number.POSITIVE_INFINITY);
 }
 
-function resolveStatusLabel(provider, fillCount, closedTradeCount) {
+function resolveStatusLabel(provider, fillCount, closedTradeCount, historyLoading) {
     const providerLabel = formatProviderLabel(provider);
 
-    if (fillCount <= 0) {
-        return `Warte auf ${providerLabel}`;
+    if (historyLoading) {
+        return `${providerLabel} History lädt`;
     }
 
-    if (closedTradeCount <= 0) {
+    if (closedTradeCount > 0) {
+        return `${providerLabel} Daten aktiv`;
+    }
+
+    if (fillCount > 0) {
         return `${providerLabel} Fills geladen`;
     }
 
-    return `${providerLabel} Daten aktiv`;
+    return `Warte auf ${providerLabel}`;
 }
 
-function resolveStatusColor(provider, fillCount, closedTradeCount) {
-    if (fillCount <= 0) {
+function resolveStatusColor(provider, fillCount, closedTradeCount, historyLoading) {
+    if (historyLoading) {
+        return COLORS.warning;
+    }
+
+    if (closedTradeCount <= 0 && fillCount <= 0) {
         return COLORS.muted;
     }
 
@@ -508,6 +745,7 @@ function truncateMiddle(value, maxLength = 24) {
 function normalizeLiveClosedTrade(entry, index) {
     const gross =
         entry?.realizedPnlGross ??
+        entry?.grossPnL ??
         entry?.grossPnl ??
         entry?.gross ??
         entry?.pnlGross ??
@@ -521,9 +759,20 @@ function normalizeLiveClosedTrade(entry, index) {
 
     const net =
         entry?.realizedPnlNet ??
+        entry?.netPnL ??
         entry?.netPnl ??
         entry?.net ??
         (toNumber(gross, 0) - toNumber(commission, 0));
+
+    const symbol = pickBestContract([
+        entry?.symbol,
+        entry?.instrument,
+        entry?.contract,
+        entry?.product,
+        entry?.securityId,
+        entry?.SecurityId,
+        entry?.SecurityID,
+    ]) || "–";
 
     return {
         tradeId:
@@ -531,12 +780,7 @@ function normalizeLiveClosedTrade(entry, index) {
             cleanString(entry?.id) ||
             cleanString(entry?.positionId) ||
             `live-closed-trade-${index}`,
-        symbol:
-            cleanString(entry?.symbol) ||
-            cleanString(entry?.instrument) ||
-            cleanString(entry?.contract) ||
-            cleanString(entry?.product) ||
-            "–",
+        symbol,
         side:
             cleanString(entry?.side) ||
             cleanString(entry?.direction) ||
@@ -544,6 +788,7 @@ function normalizeLiveClosedTrade(entry, index) {
             "–",
         entryTime:
             entry?.entryTime ||
+            entry?.openTime ||
             entry?.openedAt ||
             entry?.createdAt ||
             entry?.timestamp ||
@@ -551,6 +796,7 @@ function normalizeLiveClosedTrade(entry, index) {
             "",
         exitTime:
             entry?.exitTime ||
+            entry?.closeTime ||
             entry?.closedAt ||
             entry?.updatedAt ||
             entry?.timestamp ||
@@ -558,21 +804,129 @@ function normalizeLiveClosedTrade(entry, index) {
             "",
         entryQty:
             entry?.entryQty ??
-            entry?.quantity ??
             entry?.qty ??
+            entry?.quantity ??
             entry?.contracts ??
             0,
         closedQty:
             entry?.closedQty ??
             entry?.exitQty ??
-            entry?.quantity ??
             entry?.qty ??
+            entry?.quantity ??
             entry?.contracts ??
             0,
         realizedPnlGross: gross,
         totalCommission: commission,
         realizedPnlNet: net,
+        source: cleanString(entry?.source || "live"),
     };
+}
+
+function normalizeAtasHistoryTrade(entry, index) {
+    const gross =
+        entry?.realizedPnlGross ??
+        entry?.grossPnL ??
+        entry?.grossPnl ??
+        entry?.pnl ??
+        entry?.PnL ??
+        0;
+
+    const commission =
+        entry?.totalCommission ??
+        entry?.commission ??
+        entry?.Commission ??
+        0;
+
+    const net =
+        entry?.realizedPnlNet ??
+        entry?.netPnL ??
+        entry?.netPnl ??
+        (toNumber(gross, 0) - toNumber(commission, 0));
+
+    const qty =
+        entry?.closedQty ??
+        entry?.entryQty ??
+        entry?.qty ??
+        entry?.quantity ??
+        0;
+
+    const symbol = pickBestContract([
+        entry?.symbol,
+        entry?.instrument,
+        entry?.contract,
+        entry?.product,
+        entry?.securityId,
+        entry?.SecurityId,
+        entry?.SecurityID,
+    ]) || "–";
+
+    return {
+        tradeId:
+            cleanString(entry?.tradeId) ||
+            cleanString(entry?.id) ||
+            `atas-history-trade-${index}`,
+        symbol,
+        side:
+            cleanString(entry?.side) ||
+            cleanString(entry?.direction) ||
+            "–",
+        entryTime:
+            entry?.entryTime ||
+            entry?.openTime ||
+            entry?.OpenTime ||
+            "",
+        exitTime:
+            entry?.exitTime ||
+            entry?.closeTime ||
+            entry?.CloseTime ||
+            entry?.timestamp ||
+            "",
+        entryQty: qty,
+        closedQty: qty,
+        realizedPnlGross: gross,
+        totalCommission: commission,
+        realizedPnlNet: net,
+        source: cleanString(entry?.source || "atas-history"),
+    };
+}
+
+function dedupeClosedTrades(trades) {
+    const map = new Map();
+
+    trades.forEach((trade, index) => {
+        if (!trade) {
+            return;
+        }
+
+        const key =
+            cleanString(trade.tradeId) ||
+            [
+                cleanString(trade.symbol),
+                cleanString(trade.side),
+                cleanString(trade.entryTime),
+                cleanString(trade.exitTime),
+                cleanString(trade.closedQty),
+                cleanString(trade.realizedPnlNet),
+                index,
+            ].join("|");
+
+        if (!key) {
+            return;
+        }
+
+        map.set(key, trade);
+    });
+
+    return Array.from(map.values());
+}
+
+function sortClosedTradesDesc(trades) {
+    return [...trades].sort((a, b) => {
+        const timeA = toTimeMs(a?.exitTime || a?.entryTime);
+        const timeB = toTimeMs(b?.exitTime || b?.entryTime);
+
+        return timeB - timeA;
+    });
 }
 
 function getLiveSnapshotFills(snapshot) {
@@ -613,6 +967,10 @@ function getLiveSnapshotClosedTrades(snapshot) {
     }
 
     return EMPTY_LIST;
+}
+
+function getDefaultEndDate() {
+    return new Date().toISOString().slice(0, 10);
 }
 
 export default function JournalPanel({
@@ -665,6 +1023,7 @@ export default function JournalPanel({
     );
 
     const providerLabel = formatProviderLabel(provider);
+    const isAtasProvider = normalizeProvider(provider) === "atas";
 
     const forceAtasZeroState = useMemo(() => {
         return shouldUseAtasZeroState(resolvedAccount, liveSnapshot, provider);
@@ -712,13 +1071,22 @@ export default function JournalPanel({
         );
     }, [forceAtasZeroState, resolvedAccount, liveSnapshot, provider]);
 
+    const [historyStartDate, setHistoryStartDate] = useState(ATAS_HISTORY_START_DATE);
+    const [historyEndDate, setHistoryEndDate] = useState(getDefaultEndDate);
+    const [atasHistoryState, setAtasHistoryState] = useState({
+        loading: false,
+        error: "",
+        trades: EMPTY_LIST,
+        readAt: "",
+    });
+
     const [localImports, setLocalImports] = useState(() => {
         return loadParsedImportsForProvider(resolvedAppAccountId, provider);
     });
 
     useEffect(() => {
         if (typeof window === "undefined") {
-            return;
+            return undefined;
         }
 
         const loadImports = () => {
@@ -746,6 +1114,71 @@ export default function JournalPanel({
             window.removeEventListener("focus", loadImports);
         };
     }, [resolvedAppAccountId, provider]);
+
+    useEffect(() => {
+        if (!isAtasProvider || forceAtasZeroState || !scopeAccountId) {
+            setAtasHistoryState({
+                loading: false,
+                error: "",
+                trades: EMPTY_LIST,
+                readAt: "",
+            });
+            return undefined;
+        }
+
+        const controller = new AbortController();
+
+        setAtasHistoryState((current) => ({
+            ...current,
+            loading: true,
+            error: "",
+        }));
+
+        fetchAtasHistoryTrades(
+            {
+                accountId: scopeAccountId,
+                start: historyStartDate || ATAS_HISTORY_START_DATE,
+                end: historyEndDate || getDefaultEndDate(),
+            },
+            controller.signal
+        )
+            .then((result) => {
+                const trades = Array.isArray(result?.trades)
+                    ? result.trades.map((trade, index) =>
+                        normalizeAtasHistoryTrade(trade, index)
+                    )
+                    : EMPTY_LIST;
+
+                setAtasHistoryState({
+                    loading: false,
+                    error: "",
+                    trades,
+                    readAt: result?.readAt || "",
+                });
+            })
+            .catch((error) => {
+                if (controller.signal.aborted) {
+                    return;
+                }
+
+                setAtasHistoryState({
+                    loading: false,
+                    error: cleanString(error?.message) || "ATAS History konnte nicht geladen werden.",
+                    trades: EMPTY_LIST,
+                    readAt: "",
+                });
+            });
+
+        return () => {
+            controller.abort();
+        };
+    }, [
+        isAtasProvider,
+        forceAtasZeroState,
+        scopeAccountId,
+        historyStartDate,
+        historyEndDate,
+    ]);
 
     const resolvedAccountImports = useMemo(() => {
         return resolveImportsForProvider(provider, resolvedAccount?.imports);
@@ -835,7 +1268,7 @@ export default function JournalPanel({
             return EMPTY_LIST;
         }
 
-        if (normalizeProvider(provider) === "atas") {
+        if (isAtasProvider) {
             if (liveSnapshotFills.length > 0) {
                 return liveSnapshotFills;
             }
@@ -848,7 +1281,12 @@ export default function JournalPanel({
         }
 
         return liveSnapshotFills;
-    }, [forceAtasZeroState, provider, liveSnapshotFills, importedFillList]);
+    }, [
+        forceAtasZeroState,
+        isAtasProvider,
+        liveSnapshotFills,
+        importedFillList,
+    ]);
 
     const analytics = useMemo(() => {
         const safeFills = Array.isArray(effectiveFillList) ? effectiveFillList : EMPTY_LIST;
@@ -864,25 +1302,50 @@ export default function JournalPanel({
         return Array.isArray(trades) ? trades : EMPTY_LIST;
     }, [analytics?.closedTrades]);
 
-    const closedTrades = useMemo(() => {
-        if (forceAtasZeroState) {
+    const historyClosedTrades = useMemo(() => {
+        if (!isAtasProvider || forceAtasZeroState) {
             return EMPTY_LIST;
         }
 
-        if (normalizeProvider(provider) === "atas") {
-            if (liveSnapshotClosedTrades.length > 0) {
-                return liveSnapshotClosedTrades;
-            }
+        return Array.isArray(atasHistoryState.trades)
+            ? atasHistoryState.trades
+            : EMPTY_LIST;
+    }, [isAtasProvider, forceAtasZeroState, atasHistoryState.trades]);
 
-            return analyticsClosedTrades;
+    const closedTrades = useMemo(() => {
+    if (forceAtasZeroState) {
+        return EMPTY_LIST;
+    }
+
+    if (isAtasProvider) {
+        if (historyClosedTrades.length > 0) {
+            return sortClosedTradesDesc(dedupeClosedTrades(historyClosedTrades));
         }
 
-        if (analyticsClosedTrades.length > 0) {
-            return analyticsClosedTrades;
-        }
+        return sortClosedTradesDesc(
+            dedupeClosedTrades([
+                ...liveSnapshotClosedTrades,
+                ...analyticsClosedTrades,
+            ])
+        );
+    }
 
-        return liveSnapshotClosedTrades;
-    }, [forceAtasZeroState, provider, liveSnapshotClosedTrades, analyticsClosedTrades]);
+    if (analyticsClosedTrades.length > 0) {
+        return sortClosedTradesDesc(analyticsClosedTrades);
+    }
+
+    return sortClosedTradesDesc(liveSnapshotClosedTrades);
+}, [
+    forceAtasZeroState,
+    isAtasProvider,
+    historyClosedTrades,
+    liveSnapshotClosedTrades,
+    analyticsClosedTrades,
+]);
+
+    const displayedHistoryTradeCount = isAtasProvider
+        ? closedTrades.length
+        : historyClosedTrades.length;
 
     const fillCount = Array.isArray(effectiveFillList) ? effectiveFillList.length : 0;
 
@@ -907,8 +1370,8 @@ export default function JournalPanel({
 
         return toNumber(
             analytics?.summary?.grossPnl ??
-            analytics?.summary?.realizedPnlGross ??
-            analytics?.summary?.pnlGross,
+                analytics?.summary?.realizedPnlGross ??
+                analytics?.summary?.pnlGross,
             0
         );
     }, [closedTrades, analytics?.summary]);
@@ -923,8 +1386,8 @@ export default function JournalPanel({
 
         return toNumber(
             analytics?.summary?.totalCommission ??
-            analytics?.summary?.commission ??
-            analytics?.summary?.commissions,
+                analytics?.summary?.commission ??
+                analytics?.summary?.commissions,
             0
         );
     }, [closedTrades, analytics?.summary]);
@@ -957,23 +1420,26 @@ export default function JournalPanel({
 
     const statusLabel = forceAtasZeroState
         ? "Warte auf ATAS"
-        : resolveStatusLabel(provider, fillCount, closedTrades.length);
+        : resolveStatusLabel(
+            provider,
+            fillCount,
+            closedTrades.length,
+            atasHistoryState.loading
+        );
 
     const statusColor = forceAtasZeroState
         ? COLORS.muted
-        : resolveStatusColor(provider, fillCount, closedTrades.length);
+        : resolveStatusColor(
+            provider,
+            fillCount,
+            closedTrades.length,
+            atasHistoryState.loading
+        );
 
     const recentTrades = useMemo(() => {
-        return [...closedTrades]
-            .sort((a, b) => {
-                const timeA = new Date(a?.exitTime || a?.entryTime || 0).getTime();
-                const timeB = new Date(b?.exitTime || b?.entryTime || 0).getTime();
-                return timeB - timeA;
-            })
-            .slice(0, 5);
+        return closedTrades.slice(0, 5);
     }, [closedTrades]);
-
-    return (
+        return (
         <section
             style={{
                 background: COLORS.panelBg,
@@ -1015,7 +1481,7 @@ export default function JournalPanel({
                             lineHeight: 1.45,
                         }}
                     >
-                        Closed Trades aus deinen Fills. Net, Gross und Kommission im Hauptfokus für den aktiven Account.
+                        Closed Trades aus ATAS History, Live Fills und CSV Daten für den aktiven Account.
                     </div>
 
                     <div
@@ -1063,7 +1529,7 @@ export default function JournalPanel({
                     <div
                         style={{
                             ...badgeStyle,
-                            color: normalizeProvider(provider) === "atas"
+                            color: isAtasProvider
                                 ? COLORS.purple
                                 : COLORS.cyan,
                         }}
@@ -1074,8 +1540,79 @@ export default function JournalPanel({
                     <div style={badgeStyle}>
                         {formatInteger(closedTrades.length)} Trades
                     </div>
+
+                    {isAtasProvider ? (
+                        <div style={badgeStyle}>
+                            History ab {formatDateLabel(historyStartDate)}
+                        </div>
+                    ) : null}
                 </div>
             </div>
+
+            {isAtasProvider ? (
+                <div
+                    style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))",
+                        gap: 10,
+                        marginBottom: 18,
+                        padding: 14,
+                        borderRadius: 18,
+                        border: `1px solid ${COLORS.border}`,
+                        background: COLORS.cardBgSoft,
+                    }}
+                >
+                    <label style={filterLabelStyle}>
+                        Startdatum
+                        <input
+                            type="date"
+                            value={historyStartDate}
+                            min={ATAS_HISTORY_START_DATE}
+                            onChange={(event) => setHistoryStartDate(event.target.value)}
+                            style={filterInputStyle}
+                        />
+                    </label>
+
+                    <label style={filterLabelStyle}>
+                        Enddatum
+                        <input
+                            type="date"
+                            value={historyEndDate}
+                            min={ATAS_HISTORY_START_DATE}
+                            onChange={(event) => setHistoryEndDate(event.target.value)}
+                            style={filterInputStyle}
+                        />
+                    </label>
+
+                    <div style={filterInfoStyle}>
+                        <div style={filterInfoLabelStyle}>History Trades</div>
+                        <div style={filterInfoValueStyle}>
+                            {atasHistoryState.loading
+                                ? "Lädt..."
+                                : formatInteger(displayedHistoryTradeCount)}
+                        </div>
+                    </div>
+
+                    <div style={filterInfoStyle}>
+                        <div style={filterInfoLabelStyle}>Quelle</div>
+                        <div style={filterInfoValueStyle}>
+                            HistoryMyTrade.cdb
+                        </div>
+                    </div>
+
+                    {atasHistoryState.error ? (
+                        <div
+                            style={{
+                                ...filterInfoStyle,
+                                borderColor: "rgba(239, 68, 68, 0.28)",
+                                color: COLORS.negative,
+                            }}
+                        >
+                            {atasHistoryState.error}
+                        </div>
+                    ) : null}
+                </div>
+            ) : null}
 
             <div
                 style={{
@@ -1176,7 +1713,7 @@ export default function JournalPanel({
                                     marginTop: 4,
                                 }}
                             >
-                                Zeit, Symbol, Side, Qty, Gross, Commission und Net im Hauptfokus
+                                Zeit, Symbol, Side, Qty, Gross, Commission und Net
                             </div>
                         </div>
 
@@ -1191,7 +1728,10 @@ export default function JournalPanel({
                                 Provider {providerLabel}
                             </span>
                             <span style={tableMetaPillStyle}>
-                                Fills {formatInteger(fillCount)}
+                                Live Fills {formatInteger(fillCount)}
+                            </span>
+                            <span style={tableMetaPillStyle}>
+                                History {formatInteger(displayedHistoryTradeCount)}
                             </span>
                             <span style={tableMetaPillStyle}>
                                 Win Rate {formatNumber(winRate, 1)}%
@@ -1222,7 +1762,7 @@ export default function JournalPanel({
                                 style={{
                                     width: "100%",
                                     borderCollapse: "collapse",
-                                    minWidth: 980,
+                                    minWidth: 1040,
                                 }}
                             >
                                 <thead
@@ -1238,6 +1778,7 @@ export default function JournalPanel({
                                         <th style={headerCellStyle}>Gross</th>
                                         <th style={headerCellStyle}>Commission</th>
                                         <th style={headerCellStyle}>Net</th>
+                                        <th style={headerCellStyle}>Quelle</th>
                                         <th style={headerCellStyle}>Trade ID</th>
                                     </tr>
                                 </thead>
@@ -1308,6 +1849,12 @@ export default function JournalPanel({
                                             </td>
 
                                             <td style={bodyCellStyle}>
+                                                <span style={miniTagStyle}>
+                                                    {trade.source || "–"}
+                                                </span>
+                                            </td>
+
+                                            <td style={bodyCellStyle}>
                                                 <span style={monoTextStyle}>
                                                     {truncateMiddle(trade.tradeId, 26)}
                                                 </span>
@@ -1352,8 +1899,20 @@ export default function JournalPanel({
                             </div>
 
                             <div style={metaRowStyle}>
-                                <span style={metaKeyStyle}>Fills gesamt</span>
+                                <span style={metaKeyStyle}>Live Fills</span>
                                 <span style={metaValueStyle}>{formatInteger(fillCount)}</span>
+                            </div>
+
+                            <div style={metaRowStyle}>
+                                <span style={metaKeyStyle}>History Trades</span>
+                                <span style={metaValueStyle}>{formatInteger(displayedHistoryTradeCount)}</span>
+                            </div>
+
+                            <div style={metaRowStyle}>
+                                <span style={metaKeyStyle}>Zeitraum</span>
+                                <span style={metaValueStyle}>
+                                    {formatDateLabel(historyStartDate)} bis {formatDateLabel(historyEndDate)}
+                                </span>
                             </div>
 
                             <div style={metaRowStyle}>
@@ -1428,8 +1987,7 @@ export default function JournalPanel({
                             </div>
                         </div>
                     </div>
-
-                    <div style={sideCardStyle}>
+                              <div style={sideCardStyle}>
                         <div style={sideCardTitleStyle}>Letzte Trades</div>
 
                         {recentTrades.length === 0 ? (
@@ -1520,6 +2078,10 @@ export default function JournalPanel({
                                                     <span style={miniTagStyle}>
                                                         Qty {formatNumber(trade.closedQty ?? trade.entryQty, 0)}
                                                     </span>
+
+                                                    <span style={miniTagStyle}>
+                                                        {trade.source || "–"}
+                                                    </span>
                                                 </div>
 
                                                 <div
@@ -1577,6 +2139,46 @@ export default function JournalPanel({
         </section>
     );
 }
+
+const filterLabelStyle = {
+    display: "grid",
+    gap: 6,
+    color: COLORS.muted,
+    fontSize: 12,
+    fontWeight: 700,
+};
+
+const filterInputStyle = {
+    width: "100%",
+    borderRadius: 10,
+    border: `1px solid ${COLORS.border}`,
+    background: "rgba(255,255,255,0.04)",
+    color: COLORS.text,
+    padding: "9px 10px",
+    outline: "none",
+    fontSize: 12,
+};
+
+const filterInfoStyle = {
+    borderRadius: 12,
+    border: `1px solid ${COLORS.border}`,
+    background: "rgba(255,255,255,0.03)",
+    padding: 10,
+    display: "grid",
+    gap: 4,
+};
+
+const filterInfoLabelStyle = {
+    color: COLORS.muted,
+    fontSize: 11,
+    fontWeight: 700,
+};
+
+const filterInfoValueStyle = {
+    color: COLORS.text,
+    fontSize: 13,
+    fontWeight: 800,
+};
 
 const badgeStyle = {
     padding: "8px 12px",
@@ -1760,4 +2362,4 @@ const miniTagStyle = {
     color: COLORS.text,
     fontSize: 11,
     fontWeight: 700,
-};
+};          

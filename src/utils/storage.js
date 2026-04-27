@@ -10,7 +10,7 @@ import {
 
 const STORAGE_KEY = "tradingAppData"
 const STORAGE_EVENT = "future-dashboard-storage"
-const DATA_VERSION = 13
+const DATA_VERSION = 15
 
 const DEFAULT_SLOT_STATE = {
     rules: [],
@@ -48,6 +48,10 @@ const DEFAULT_ACCOUNT = {
     productType: "eod",
     accountPhase: "eval",
     accountStatus: "open",
+    evalStartDate: "",
+    accessStartDate: "",
+    accessEndDate: "",
+    paActivationDeadlineDate: "",
     accountSize: 0,
     startingBalance: 0,
     currentBalance: 0,
@@ -106,6 +110,22 @@ const CSV_IMPORT_KEYS = [
 
 const STANDARD_ACCOUNT_SIZES = [25000, 50000, 100000, 150000]
 
+const KNOWN_LIFECYCLE_DATES = {
+    APEX42513409: {
+        evalStartDate: "2026-04-04",
+        accessStartDate: "2026-04-04",
+        accessEndDate: "2026-05-03",
+    },
+}
+
+const KNOWN_ACCOUNT_LINKS = [
+    {
+        evalKey: "APEX42513408",
+        paKey: "PAAPEX42513402",
+        productType: "eod",
+    },
+]
+
 const DEFAULT_DATA = {
     version: DATA_VERSION,
     accounts: [],
@@ -142,6 +162,358 @@ function cleanString(value) {
     return String(value).trim()
 }
 
+function toNumber(value, fallback = 0) {
+    if (typeof value === "number") {
+        return Number.isFinite(value) ? value : fallback
+    }
+
+    const text = cleanString(value)
+        .replace(/\s/g, "")
+        .replace(/[$€£]/g, "")
+        .replace(/USD|EUR|CHF/gi, "")
+        .replace(/'/g, "")
+
+    if (!text) {
+        return fallback
+    }
+
+    const normalized =
+        text.includes(",") && text.includes(".")
+            ? text.lastIndexOf(",") > text.lastIndexOf(".")
+                ? text.replace(/\./g, "").replace(/,/g, ".")
+                : text.replace(/,/g, "")
+            : text.includes(",")
+                ? text.replace(/,/g, ".")
+                : text
+
+    const parsed = Number(normalized)
+
+    return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function toBoolean(value) {
+    if (typeof value === "boolean") {
+        return value
+    }
+
+    if (typeof value === "number") {
+        return value !== 0
+    }
+
+    const text = cleanString(value).toLowerCase()
+
+    if (["true", "yes", "ja", "1"].includes(text)) {
+        return true
+    }
+
+    if (["false", "no", "nein", "0"].includes(text)) {
+        return false
+    }
+
+    return Boolean(value)
+}
+
+function unique(values) {
+    return Array.from(new Set((values || []).map(cleanString).filter(Boolean)))
+}
+
+function normalizeApexLifecycleKey(value) {
+    return cleanString(value)
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "")
+}
+
+function normalizeDateOnly(value) {
+    const text = cleanString(value)
+
+    if (!text) {
+        return ""
+    }
+
+    if (/^\d{4}-\d{2}-\d{2}/.test(text)) {
+        return text.slice(0, 10)
+    }
+
+    const date = new Date(text)
+
+    if (Number.isNaN(date.getTime())) {
+        return ""
+    }
+
+    return date.toISOString().slice(0, 10)
+}
+
+function pickDateOnly(...values) {
+    for (const value of values) {
+        const date = normalizeDateOnly(value)
+
+        if (date) {
+            return date
+        }
+    }
+
+    return ""
+}
+
+function addCalendarDaysInclusive(startDate, totalDays) {
+    const normalizedStartDate = normalizeDateOnly(startDate)
+    const numericDays = Number(totalDays)
+
+    if (!normalizedStartDate || !Number.isFinite(numericDays) || numericDays <= 0) {
+        return ""
+    }
+
+    const date = new Date(`${normalizedStartDate}T00:00:00.000Z`)
+    date.setUTCDate(date.getUTCDate() + Math.max(0, Math.floor(numericDays) - 1))
+
+    return date.toISOString().slice(0, 10)
+}
+
+function formatMoney(value) {
+    return new Intl.NumberFormat("de-CH", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+    }).format(toNumber(value, 0))
+}
+
+function getMoneyLine(label, value, options = {}) {
+    const allowZero = options.allowZero ?? true
+    const emptyText = options.emptyText ?? "offen"
+    const numeric = Number(value)
+
+    if (!Number.isFinite(numeric)) {
+        return `${label}: ${emptyText}`
+    }
+
+    if (!allowZero && numeric === 0) {
+        return `${label}: ${emptyText}`
+    }
+
+    return `${label}: ${formatMoney(numeric)}`
+}
+
+function sortHistory(history) {
+    return [...(history || [])].sort((a, b) => {
+        const left = cleanString(a?.createdAt)
+        const right = cleanString(b?.createdAt)
+        return left.localeCompare(right)
+    })
+}
+
+function createHistoryEntry(type, payload = {}) {
+    return {
+        id: `${type}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        type: cleanString(type),
+        createdAt: nowIso(),
+        ...payload,
+    }
+}
+
+function normalizeProductType(value) {
+    const normalized = cleanString(value).toLowerCase()
+
+    if (normalized === "intraday" || normalized === "intra") {
+        return "intraday"
+    }
+
+    return "eod"
+}
+
+function normalizeAccountPhase(value) {
+    const normalized = cleanString(value).toLowerCase()
+
+    if (normalized === "pa") {
+        return "pa"
+    }
+
+    return "eval"
+}
+
+function normalizeAccountStatus(value) {
+    const normalized = cleanString(value).toLowerCase()
+
+    if (normalized === "active") {
+        return "active"
+    }
+
+    if (normalized === "passed") {
+        return "passed"
+    }
+
+    if (normalized === "failed") {
+        return "failed"
+    }
+
+    if (normalized === "archived" || normalized === "archive") {
+        return "archived"
+    }
+
+    return "open"
+}
+
+function getDefaultDataProviderStatus(provider) {
+    return normalizeDataProvider(provider) === "atas" ? "disconnected" : "ready"
+}
+
+function getAccountDataProvider(account) {
+    return normalizeDataProvider(
+        account?.dataProvider ||
+        account?.source?.provider ||
+        "tradovate"
+    )
+}
+
+export function normalizeAccountSize(value, fallback = 0) {
+    const numeric = toNumber(value, 0)
+
+    if (numeric > 0) {
+        const normalizedNumeric = numeric < 1000 ? numeric * 1000 : numeric
+        const closest = findClosestStandardAccountSize(normalizedNumeric)
+        const tolerance = Math.max(closest * 0.15, 1000)
+
+        if (closest > 0 && Math.abs(normalizedNumeric - closest) <= tolerance) {
+            return closest
+        }
+
+        return Math.round(normalizedNumeric)
+    }
+
+    const fallbackNumeric = toNumber(fallback, 0)
+
+    if (fallbackNumeric > 0) {
+        return normalizeAccountSize(fallbackNumeric, 0)
+    }
+
+    return 0
+}
+
+function findClosestStandardAccountSize(value) {
+    const numeric = toNumber(value, 0)
+
+    if (numeric <= 0) {
+        return 0
+    }
+
+    let closest = STANDARD_ACCOUNT_SIZES[0]
+    let smallestDistance = Math.abs(numeric - closest)
+
+    for (const size of STANDARD_ACCOUNT_SIZES) {
+        const distance = Math.abs(numeric - size)
+
+        if (distance < smallestDistance) {
+            smallestDistance = distance
+            closest = size
+        }
+    }
+
+    return closest
+}
+
+export function formatAccountSizeLabel(value) {
+    const normalized = normalizeAccountSize(value, 0)
+
+    if (!normalized) {
+        return ""
+    }
+
+    if (normalized >= 1000) {
+        return `${Math.round(normalized / 1000)}K`
+    }
+
+    return String(normalized)
+}
+
+export function detectAccountSize(value) {
+    const rawText = cleanString(value).toLowerCase()
+
+    if (!rawText) {
+        return 0
+    }
+
+    const normalized = rawText
+        .replace(/[$()]/g, " ")
+        .replace(/[_./-]+/g, " ")
+        .replace(/,/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+
+    const compact = normalized.replace(/\s+/g, "")
+
+    if (
+        compact.includes("150k") ||
+        compact.includes("150000") ||
+        /\b150\s*k\b/.test(normalized) ||
+        /\b150\s*000\b/.test(normalized) ||
+        /\b150000\b/.test(normalized)
+    ) {
+        return 150000
+    }
+
+    if (
+        compact.includes("100k") ||
+        compact.includes("100000") ||
+        /\b100\s*k\b/.test(normalized) ||
+        /\b100\s*000\b/.test(normalized) ||
+        /\b100000\b/.test(normalized)
+    ) {
+        return 100000
+    }
+
+    if (
+        compact.includes("50k") ||
+        compact.includes("50000") ||
+        /\b50\s*k\b/.test(normalized) ||
+        /\b50\s*000\b/.test(normalized) ||
+        /\b50000\b/.test(normalized)
+    ) {
+        return 50000
+    }
+
+    if (
+        compact.includes("25k") ||
+        compact.includes("25000") ||
+        /\b25\s*k\b/.test(normalized) ||
+        /\b25\s*000\b/.test(normalized) ||
+        /\b25000\b/.test(normalized)
+    ) {
+        return 25000
+    }
+
+    return 0
+}
+
+function getEvalProfitTargetBySize(accountSize) {
+    const size = normalizeAccountSize(accountSize, 0)
+
+    if (size === 25000) {
+        return 1500
+    }
+
+    if (size === 50000) {
+        return 3000
+    }
+
+    if (size === 100000) {
+        return 6000
+    }
+
+    if (size === 150000) {
+        return 9000
+    }
+
+    return 0
+}
+
+function resolveInitialStatusForNewAccount(phase, status) {
+    const normalizedPhase = normalizeAccountPhase(phase)
+    const normalizedStatus = normalizeAccountStatus(status)
+
+    if (normalizedPhase === "eval" && normalizedStatus === "open") {
+        return "active"
+    }
+
+    return normalizedStatus
+}
 function toArrayRows(value) {
     return Array.isArray(value) ? value : []
 }
@@ -230,6 +602,35 @@ function resolveTradingAccountNameFromAccountLike(input = {}, fallbackId = "") {
     return cleanString(fallbackId)
 }
 
+function resolveDetectedAccountSizeFromAccountLike(input = {}) {
+    const candidates = [
+        input?.tradingAccountId,
+        input?.tradingAccountName,
+        input?.tradovateAccountId,
+        input?.tradovateAccountName,
+        input?.atasAccountId,
+        input?.atasAccountName,
+        input?.dataProviderAccountId,
+        input?.dataProviderAccountName,
+        input?.id,
+        input?.displayName,
+        input?.accountId,
+        input?.accountName,
+        input?.name,
+        input?.label,
+    ]
+
+    for (const candidate of candidates) {
+        const detected = detectAccountSize(candidate)
+
+        if (detected > 0) {
+            return detected
+        }
+    }
+
+    return 0
+}
+
 function createEmptyCsvImport(type) {
     return {
         type: cleanString(type),
@@ -264,111 +665,326 @@ function getEmptyCsvImports() {
     }
 }
 
-function toNumber(value, fallback = 0) {
-    const parsed = Number(value)
-    return Number.isFinite(parsed) ? parsed : fallback
-}
+function normalizeImportType(type) {
+    const safeType = cleanString(type)
 
-function toBoolean(value) {
-    return Boolean(value)
-}
-
-function formatMoney(value) {
-    return new Intl.NumberFormat("de-CH", {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-    }).format(toNumber(value, 0))
-}
-
-function getMoneyLine(label, value, options = {}) {
-    const allowZero = options.allowZero ?? true
-    const emptyText = options.emptyText ?? "offen"
-    const numeric = Number(value)
-
-    if (!Number.isFinite(numeric)) {
-        return `${label}: ${emptyText}`
+    if (safeType === "dailySummary") {
+        return "cashHistory"
     }
 
-    if (!allowZero && numeric === 0) {
-        return `${label}: ${emptyText}`
+    if (CSV_IMPORT_KEYS.includes(safeType)) {
+        return safeType
     }
 
-    return `${label}: ${formatMoney(numeric)}`
+    return ""
 }
 
-function unique(values) {
-    return Array.from(new Set((values || []).map(cleanString).filter(Boolean)))
-}
-
-function sortHistory(history) {
-    return [...(history || [])].sort((a, b) => {
-        const left = cleanString(a?.createdAt)
-        const right = cleanString(b?.createdAt)
-        return left.localeCompare(right)
-    })
-}
-
-function createHistoryEntry(type, payload = {}) {
+function cloneCsvImportEntry(type, source = {}) {
     return {
-        id: `${type}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        type: cleanString(type),
-        createdAt: nowIso(),
-        ...payload,
+        ...createEmptyCsvImport(type),
+        ...(source || {}),
+        type,
+        fileName: cleanString(source?.fileName),
+        importedAt: cleanString(source?.importedAt),
+        headers: Array.isArray(source?.headers) ? source.headers : [],
+        rows: Array.isArray(source?.rows) ? source.rows : [],
+        previewRows: Array.isArray(source?.previewRows) ? source.previewRows : [],
+        rawText: String(source?.rawText || ""),
+        appAccountId: cleanString(source?.appAccountId),
+        appAccountName: cleanString(source?.appAccountName),
+        tradingAccountId: cleanString(source?.tradingAccountId),
+        tradingAccountName: cleanString(source?.tradingAccountName),
+        tradingAccountKey: cleanString(source?.tradingAccountKey),
+        csvAccountRaw: cleanString(source?.csvAccountRaw),
     }
 }
 
-function normalizeProductType(value) {
-    const normalized = cleanString(value).toLowerCase()
-
-    if (normalized === "intraday" || normalized === "intra") {
-        return "intraday"
-    }
-
-    return "eod"
+function normalizeCsvImportsShape(value) {
+    return normalizeProviderImportsShape(value || getEmptyCsvImports())
 }
 
-function normalizeAccountPhase(value) {
-    const normalized = cleanString(value).toLowerCase()
+function getPreferredCsvImportMeta(value) {
+    const normalizedImports = normalizeCsvImportsShape(value)
 
-    if (normalized === "pa") {
-        return "pa"
+    const candidates = [
+        normalizedImports.cashHistory,
+        normalizedImports.trades,
+        normalizedImports.orders,
+        normalizedImports.performance,
+        normalizedImports.positionHistory,
+    ]
+
+    for (const entry of candidates) {
+        const tradingAccountId = cleanString(entry?.tradingAccountId || entry?.csvAccountRaw)
+        const tradingAccountName = cleanString(entry?.tradingAccountName || tradingAccountId)
+        const tradingAccountKey = cleanString(
+            entry?.tradingAccountKey ||
+            normalizeAccountLookup(tradingAccountId || tradingAccountName)
+        )
+
+        if (tradingAccountId || tradingAccountName) {
+            return {
+                appAccountId: cleanString(entry?.appAccountId),
+                appAccountName: cleanString(entry?.appAccountName),
+                tradingAccountId,
+                tradingAccountName,
+                tradingAccountKey,
+                csvAccountRaw: cleanString(entry?.csvAccountRaw),
+            }
+        }
     }
 
-    return "eval"
+    return {
+        appAccountId: "",
+        appAccountName: "",
+        tradingAccountId: "",
+        tradingAccountName: "",
+        tradingAccountKey: "",
+        csvAccountRaw: "",
+    }
 }
 
-function normalizeAccountStatus(value) {
-    const normalized = cleanString(value).toLowerCase()
+function getKnownLifecycleDateOverrides(account = {}) {
+    const candidates = [
+        account?.id,
+        account?.displayName,
+        account?.tradingAccountId,
+        account?.tradingAccountName,
+        account?.tradovateAccountId,
+        account?.tradovateAccountName,
+        account?.atasAccountId,
+        account?.atasAccountName,
+        account?.dataProviderAccountId,
+        account?.dataProviderAccountName,
+        account?.accountId,
+        account?.accountName,
+        account?.name,
+        account?.label,
+        account?.source?.accountId,
+        account?.source?.accountName,
+    ]
 
-    if (normalized === "active") {
-        return "active"
+    for (const candidate of candidates) {
+        const key = normalizeApexLifecycleKey(candidate)
+
+        if (key && KNOWN_LIFECYCLE_DATES[key]) {
+            return KNOWN_LIFECYCLE_DATES[key]
+        }
     }
 
-    if (normalized === "passed") {
-        return "passed"
-    }
-
-    if (normalized === "failed") {
-        return "failed"
-    }
-
-    if (normalized === "archived" || normalized === "archive") {
-        return "archived"
-    }
-
-    return "open"
+    return {}
 }
 
-function getDefaultDataProviderStatus(provider) {
-    return normalizeDataProvider(provider) === "atas" ? "disconnected" : "ready"
+function getKnownAccountLinkCandidates(account = {}) {
+    return [
+        account?.id,
+        account?.displayName,
+        account?.tradingAccountId,
+        account?.tradingAccountName,
+        account?.tradovateAccountId,
+        account?.tradovateAccountName,
+        account?.atasAccountId,
+        account?.atasAccountName,
+        account?.dataProviderAccountId,
+        account?.dataProviderAccountName,
+        account?.accountId,
+        account?.accountName,
+        account?.name,
+        account?.label,
+        account?.source?.accountId,
+        account?.source?.accountName,
+    ]
+        .map(normalizeApexLifecycleKey)
+        .filter(Boolean)
 }
 
-function getAccountDataProvider(account) {
-    return normalizeDataProvider(
-        account?.dataProvider ||
-        account?.source?.provider ||
-        "tradovate"
+function accountMatchesKnownAccountKey(account, knownKey) {
+    const normalizedKnownKey = normalizeApexLifecycleKey(knownKey)
+
+    if (!normalizedKnownKey) {
+        return false
+    }
+
+    return getKnownAccountLinkCandidates(account).includes(normalizedKnownKey)
+}
+
+function findKnownAccountByKey(accounts, knownKey, phase = "") {
+    const normalizedPhase = phase ? normalizeAccountPhase(phase) : ""
+
+    return (accounts || []).find((account) => {
+        if (!account) {
+            return false
+        }
+
+        if (
+            normalizedPhase &&
+            normalizeAccountPhase(account.accountPhase) !== normalizedPhase
+        ) {
+            return false
+        }
+
+        return accountMatchesKnownAccountKey(account, knownKey)
+    }) || null
+}
+
+function applyKnownAccountLinks(accounts) {
+    const safeAccounts = Array.isArray(accounts) ? accounts : []
+
+    KNOWN_ACCOUNT_LINKS.forEach((link) => {
+        const evalAccount =
+            findKnownAccountByKey(safeAccounts, link.evalKey, "eval") ||
+            findKnownAccountByKey(safeAccounts, link.evalKey, "")
+
+        const paAccount =
+            findKnownAccountByKey(safeAccounts, link.paKey, "pa") ||
+            findKnownAccountByKey(safeAccounts, link.paKey, "")
+
+        if (!evalAccount || !paAccount) {
+            return
+        }
+
+        const productType = normalizeProductType(
+            link.productType ||
+            evalAccount.productType ||
+            paAccount.productType ||
+            "eod"
+        )
+
+        const fixedGroupId = `group_${productType}_${normalizeApexLifecycleKey(link.evalKey)}`
+
+        evalAccount.accountPhase = "eval"
+        paAccount.accountPhase = "pa"
+
+        evalAccount.productType = productType
+        paAccount.productType = productType
+
+        evalAccount.accountGroupId = fixedGroupId
+        paAccount.accountGroupId = fixedGroupId
+
+        evalAccount.linkedPaAccountIds = unique([paAccount.id])
+        paAccount.linkedEvalAccountId = evalAccount.id
+
+        evalAccount.accountStatus = "passed"
+
+        if (
+            normalizeAccountStatus(paAccount.accountStatus) !== "failed" &&
+            normalizeAccountStatus(paAccount.accountStatus) !== "archived"
+        ) {
+            paAccount.accountStatus = "active"
+        }
+
+        safeAccounts.forEach((account) => {
+            if (
+                !account ||
+                account.id === paAccount.id ||
+                account.id === evalAccount.id
+            ) {
+                return
+            }
+
+            if (
+                normalizeAccountPhase(account.accountPhase) !== "eval" ||
+                normalizeProductType(account.productType) !== productType
+            ) {
+                return
+            }
+
+            account.linkedPaAccountIds = (account.linkedPaAccountIds || []).filter(
+                (value) => value !== paAccount.id
+            )
+        })
+    })
+
+    return safeAccounts
+}
+
+function applyKnownLifecycleDates(account = {}) {
+    const overrides = getKnownLifecycleDateOverrides(account)
+    const phase = normalizeAccountPhase(account.accountPhase)
+    const status = normalizeAccountStatus(account.accountStatus)
+
+    const evalStartDate = pickDateOnly(
+        account.evalStartDate,
+        overrides.evalStartDate,
+        account.accessStartDate,
+        overrides.accessStartDate,
+        phase === "eval" ? account.createdAt : ""
     )
+
+    const accessStartDate = pickDateOnly(
+        account.accessStartDate,
+        overrides.accessStartDate,
+        evalStartDate
+    )
+
+    const accessEndDate = pickDateOnly(
+        account.accessEndDate,
+        overrides.accessEndDate,
+        phase === "eval" && accessStartDate
+            ? addCalendarDaysInclusive(accessStartDate, 30)
+            : ""
+    )
+
+    const passedAt = pickDateOnly(
+        account.passedAt,
+        account.passDate,
+        account.evaluationPassedAt
+    )
+
+    const paActivationDeadlineDate = pickDateOnly(
+        account.paActivationDeadlineDate,
+        overrides.paActivationDeadlineDate,
+        phase === "eval" && passedAt
+            ? addCalendarDaysInclusive(passedAt, 7)
+            : ""
+    )
+
+    return {
+        ...account,
+        accountStatus: status,
+        evalStartDate,
+        accessStartDate,
+        accessEndDate,
+        paActivationDeadlineDate,
+        activatedAt: cleanString(account.activatedAt),
+        passedAt,
+        failedAt: cleanString(account.failedAt),
+        archivedAt: cleanString(account.archivedAt),
+    }
+}
+
+function copyLifecycleFields(target, source = {}) {
+    if (!target || !source || typeof source !== "object") {
+        return
+    }
+
+    const dateOnlyKeys = [
+        "evalStartDate",
+        "accessStartDate",
+        "accessEndDate",
+        "paActivationDeadlineDate",
+    ]
+
+    dateOnlyKeys.forEach((key) => {
+        if (Object.prototype.hasOwnProperty.call(source, key)) {
+            target[key] = normalizeDateOnly(source[key])
+        }
+    })
+
+    const timestampKeys = [
+        "activatedAt",
+        "passedAt",
+        "failedAt",
+        "archivedAt",
+        "statusChangedAt",
+        "phaseChangedAt",
+    ]
+
+    timestampKeys.forEach((key) => {
+        if (Object.prototype.hasOwnProperty.call(source, key)) {
+            target[key] = cleanString(source[key])
+        }
+    })
 }
 
 function normalizeSlotState(value) {
@@ -414,7 +1030,6 @@ function createEmptyGroupSlots() {
         paIntraday: null,
     }
 }
-
 function getAccountProvider(account) {
     const provider = cleanString(
         account?.provider ||
@@ -717,239 +1332,150 @@ function decorateAccountWithDerivedSlotState(account, dailyState = null) {
     }
 }
 
-function findClosestStandardAccountSize(value) {
-    const numeric = toNumber(value, 0)
-
-    if (numeric <= 0) {
-        return 0
+function isPaAccountValidForLinkedEval(paAccount, dailyState = null) {
+    if (!paAccount) {
+        return false
     }
 
-    let closest = STANDARD_ACCOUNT_SIZES[0]
-    let smallestDistance = Math.abs(numeric - closest)
+    const status = normalizeAccountStatus(paAccount.accountStatus)
 
-    for (const size of STANDARD_ACCOUNT_SIZES) {
-        const distance = Math.abs(numeric - size)
+    if (status === "failed" || status === "archived") {
+        return false
+    }
 
-        if (distance < smallestDistance) {
-            smallestDistance = distance
-            closest = size
+    const state = normalizeDailyState(dailyState || {})
+
+    if (
+        toBoolean(state.trailingDrawdownViolation) ||
+        toBoolean(state.liquidationPriceBreached) ||
+        toBoolean(state.isLocked)
+    ) {
+        return false
+    }
+
+    return status === "active" || status === "passed" || status === "open"
+}
+
+function getLinkedPaAccounts(accounts, evalAccountId, productType = "") {
+    const evalId = cleanString(evalAccountId)
+    const normalizedProductType = productType
+        ? normalizeProductType(productType)
+        : ""
+
+    if (!evalId) {
+        return []
+    }
+
+    return (accounts || []).filter((account) => {
+        if (normalizeAccountPhase(account.accountPhase) !== "pa") {
+            return false
         }
-    }
 
-    return closest
-}
-
-export function normalizeAccountSize(value, fallback = 0) {
-    const numeric = toNumber(value, 0)
-
-    if (numeric > 0) {
-        const closest = findClosestStandardAccountSize(numeric)
-        const tolerance = Math.max(closest * 0.15, 1000)
-
-        if (closest > 0 && Math.abs(numeric - closest) <= tolerance) {
-            return closest
+        if (cleanString(account.linkedEvalAccountId) !== evalId) {
+            return false
         }
 
-        return Math.round(numeric)
-    }
-
-    const fallbackNumeric = toNumber(fallback, 0)
-
-    if (fallbackNumeric > 0) {
-        return normalizeAccountSize(fallbackNumeric, 0)
-    }
-
-    return 0
-}
-
-export function formatAccountSizeLabel(value) {
-    const normalized = normalizeAccountSize(value, 0)
-
-    if (!normalized) {
-        return ""
-    }
-
-    if (normalized >= 1000) {
-        return `${Math.round(normalized / 1000)}K`
-    }
-
-    return String(normalized)
-}
-
-export function detectAccountSize(value) {
-    const rawText = cleanString(value).toLowerCase()
-
-    if (!rawText) {
-        return 0
-    }
-
-    const normalized = rawText
-        .replace(/[$()]/g, " ")
-        .replace(/[_./-]+/g, " ")
-        .replace(/,/g, "")
-        .replace(/\s+/g, " ")
-        .trim()
-
-    const compact = normalized.replace(/\s+/g, "")
-
-    if (
-        compact.includes("150k") ||
-        compact.includes("150000") ||
-        /\b150\s*k\b/.test(normalized) ||
-        /\b150\s*000\b/.test(normalized) ||
-        /\b150000\b/.test(normalized)
-    ) {
-        return 150000
-    }
-
-    if (
-        compact.includes("100k") ||
-        compact.includes("100000") ||
-        /\b100\s*k\b/.test(normalized) ||
-        /\b100\s*000\b/.test(normalized) ||
-        /\b100000\b/.test(normalized)
-    ) {
-        return 100000
-    }
-
-    if (
-        compact.includes("50k") ||
-        compact.includes("50000") ||
-        /\b50\s*k\b/.test(normalized) ||
-        /\b50\s*000\b/.test(normalized) ||
-        /\b50000\b/.test(normalized)
-    ) {
-        return 50000
-    }
-
-    if (
-        compact.includes("25k") ||
-        compact.includes("25000") ||
-        /\b25\s*k\b/.test(normalized) ||
-        /\b25\s*000\b/.test(normalized) ||
-        /\b25000\b/.test(normalized)
-    ) {
-        return 25000
-    }
-
-    return 0
-}
-
-function resolveDetectedAccountSizeFromAccountLike(input = {}) {
-    const candidates = [
-        input?.tradingAccountId,
-        input?.tradingAccountName,
-        input?.tradovateAccountId,
-        input?.tradovateAccountName,
-        input?.atasAccountId,
-        input?.atasAccountName,
-        input?.id,
-        input?.displayName,
-        input?.accountId,
-        input?.accountName,
-        input?.name,
-        input?.label,
-    ]
-
-    for (const candidate of candidates) {
-        const detected = detectAccountSize(candidate)
-
-        if (detected > 0) {
-            return detected
+        if (
+            normalizedProductType &&
+            normalizeProductType(account.productType) !== normalizedProductType
+        ) {
+            return false
         }
-    }
 
-    return 0
+        return true
+    })
 }
 
-function resolveInitialStatusForNewAccount(phase, status) {
-    const normalizedPhase = normalizeAccountPhase(phase)
-    const normalizedStatus = normalizeAccountStatus(status)
-
-    if (normalizedPhase === "eval" && normalizedStatus === "open") {
-        return "active"
+function getValidLinkedPaAccount(accounts, evalAccount, dailyStateByAccount = {}) {
+    if (!evalAccount?.id) {
+        return null
     }
 
-    return normalizedStatus
-}
+    const linkedPaAccounts = getLinkedPaAccounts(
+        accounts,
+        evalAccount.id,
+        evalAccount.productType
+    )
 
-function normalizeImportType(type) {
-    const safeType = cleanString(type)
-
-    if (safeType === "dailySummary") {
-        return "cashHistory"
-    }
-
-    if (CSV_IMPORT_KEYS.includes(safeType)) {
-        return safeType
-    }
-
-    return ""
-}
-
-function cloneCsvImportEntry(type, source = {}) {
-    return {
-        ...createEmptyCsvImport(type),
-        ...(source || {}),
-        type,
-        fileName: cleanString(source?.fileName),
-        importedAt: cleanString(source?.importedAt),
-        headers: Array.isArray(source?.headers) ? source.headers : [],
-        rows: Array.isArray(source?.rows) ? source.rows : [],
-        previewRows: Array.isArray(source?.previewRows) ? source.previewRows : [],
-        rawText: String(source?.rawText || ""),
-        appAccountId: cleanString(source?.appAccountId),
-        appAccountName: cleanString(source?.appAccountName),
-        tradingAccountId: cleanString(source?.tradingAccountId),
-        tradingAccountName: cleanString(source?.tradingAccountName),
-        tradingAccountKey: cleanString(source?.tradingAccountKey),
-        csvAccountRaw: cleanString(source?.csvAccountRaw),
-    }
-}
-
-function normalizeCsvImportsShape(value) {
-    return normalizeProviderImportsShape(value)
-}
-
-function getPreferredCsvImportMeta(value) {
-    const normalizedImports = normalizeCsvImportsShape(value)
-
-    const candidates = [
-        normalizedImports.cashHistory,
-        normalizedImports.trades,
-        normalizedImports.orders,
-        normalizedImports.performance,
-        normalizedImports.positionHistory,
-    ]
-
-    for (const entry of candidates) {
-        const tradingAccountId = cleanString(entry?.tradingAccountId || entry?.csvAccountRaw)
-        const tradingAccountName = cleanString(entry?.tradingAccountName || tradingAccountId)
-        const tradingAccountKey = cleanString(
-            entry?.tradingAccountKey ||
-            normalizeAccountLookup(tradingAccountId || tradingAccountName)
+    return linkedPaAccounts.find((paAccount) =>
+        isPaAccountValidForLinkedEval(
+            paAccount,
+            dailyStateByAccount?.[paAccount.id] || {}
         )
+    ) || null
+}
 
-        if (tradingAccountId || tradingAccountName) {
-            return {
-                appAccountId: cleanString(entry?.appAccountId),
-                appAccountName: cleanString(entry?.appAccountName),
-                tradingAccountId,
-                tradingAccountName,
-                tradingAccountKey,
-                csvAccountRaw: cleanString(entry?.csvAccountRaw),
-            }
+function buildDashboardVisibilityMeta(account, accounts = [], dailyStateByAccount = {}) {
+    if (!account) {
+        return {
+            visible: false,
+            showMacherBadge: false,
+            linkedPaAccountId: "",
+            reason: "missing_account",
+        }
+    }
+
+    const phase = normalizeAccountPhase(account.accountPhase)
+    const status = normalizeAccountStatus(account.accountStatus)
+
+    if (phase === "pa") {
+        const visible = status !== "failed" && status !== "archived"
+
+        return {
+            visible,
+            showMacherBadge: false,
+            linkedPaAccountId: cleanString(account.linkedEvalAccountId),
+            reason: visible ? "pa_visible" : "pa_invalid",
+        }
+    }
+
+    if (status === "failed") {
+        return {
+            visible: false,
+            showMacherBadge: false,
+            linkedPaAccountId: "",
+            reason: "eval_failed",
+        }
+    }
+
+    const validLinkedPa = getValidLinkedPaAccount(
+        accounts,
+        account,
+        dailyStateByAccount
+    )
+
+    if (validLinkedPa) {
+        return {
+            visible: true,
+            showMacherBadge: status === "passed" || status === "archived",
+            linkedPaAccountId: validLinkedPa.id,
+            reason: "eval_linked_to_valid_pa",
+        }
+    }
+
+    if (status === "passed" || status === "archived") {
+        return {
+            visible: false,
+            showMacherBadge: false,
+            linkedPaAccountId: "",
+            reason: "eval_without_valid_pa",
         }
     }
 
     return {
-        appAccountId: "",
-        appAccountName: "",
-        tradingAccountId: "",
-        tradingAccountName: "",
-        tradingAccountKey: "",
-        csvAccountRaw: "",
+        visible: status === "active" || status === "open",
+        showMacherBadge: false,
+        linkedPaAccountId: "",
+        reason: "eval_running",
     }
+}
+
+function shouldShowAccountInDashboard(account, accounts = [], dailyStateByAccount = {}) {
+    return buildDashboardVisibilityMeta(account, accounts, dailyStateByAccount).visible
+}
+
+function shouldArchiveEvalDueToLinkedPa() {
+    return false
 }
 function resolveLegacyGroupId(account) {
     return cleanString(
@@ -967,10 +1493,12 @@ function buildFallbackGroupId(account) {
         account?.mode ||
         account?.challengeMode
     )
+
     const phase = normalizeAccountPhase(
         account?.accountPhase ||
         account?.phase
     )
+
     const displaySeed = cleanString(
         account?.tradingAccountId ||
         account?.displayName ||
@@ -1100,7 +1628,9 @@ function normalizeAccount(account) {
     const normalizedAtasAccountName = cleanString(
         base.atasAccountName ||
         (incomingProvider === "atas"
-            ? base.dataProviderAccountName || base.source?.accountName || normalizedDisplayName
+            ? base.dataProviderAccountName ||
+            base.source?.accountName ||
+            normalizedDisplayName
             : "")
     )
 
@@ -1110,10 +1640,12 @@ function normalizeAccount(account) {
     )
 
     const normalizedDataProvider = incomingProvider
+
     const normalizedDataProviderType = normalizeDataProviderType(
         base.dataProviderType || base.source?.type || "",
         normalizedDataProvider
     )
+
     const normalizedDataProviderStatus = normalizeDataProviderStatus(
         base.dataProviderStatus || base.source?.status || "",
         getDefaultDataProviderStatus(normalizedDataProvider)
@@ -1144,6 +1676,8 @@ function normalizeAccount(account) {
         tradovateAccountName: normalizedTradovateAccountName,
         atasAccountId: normalizedAtasAccountId,
         atasAccountName: normalizedAtasAccountName,
+        dataProviderAccountId: normalizedDataProviderAccountId,
+        dataProviderAccountName: normalizedDataProviderAccountName,
     })
 
     const normalizedAccountSize = normalizeAccountSize(
@@ -1155,6 +1689,7 @@ function normalizeAccount(account) {
 
     const normalizedStartingBalance =
         toNumber(base.startingBalance, 0) || normalizedAccountSize
+
     const normalizedCurrentBalance =
         toNumber(base.currentBalance, 0) || normalizedStartingBalance
 
@@ -1187,7 +1722,7 @@ function normalizeAccount(account) {
         lastSyncAt: normalizedLastSyncAt,
     }
 
-    return {
+    const normalizedAccount = {
         ...base,
         id: cleanString(base.id),
         displayName: normalizedDisplayName,
@@ -1208,6 +1743,10 @@ function normalizeAccount(account) {
         productType: normalizedProductType,
         accountPhase: normalizedPhase,
         accountStatus: normalizeAccountStatus(base.accountStatus || base.status),
+        evalStartDate: normalizeDateOnly(base.evalStartDate),
+        accessStartDate: normalizeDateOnly(base.accessStartDate),
+        accessEndDate: normalizeDateOnly(base.accessEndDate),
+        paActivationDeadlineDate: normalizeDateOnly(base.paActivationDeadlineDate),
         accountSize: normalizedAccountSize,
         startingBalance: normalizedStartingBalance,
         currentBalance: normalizedCurrentBalance,
@@ -1238,11 +1777,13 @@ function normalizeAccount(account) {
         history: sortHistory(base.history),
         riskStatus:
             base.riskStatus &&
-                typeof base.riskStatus === "object" &&
-                !Array.isArray(base.riskStatus)
+            typeof base.riskStatus === "object" &&
+            !Array.isArray(base.riskStatus)
                 ? clone(base.riskStatus)
                 : null,
     }
+
+    return applyKnownLifecycleDates(normalizedAccount)
 }
 
 function mergeAccountWithImportMeta(account, csvImports = {}) {
@@ -1406,27 +1947,28 @@ function buildLegacyTradovateProviderBucket(data, accountId, account = null) {
             safeAccount?.source?.lastSyncAt ||
             legacyCsvImports?.cashHistory?.importedAt
         ),
-        orders: Array.isArray(data?.ordersByAccount?.[id]) ? data.ordersByAccount[id] : [],
-        fills: Array.isArray(data?.fillsByAccount?.[id]) ? data.fillsByAccount[id] : [],
+        orders: Array.isArray(data?.ordersByAccount?.[id])
+            ? data.ordersByAccount[id]
+            : [],
+        fills: Array.isArray(data?.fillsByAccount?.[id])
+            ? data.fillsByAccount[id]
+            : [],
         balanceHistory: Array.isArray(data?.cashHistoryByAccount?.[id])
             ? data.cashHistoryByAccount[id]
             : [],
-        performance: Array.isArray(data?.providerDataByAccount?.[id]?.tradovate?.performance) &&
+        performance:
+            Array.isArray(data?.providerDataByAccount?.[id]?.tradovate?.performance) &&
             data.providerDataByAccount[id].tradovate.performance.length
-            ? data.providerDataByAccount[id].tradovate.performance
-            : (Array.isArray(legacyCsvImports?.performance?.rows)
-                ? legacyCsvImports.performance.rows
-                : []),
-        positionHistory: Array.isArray(data?.providerDataByAccount?.[id]?.tradovate?.positionHistory) &&
+                ? data.providerDataByAccount[id].tradovate.performance
+                : toArrayRows(legacyCsvImports?.performance?.rows),
+        positionHistory:
+            Array.isArray(data?.providerDataByAccount?.[id]?.tradovate?.positionHistory) &&
             data.providerDataByAccount[id].tradovate.positionHistory.length
-            ? data.providerDataByAccount[id].tradovate.positionHistory
-            : (Array.isArray(legacyCsvImports?.positionHistory?.rows)
-                ? legacyCsvImports.positionHistory.rows
-                : []),
+                ? data.providerDataByAccount[id].tradovate.positionHistory
+                : toArrayRows(legacyCsvImports?.positionHistory?.rows),
         csvImports: legacyCsvImports,
     })
 }
-
 function getProviderBucketFromData(data, accountId, providerOverride = "", accountOverride = null) {
     const id = cleanString(accountId)
     const safeData = data || DEFAULT_DATA
@@ -1436,7 +1978,11 @@ function getProviderBucketFromData(data, accountId, providerOverride = "", accou
     )
     const storedProviderData = safeData?.providerDataByAccount?.[id]?.[provider]
 
-    if (storedProviderData && typeof storedProviderData === "object" && Object.keys(storedProviderData).length) {
+    if (
+        storedProviderData &&
+        typeof storedProviderData === "object" &&
+        Object.keys(storedProviderData).length
+    ) {
         const legacyTradovateCsvImports = provider === "tradovate"
             ? normalizeCsvImportsShape(
                 storedProviderData?.csvImports ||
@@ -1462,21 +2008,29 @@ function getProviderBucketFromData(data, accountId, providerOverride = "", accou
                 storedProviderData.source?.lastSyncAt ||
                 safeAccount?.lastSyncAt
             ),
-            orders: Array.isArray(storedProviderData.orders) ? storedProviderData.orders : [],
-            fills: Array.isArray(storedProviderData.fills) ? storedProviderData.fills : [],
-            balanceHistory: Array.isArray(storedProviderData.balanceHistory) ? storedProviderData.balanceHistory : [],
+            orders: Array.isArray(storedProviderData.orders)
+                ? storedProviderData.orders
+                : [],
+            fills: Array.isArray(storedProviderData.fills)
+                ? storedProviderData.fills
+                : [],
+            balanceHistory: Array.isArray(storedProviderData.balanceHistory)
+                ? storedProviderData.balanceHistory
+                : [],
             performance:
-                Array.isArray(storedProviderData.performance) && storedProviderData.performance.length
+                Array.isArray(storedProviderData.performance) &&
+                storedProviderData.performance.length
                     ? storedProviderData.performance
-                    : (provider === "tradovate"
+                    : provider === "tradovate"
                         ? toArrayRows(legacyTradovateCsvImports?.performance?.rows)
-                        : []),
+                        : [],
             positionHistory:
-                Array.isArray(storedProviderData.positionHistory) && storedProviderData.positionHistory.length
+                Array.isArray(storedProviderData.positionHistory) &&
+                storedProviderData.positionHistory.length
                     ? storedProviderData.positionHistory
-                    : (provider === "tradovate"
+                    : provider === "tradovate"
                         ? toArrayRows(legacyTradovateCsvImports?.positionHistory?.rows)
-                        : []),
+                        : [],
             csvImports: legacyTradovateCsvImports,
         })
     }
@@ -1514,11 +2068,12 @@ function ensureProviderBucketForAccount(data, accountId, providerOverride = "", 
         data.providerDataByAccount[id] = buildEmptyProviderData()
     }
 
-    const bucket = getProviderBucketFromData(data, id, providerOverride, accountOverride)
     const provider = normalizeDataProvider(
         providerOverride ||
         getAccountDataProvider(accountOverride || findAccount(data.accounts, id))
     )
+
+    const bucket = getProviderBucketFromData(data, id, provider, accountOverride)
 
     data.providerDataByAccount[id] = {
         ...buildEmptyProviderData(),
@@ -1546,6 +2101,7 @@ function ensureAllProviderBucketsForAccount(data, accountId, accountOverride = n
         "tradovate",
         accountOverride
     )
+
     const atas = ensureProviderBucketForAccount(
         data,
         id,
@@ -1590,9 +2146,11 @@ function syncLegacySectionsFromTradovateBucket(data, accountId) {
         [id]: normalizeCsvImportsShape(tradovateBucket.csvImports || {}),
     }
 }
+
 function resolveProviderForAccountWrite(data, accountId, providerOverride = "") {
     const id = cleanString(accountId)
     const account = findAccount(data?.accounts, id)
+
     return normalizeDataProvider(
         providerOverride || getAccountDataProvider(account)
     )
@@ -1638,13 +2196,13 @@ function normalizeProviderDataByAccountMap(baseData, accounts) {
     const result = {}
     const ids = new Set()
 
-        ; (accounts || []).forEach((account) => {
-            const id = cleanString(account?.id)
+    ;(accounts || []).forEach((account) => {
+        const id = cleanString(account?.id)
 
-            if (id) {
-                ids.add(id)
-            }
-        })
+        if (id) {
+            ids.add(id)
+        }
+    })
 
     Object.keys(baseData?.providerDataByAccount || {}).forEach((id) => {
         const safeId = cleanString(id)
@@ -1688,6 +2246,7 @@ function normalizeProviderDataByAccountMap(baseData, accounts) {
 
     ids.forEach((id) => {
         const account = findAccount(accounts, id)
+
         result[id] = {
             tradovate: getProviderBucketFromData(baseData, id, "tradovate", account),
             atas: getProviderBucketFromData(baseData, id, "atas", account),
@@ -1695,401 +2254,6 @@ function normalizeProviderDataByAccountMap(baseData, accounts) {
     })
 
     return result
-}
-
-function normalizeData(data) {
-    const base = {
-        ...DEFAULT_DATA,
-        ...(data || {}),
-    }
-
-    const normalizedCsvImportsByAccount = normalizeCsvImportsMap(base.csvImportsByAccount)
-
-    const normalizedAccounts = Array.isArray(base.accounts)
-        ? base.accounts
-            .map(normalizeAccount)
-            .filter((account) => cleanString(account.id))
-        : []
-
-    const uniqueAccounts = []
-    const seen = new Set()
-
-    for (const account of normalizedAccounts) {
-        if (seen.has(account.id)) {
-            continue
-        }
-
-        seen.add(account.id)
-        uniqueAccounts.push(
-            mergeAccountWithImportMeta(
-                account,
-                normalizedCsvImportsByAccount?.[account.id] || {}
-            )
-        )
-    }
-
-    const normalizedProviderDataByAccount = normalizeProviderDataByAccountMap(
-        {
-            ...base,
-            csvImportsByAccount: normalizedCsvImportsByAccount,
-        },
-        uniqueAccounts
-    )
-
-    const normalizedOrdersByAccount = normalizeMapSection(base.ordersByAccount)
-    const normalizedFillsByAccount = normalizeMapSection(base.fillsByAccount)
-    const normalizedCashHistoryByAccount = normalizeMapSection(base.cashHistoryByAccount)
-
-    Object.entries(normalizedProviderDataByAccount).forEach(([accountId, providerData]) => {
-        if (!Array.isArray(normalizedOrdersByAccount[accountId]) || !normalizedOrdersByAccount[accountId].length) {
-            normalizedOrdersByAccount[accountId] = clone(providerData?.tradovate?.orders || [])
-        }
-
-        if (!Array.isArray(normalizedFillsByAccount[accountId]) || !normalizedFillsByAccount[accountId].length) {
-            normalizedFillsByAccount[accountId] = clone(providerData?.tradovate?.fills || [])
-        }
-
-        if (!Array.isArray(normalizedCashHistoryByAccount[accountId]) || !normalizedCashHistoryByAccount[accountId].length) {
-            normalizedCashHistoryByAccount[accountId] = clone(providerData?.tradovate?.balanceHistory || [])
-        }
-
-        if (!normalizedCsvImportsByAccount[accountId]) {
-            normalizedCsvImportsByAccount[accountId] = normalizeCsvImportsShape(
-                providerData?.tradovate?.csvImports || {}
-            )
-        }
-    })
-
-    return {
-        version: DATA_VERSION,
-        accounts: uniqueAccounts,
-        activeAccountId: cleanString(base.activeAccountId),
-        accountProfilesById: normalizeMapSection(base.accountProfilesById),
-        ordersByAccount: normalizedOrdersByAccount,
-        positionsByAccount: normalizeMapSection(base.positionsByAccount),
-        riskByAccount: normalizeMapSection(base.riskByAccount),
-        journalByAccount: normalizeMapSection(base.journalByAccount),
-        fillsByAccount: normalizedFillsByAccount,
-        importedOrdersByAccount: normalizeMapSection(base.importedOrdersByAccount),
-        importedTradesByAccount: normalizeMapSection(base.importedTradesByAccount),
-        dailySummaryByAccount: normalizeMapSection(base.dailySummaryByAccount),
-        dailyStateByAccount: normalizeDailyStateMap(base.dailyStateByAccount),
-        accountReportByAccount: normalizeMapSection(base.accountReportByAccount),
-        cashHistoryByAccount: normalizedCashHistoryByAccount,
-        csvImportsByAccount: normalizedCsvImportsByAccount,
-        providerDataByAccount: normalizedProviderDataByAccount,
-    }
-}
-
-function notifyStorageChange() {
-    if (typeof window === "undefined") {
-        return
-    }
-
-    window.dispatchEvent(new CustomEvent(STORAGE_EVENT))
-}
-
-function readData() {
-    if (typeof window === "undefined") {
-        return normalizeData(DEFAULT_DATA)
-    }
-
-    try {
-        const raw = window.localStorage.getItem(STORAGE_KEY)
-
-        if (!raw) {
-            return normalizeData(DEFAULT_DATA)
-        }
-
-        return normalizeData(JSON.parse(raw))
-    } catch (error) {
-        console.error("storage read error", error)
-        return normalizeData(DEFAULT_DATA)
-    }
-}
-
-function writeData(data) {
-    const normalized = normalizeData(data)
-
-    if (typeof window !== "undefined") {
-        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized))
-    }
-
-    notifyStorageChange()
-    return normalized
-}
-
-function updateData(mutator) {
-    const current = readData()
-    const draft = clone(current)
-    const result = mutator(draft)
-    writeData(draft)
-    return result
-}
-
-function findAccount(accounts, accountId) {
-    const id = cleanString(accountId)
-    return (accounts || []).find((account) => account.id === id) || null
-}
-
-function ensureAccount(accounts, accountId) {
-    const account = findAccount(accounts, accountId)
-
-    if (!account) {
-        throw new Error(`Account not found: ${accountId}`)
-    }
-
-    return account
-}
-
-function syncAccountTradingMetaFromImports(data, accountId) {
-    const id = cleanString(accountId)
-
-    if (!id) {
-        return
-    }
-
-    const account = findAccount(data?.accounts, id)
-
-    if (!account) {
-        return
-    }
-
-    const tradovateImports = normalizeCsvImportsShape(
-        data?.providerDataByAccount?.[id]?.tradovate?.csvImports ||
-        data?.csvImportsByAccount?.[id] ||
-        {}
-    )
-
-    const merged = mergeAccountWithImportMeta(
-        account,
-        tradovateImports
-    )
-
-    Object.assign(account, merged)
-
-    const tradovateBucket = ensureProviderBucketForAccount(data, id, "tradovate", account)
-    tradovateBucket.source = {
-        ...tradovateBucket.source,
-        ...buildProviderSourceFromAccount(account, "tradovate"),
-        accountId: cleanString(account.tradovateAccountId || account.tradingAccountId),
-        accountName: cleanString(account.tradovateAccountName || account.tradingAccountName),
-    }
-
-    if (getAccountDataProvider(account) === "tradovate") {
-        account.dataProviderAccountId = cleanString(
-            account.dataProviderAccountId || account.tradovateAccountId || account.tradingAccountId
-        )
-        account.dataProviderAccountName = cleanString(
-            account.dataProviderAccountName || account.tradovateAccountName || account.tradingAccountName
-        )
-        account.source = {
-            ...(account.source || {}),
-            accountId: account.dataProviderAccountId,
-            accountName: account.dataProviderAccountName,
-        }
-    }
-}
-
-function pushHistory(account, entry) {
-    account.history = sortHistory([...(account.history || []), entry])
-    account.updatedAt = entry.createdAt
-    account.lifecycleVersion = toNumber(account.lifecycleVersion, 2) + 1
-}
-
-function getLinkedPaAccounts(accounts, evalAccountId, productType = "") {
-    const evalId = cleanString(evalAccountId)
-    const normalizedProductType = productType
-        ? normalizeProductType(productType)
-        : ""
-
-    if (!evalId) {
-        return []
-    }
-
-    return (accounts || []).filter((account) => {
-        if (normalizeAccountPhase(account.accountPhase) !== "pa") {
-            return false
-        }
-
-        if (cleanString(account.linkedEvalAccountId) !== evalId) {
-            return false
-        }
-
-        if (
-            normalizedProductType &&
-            normalizeProductType(account.productType) !== normalizedProductType
-        ) {
-            return false
-        }
-
-        return true
-    })
-}
-
-function hasLinkedPaWithStatuses(accounts, evalAccountId, productType, statuses = []) {
-    const allowedStatuses = new Set(statuses.map(normalizeAccountStatus))
-
-    return getLinkedPaAccounts(accounts, evalAccountId, productType).some((account) => {
-        return allowedStatuses.has(normalizeAccountStatus(account.accountStatus))
-    })
-}
-
-function shouldArchiveEvalDueToLinkedPa(accounts, evalAccountId, productType) {
-    return hasLinkedPaWithStatuses(
-        accounts,
-        evalAccountId,
-        productType,
-        ["active", "passed"]
-    )
-}
-
-function resolveEvalStatusForRules(accounts, account, requestedStatus) {
-    if (!account) {
-        return normalizeAccountStatus(requestedStatus)
-    }
-
-    const phase = normalizeAccountPhase(account.accountPhase)
-    const nextStatus = normalizeAccountStatus(requestedStatus)
-
-    if (
-        phase === "eval" &&
-        shouldArchiveEvalDueToLinkedPa(accounts, account.id, account.productType)
-    ) {
-        return "archived"
-    }
-
-    return nextStatus
-}
-
-function archiveEvalFromPaActivation(evalAccount, paAccount) {
-    if (!evalAccount) {
-        return
-    }
-
-    if (normalizeAccountStatus(evalAccount.accountStatus) === "archived") {
-        return
-    }
-
-    const entry = createHistoryEntry("auto_archived_by_pa_activation", {
-        fromStatus: evalAccount.accountStatus,
-        toStatus: "archived",
-        triggerAccountId: cleanString(paAccount?.id),
-        productType: normalizeProductType(evalAccount.productType),
-    })
-
-    evalAccount.accountStatus = "archived"
-    evalAccount.archivedAt = entry.createdAt
-    evalAccount.statusChangedAt = entry.createdAt
-    pushHistory(evalAccount, entry)
-}
-
-function syncAccountGroupId(evalAccount, paAccount) {
-    const existingEvalGroupId = cleanString(evalAccount?.accountGroupId)
-    const existingPaGroupId = cleanString(paAccount?.accountGroupId)
-    const nextGroupId =
-        existingEvalGroupId ||
-        existingPaGroupId ||
-        buildFallbackGroupId(evalAccount) ||
-        buildFallbackGroupId(paAccount) ||
-        `group_${cleanString(evalAccount?.id || paAccount?.id)}`
-
-    if (evalAccount) {
-        evalAccount.accountGroupId = nextGroupId
-    }
-
-    if (paAccount) {
-        paAccount.accountGroupId = nextGroupId
-    }
-
-    return nextGroupId
-}
-
-function enforceAccountLifecycleRules(accounts) {
-    const safeAccounts = Array.isArray(accounts) ? accounts : []
-
-    safeAccounts.forEach((account) => {
-        if (normalizeAccountPhase(account.accountPhase) !== "pa") {
-            return
-        }
-
-        const status = normalizeAccountStatus(account.accountStatus)
-
-        if (
-            (status === "active" || status === "passed") &&
-            cleanString(account.linkedEvalAccountId)
-        ) {
-            const evalAccount = findAccount(safeAccounts, account.linkedEvalAccountId)
-
-            if (
-                evalAccount &&
-                normalizeProductType(evalAccount.productType) ===
-                normalizeProductType(account.productType)
-            ) {
-                syncAccountGroupId(evalAccount, account)
-                archiveEvalFromPaActivation(evalAccount, account)
-            }
-        }
-    })
-
-    safeAccounts.forEach((account) => {
-        if (normalizeAccountPhase(account.accountPhase) !== "eval") {
-            return
-        }
-
-        if (
-            !shouldArchiveEvalDueToLinkedPa(
-                safeAccounts,
-                account.id,
-                account.productType
-            )
-        ) {
-            return
-        }
-
-        archiveEvalFromPaActivation(account, null)
-    })
-}
-
-function detachPaFromPreviousEval(accounts, paAccount, nextEvalId) {
-    const previousEvalId = cleanString(paAccount.linkedEvalAccountId)
-
-    if (!previousEvalId || previousEvalId === cleanString(nextEvalId)) {
-        return
-    }
-
-    const previousEval = findAccount(accounts, previousEvalId)
-
-    if (!previousEval) {
-        paAccount.linkedEvalAccountId = ""
-        return
-    }
-
-    const entry = createHistoryEntry("unlinked_replaced", {
-        fromAccountId: previousEval.id,
-        toAccountId: cleanString(nextEvalId),
-        targetAccountId: paAccount.id,
-        productType: normalizeProductType(paAccount.productType),
-    })
-
-    previousEval.linkedPaAccountIds = previousEval.linkedPaAccountIds.filter(
-        (value) => value !== paAccount.id
-    )
-    previousEval.unlinkedAt = entry.createdAt
-    pushHistory(previousEval, entry)
-
-    paAccount.unlinkedAt = entry.createdAt
-    pushHistory(
-        paAccount,
-        createHistoryEntry("unlinked_replaced", {
-            fromAccountId: previousEval.id,
-            toAccountId: cleanString(nextEvalId),
-            targetAccountId: previousEval.id,
-            productType: normalizeProductType(paAccount.productType),
-        })
-    )
-
-    paAccount.linkedEvalAccountId = ""
 }
 
 function getAccountSlotStatus(account) {
@@ -2165,19 +2329,55 @@ function sortGroupAccounts(accounts) {
     })
 }
 
-function buildAccountGroupsFromAccounts(accounts, dailyStateByAccount = {}) {
-    const normalizedAccounts = [...(accounts || [])]
+function decorateAccountWithDashboardVisibility(account, accounts = [], dailyStateByAccount = {}) {
+    const decoratedAccount = decorateAccountWithDerivedSlotState(
+        account,
+        dailyStateByAccount?.[cleanString(account?.id)] || {}
+    )
+
+    const visibility = buildDashboardVisibilityMeta(
+        decoratedAccount,
+        accounts,
+        dailyStateByAccount
+    )
+
+    return {
+        ...decoratedAccount,
+        dashboardVisibility: visibility,
+        showMacherBadge: visibility.showMacherBadge,
+        macherBadgeTitle: "Macher Modus",
+        macherBadgeText: "Bleib diszipliniert",
+        macherBadgeIcon: "🏆",
+    }
+}
+
+function getDashboardVisibleAccounts(accounts = [], dailyStateByAccount = {}) {
+    return (accounts || [])
         .map((account) =>
-            decorateAccountWithDerivedSlotState(
+            decorateAccountWithDashboardVisibility(
                 account,
-                dailyStateByAccount?.[cleanString(account?.id)] || {}
+                accounts,
+                dailyStateByAccount
             )
         )
-        .sort((left, right) => {
-            const leftTime = cleanString(left?.createdAt)
-            const rightTime = cleanString(right?.createdAt)
-            return leftTime.localeCompare(rightTime)
-        })
+        .filter((account) =>
+            shouldShowAccountInDashboard(
+                account,
+                accounts,
+                dailyStateByAccount
+            )
+        )
+}
+
+function buildAccountGroupsFromAccounts(accounts, dailyStateByAccount = {}) {
+    const normalizedAccounts = getDashboardVisibleAccounts(
+        accounts,
+        dailyStateByAccount
+    ).sort((left, right) => {
+        const leftTime = cleanString(left?.createdAt)
+        const rightTime = cleanString(right?.createdAt)
+        return leftTime.localeCompare(rightTime)
+    })
 
     const runtimeGroups = []
 
@@ -2218,38 +2418,45 @@ function buildAccountGroupsFromAccounts(accounts, dailyStateByAccount = {}) {
             }
         }
     }
+
     const groups = runtimeGroups.map((group) => {
         const sortedAccounts = sortGroupAccounts(group.accounts)
+
         const decoratedAccounts = sortedAccounts.map((account) =>
-            decorateAccountWithDerivedSlotState(
+            decorateAccountWithDashboardVisibility(
                 account,
-                dailyStateByAccount?.[account.id] || {}
+                accounts,
+                dailyStateByAccount
             )
         )
 
         const slots = {
             evalEod: group.slots.evalEod
-                ? decorateAccountWithDerivedSlotState(
+                ? decorateAccountWithDashboardVisibility(
                     group.slots.evalEod,
-                    dailyStateByAccount?.[group.slots.evalEod.id] || {}
+                    accounts,
+                    dailyStateByAccount
                 )
                 : null,
             paEod: group.slots.paEod
-                ? decorateAccountWithDerivedSlotState(
+                ? decorateAccountWithDashboardVisibility(
                     group.slots.paEod,
-                    dailyStateByAccount?.[group.slots.paEod.id] || {}
+                    accounts,
+                    dailyStateByAccount
                 )
                 : null,
             evalIntraday: group.slots.evalIntraday
-                ? decorateAccountWithDerivedSlotState(
+                ? decorateAccountWithDashboardVisibility(
                     group.slots.evalIntraday,
-                    dailyStateByAccount?.[group.slots.evalIntraday.id] || {}
+                    accounts,
+                    dailyStateByAccount
                 )
                 : null,
             paIntraday: group.slots.paIntraday
-                ? decorateAccountWithDerivedSlotState(
+                ? decorateAccountWithDashboardVisibility(
                     group.slots.paIntraday,
-                    dailyStateByAccount?.[group.slots.paIntraday.id] || {}
+                    accounts,
+                    dailyStateByAccount
                 )
                 : null,
         }
@@ -2292,6 +2499,164 @@ function buildAccountGroupsFromAccounts(accounts, dailyStateByAccount = {}) {
 
         return rightTime.localeCompare(leftTime)
     })
+}
+
+function normalizeData(data) {
+    const base = {
+        ...DEFAULT_DATA,
+        ...(data || {}),
+    }
+
+    const normalizedCsvImportsByAccount = normalizeCsvImportsMap(base.csvImportsByAccount)
+
+    const normalizedAccounts = Array.isArray(base.accounts)
+        ? base.accounts
+            .map(normalizeAccount)
+            .filter((account) => cleanString(account.id))
+        : []
+
+    const uniqueAccounts = []
+    const seen = new Set()
+
+    for (const account of normalizedAccounts) {
+        if (seen.has(account.id)) {
+            continue
+        }
+
+        seen.add(account.id)
+        uniqueAccounts.push(
+            mergeAccountWithImportMeta(
+                account,
+                normalizedCsvImportsByAccount?.[account.id] || {}
+            )
+        )
+    }
+
+    applyKnownAccountLinks(uniqueAccounts)
+
+    const normalizedProviderDataByAccount = normalizeProviderDataByAccountMap(
+        {
+            ...base,
+            csvImportsByAccount: normalizedCsvImportsByAccount,
+        },
+        uniqueAccounts
+    )
+
+    const normalizedOrdersByAccount = normalizeMapSection(base.ordersByAccount)
+    const normalizedFillsByAccount = normalizeMapSection(base.fillsByAccount)
+    const normalizedCashHistoryByAccount = normalizeMapSection(base.cashHistoryByAccount)
+
+    Object.entries(normalizedProviderDataByAccount).forEach(([accountId, providerData]) => {
+        if (
+            !Array.isArray(normalizedOrdersByAccount[accountId]) ||
+            !normalizedOrdersByAccount[accountId].length
+        ) {
+            normalizedOrdersByAccount[accountId] = clone(providerData?.tradovate?.orders || [])
+        }
+
+        if (
+            !Array.isArray(normalizedFillsByAccount[accountId]) ||
+            !normalizedFillsByAccount[accountId].length
+        ) {
+            normalizedFillsByAccount[accountId] = clone(providerData?.tradovate?.fills || [])
+        }
+
+        if (
+            !Array.isArray(normalizedCashHistoryByAccount[accountId]) ||
+            !normalizedCashHistoryByAccount[accountId].length
+        ) {
+            normalizedCashHistoryByAccount[accountId] = clone(providerData?.tradovate?.balanceHistory || [])
+        }
+
+        if (!normalizedCsvImportsByAccount[accountId]) {
+            normalizedCsvImportsByAccount[accountId] = normalizeCsvImportsShape(
+                providerData?.tradovate?.csvImports || {}
+            )
+        }
+    })
+
+    return {
+        version: DATA_VERSION,
+        accounts: uniqueAccounts,
+        activeAccountId: cleanString(base.activeAccountId),
+        accountProfilesById: normalizeMapSection(base.accountProfilesById),
+        ordersByAccount: normalizedOrdersByAccount,
+        positionsByAccount: normalizeMapSection(base.positionsByAccount),
+        riskByAccount: normalizeMapSection(base.riskByAccount),
+        journalByAccount: normalizeMapSection(base.journalByAccount),
+        fillsByAccount: normalizedFillsByAccount,
+        importedOrdersByAccount: normalizeMapSection(base.importedOrdersByAccount),
+        importedTradesByAccount: normalizeMapSection(base.importedTradesByAccount),
+        dailySummaryByAccount: normalizeMapSection(base.dailySummaryByAccount),
+        dailyStateByAccount: normalizeDailyStateMap(base.dailyStateByAccount),
+        accountReportByAccount: normalizeMapSection(base.accountReportByAccount),
+        cashHistoryByAccount: normalizedCashHistoryByAccount,
+        csvImportsByAccount: normalizedCsvImportsByAccount,
+        providerDataByAccount: normalizedProviderDataByAccount,
+    }
+}
+
+function notifyStorageChange() {
+    if (typeof window === "undefined") {
+        return
+    }
+
+    window.dispatchEvent(new CustomEvent(STORAGE_EVENT))
+}
+
+function readData() {
+    if (typeof window === "undefined") {
+        return normalizeData(DEFAULT_DATA)
+    }
+
+    try {
+        const raw = window.localStorage.getItem(STORAGE_KEY)
+
+        if (!raw) {
+            return normalizeData(DEFAULT_DATA)
+        }
+
+        return normalizeData(JSON.parse(raw))
+    } catch (error) {
+        console.error("storage read error", error)
+        return normalizeData(DEFAULT_DATA)
+    }
+}
+
+function writeData(data) {
+    const normalized = normalizeData(data)
+
+    if (typeof window !== "undefined") {
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized))
+    }
+
+    notifyStorageChange()
+    return normalized
+}
+
+function updateData(mutator) {
+    const current = readData()
+    const draft = clone(current)
+    const result = mutator(draft)
+
+    writeData(draft)
+
+    return result
+}
+
+function findAccount(accounts, accountId) {
+    const id = cleanString(accountId)
+    return (accounts || []).find((account) => account.id === id) || null
+}
+
+function ensureAccount(accounts, accountId) {
+    const account = findAccount(accounts, accountId)
+
+    if (!account) {
+        throw new Error(`Account not found: ${accountId}`)
+    }
+
+    return account
 }
 
 function getSection(sectionName, accountId, fallback) {
@@ -2352,6 +2717,127 @@ function removeSectionAccount(sectionName, accountId, data) {
     }
 
     delete data[sectionName][id]
+}
+function syncAccountTradingMetaFromImports(data, accountId) {
+    const id = cleanString(accountId)
+
+    if (!id) {
+        return
+    }
+
+    const account = findAccount(data?.accounts, id)
+
+    if (!account) {
+        return
+    }
+
+    const tradovateImports = normalizeCsvImportsShape(
+        data?.providerDataByAccount?.[id]?.tradovate?.csvImports ||
+        data?.csvImportsByAccount?.[id] ||
+        {}
+    )
+
+    const merged = mergeAccountWithImportMeta(account, tradovateImports)
+
+    Object.assign(account, merged)
+
+    const tradovateBucket = ensureProviderBucketForAccount(data, id, "tradovate", account)
+
+    tradovateBucket.source = {
+        ...tradovateBucket.source,
+        ...buildProviderSourceFromAccount(account, "tradovate"),
+        accountId: cleanString(account.tradovateAccountId || account.tradingAccountId),
+        accountName: cleanString(account.tradovateAccountName || account.tradingAccountName),
+    }
+
+    if (getAccountDataProvider(account) === "tradovate") {
+        account.dataProviderAccountId = cleanString(
+            account.dataProviderAccountId ||
+            account.tradovateAccountId ||
+            account.tradingAccountId
+        )
+        account.dataProviderAccountName = cleanString(
+            account.dataProviderAccountName ||
+            account.tradovateAccountName ||
+            account.tradingAccountName
+        )
+        account.source = {
+            ...(account.source || {}),
+            accountId: account.dataProviderAccountId,
+            accountName: account.dataProviderAccountName,
+        }
+    }
+}
+
+function pushHistory(account, entry) {
+    account.history = sortHistory([...(account.history || []), entry])
+    account.updatedAt = entry.createdAt
+    account.lifecycleVersion = toNumber(account.lifecycleVersion, 2) + 1
+}
+
+function syncAccountGroupId(evalAccount, paAccount) {
+    const existingEvalGroupId = cleanString(evalAccount?.accountGroupId)
+    const existingPaGroupId = cleanString(paAccount?.accountGroupId)
+    const nextGroupId =
+        existingEvalGroupId ||
+        existingPaGroupId ||
+        buildFallbackGroupId(evalAccount) ||
+        buildFallbackGroupId(paAccount) ||
+        `group_${cleanString(evalAccount?.id || paAccount?.id)}`
+
+    if (evalAccount) {
+        evalAccount.accountGroupId = nextGroupId
+    }
+
+    if (paAccount) {
+        paAccount.accountGroupId = nextGroupId
+    }
+
+    return nextGroupId
+}
+
+function detachPaFromPreviousEval(accounts, paAccount, nextEvalId) {
+    const previousEvalId = cleanString(paAccount.linkedEvalAccountId)
+
+    if (!previousEvalId || previousEvalId === cleanString(nextEvalId)) {
+        return
+    }
+
+    const previousEval = findAccount(accounts, previousEvalId)
+
+    if (!previousEval) {
+        paAccount.linkedEvalAccountId = ""
+        return
+    }
+
+    const entry = createHistoryEntry("unlinked_replaced", {
+        fromAccountId: previousEval.id,
+        toAccountId: cleanString(nextEvalId),
+        targetAccountId: paAccount.id,
+        productType: normalizeProductType(paAccount.productType),
+    })
+
+    previousEval.linkedPaAccountIds = previousEval.linkedPaAccountIds.filter(
+        (value) => value !== paAccount.id
+    )
+    previousEval.unlinkedAt = entry.createdAt
+    pushHistory(previousEval, entry)
+
+    paAccount.unlinkedAt = entry.createdAt
+    paAccount.linkedEvalAccountId = ""
+    pushHistory(
+        paAccount,
+        createHistoryEntry("unlinked_replaced", {
+            fromAccountId: previousEval.id,
+            toAccountId: cleanString(nextEvalId),
+            targetAccountId: previousEval.id,
+            productType: normalizeProductType(paAccount.productType),
+        })
+    )
+}
+
+function enforceAccountLifecycleRules(accounts) {
+    applyKnownAccountLinks(accounts)
 }
 
 function applyAccountUpdates(account, updates = {}) {
@@ -2486,11 +2972,13 @@ function applyAccountUpdates(account, updates = {}) {
         )
     }
 
+    copyLifecycleFields(account, updates)
+
     if (Object.prototype.hasOwnProperty.call(updates, "riskStatus")) {
         account.riskStatus =
             updates.riskStatus &&
-                typeof updates.riskStatus === "object" &&
-                !Array.isArray(updates.riskStatus)
+            typeof updates.riskStatus === "object" &&
+            !Array.isArray(updates.riskStatus)
                 ? clone(updates.riskStatus)
                 : null
     }
@@ -2594,7 +3082,7 @@ function applyAccountUpdates(account, updates = {}) {
 
 export function subscribeStorage(callback) {
     if (typeof window === "undefined") {
-        return () => { }
+        return () => {}
     }
 
     const handler = () => {
@@ -2613,11 +3101,9 @@ export function subscribeStorage(callback) {
 export function getAccounts() {
     const data = readData()
 
-    return data.accounts.map((account) =>
-        decorateAccountWithDerivedSlotState(
-            account,
-            data.dailyStateByAccount?.[account.id] || {}
-        )
+    return getDashboardVisibleAccounts(
+        data.accounts,
+        data.dailyStateByAccount || {}
     )
 }
 
@@ -2629,14 +3115,16 @@ export function getAccountById(accountId) {
         return null
     }
 
-    return decorateAccountWithDerivedSlotState(
+    return decorateAccountWithDashboardVisibility(
         account,
-        data.dailyStateByAccount?.[account.id] || {}
+        data.accounts,
+        data.dailyStateByAccount || {}
     )
 }
 
 export function getAccountGroups() {
     const data = readData()
+
     return buildAccountGroupsFromAccounts(
         data.accounts,
         data.dailyStateByAccount || {}
@@ -2744,7 +3232,9 @@ export function addAccount(input = {}) {
                 input.source?.accountName ||
                 (inputDataProvider === "atas"
                     ? input.atasAccountName
-                    : input.tradovateAccountName || input.tradingAccountName || input.displayName)
+                    : input.tradovateAccountName ||
+                    input.tradingAccountName ||
+                    input.displayName)
             ),
             lastSyncAt: cleanString(input.lastSyncAt || input.source?.lastSyncAt),
             productType: inputProductType,
@@ -2811,152 +3301,13 @@ export function upsertDetectedAccount(input = {}) {
         const existing = findAccount(data.accounts, accountId)
 
         if (!existing) {
-            const createdPhase = normalizeAccountPhase(
-                input.accountPhase || input.phase || "eval"
-            )
-            const createdProductType = normalizeProductType(
-                input.productType || input.mode || "eod"
-            )
-            const createdStatus = resolveInitialStatusForNewAccount(
-                createdPhase,
-                input.accountStatus || "open"
-            )
-            const createdDataProvider = normalizeDataProvider(
-                input.dataProvider || "tradovate"
-            )
-
-            const created = normalizeAccount({
-                ...DEFAULT_ACCOUNT,
+            return addAccount({
                 ...input,
                 id: accountId,
-                displayName: cleanString(
-                    input.displayName ||
-                    input.name ||
-                    input.accountName ||
-                    accountId
-                ),
-                tradingAccountId: cleanString(
-                    input.tradingAccountId ||
-                    resolveTradingAccountIdFromAccountLike(input)
-                ),
-                tradingAccountName: cleanString(
-                    input.tradingAccountName ||
-                    resolveTradingAccountNameFromAccountLike(
-                        input,
-                        cleanString(
-                            input.tradingAccountId ||
-                            resolveTradingAccountIdFromAccountLike(input)
-                        )
-                    )
-                ),
-                tradovateAccountId: cleanString(
-                    input.tradovateAccountId ||
-                    input.tradingAccountId ||
-                    resolveTradingAccountIdFromAccountLike(input)
-                ),
-                tradovateAccountName: cleanString(
-                    input.tradovateAccountName ||
-                    input.tradingAccountName ||
-                    resolveTradingAccountNameFromAccountLike(
-                        input,
-                        cleanString(
-                            input.tradovateAccountId ||
-                            input.tradingAccountId ||
-                            resolveTradingAccountIdFromAccountLike(input)
-                        )
-                    )
-                ),
-                atasAccountId: cleanString(input.atasAccountId),
-                atasAccountName: cleanString(input.atasAccountName),
-                dataProvider: createdDataProvider,
-                dataProviderType: normalizeDataProviderType(
-                    input.dataProviderType,
-                    createdDataProvider
-                ),
-                dataProviderStatus: normalizeDataProviderStatus(
-                    input.dataProviderStatus,
-                    getDefaultDataProviderStatus(createdDataProvider)
-                ),
-                dataProviderAccountId: cleanString(
-                    input.dataProviderAccountId ||
-                    (createdDataProvider === "atas"
-                        ? input.atasAccountId
-                        : input.tradovateAccountId || input.tradingAccountId)
-                ),
-                dataProviderAccountName: cleanString(
-                    input.dataProviderAccountName ||
-                    (createdDataProvider === "atas"
-                        ? input.atasAccountName
-                        : input.tradovateAccountName || input.tradingAccountName || input.displayName)
-                ),
-                lastSyncAt: cleanString(input.lastSyncAt),
-                accountPhase: createdPhase,
-                accountStatus: createdStatus,
-                productType: createdProductType,
-                accountGroupId: cleanString(
-                    input.accountGroupId ||
-                    buildFallbackGroupId({
-                        ...input,
-                        id: accountId,
-                        accountPhase: createdPhase,
-                        productType: createdProductType,
-                    })
-                ),
-                accountSize: normalizeAccountSize(
-                    toNumber(input.accountSize, 0) ||
-                    toNumber(input.startingBalance, 0) ||
-                    toNumber(input.currentBalance ?? input.balance, 0),
-                    detectAccountSize(
-                        cleanString(
-                            input.tradingAccountId ||
-                            input.displayName ||
-                            input.accountName ||
-                            accountId
-                        )
-                    )
-                ),
-                startingBalance: toNumber(input.startingBalance, 0),
-                currentBalance: toNumber(
-                    input.currentBalance ?? input.balance ?? input.startingBalance,
-                    0
-                ),
-                createdAt: nowIso(),
-                updatedAt: nowIso(),
             })
-
-            pushHistory(
-                created,
-                createHistoryEntry("created_detected", {
-                    accountPhase: created.accountPhase,
-                    accountStatus: created.accountStatus,
-                    productType: created.productType,
-                    accountGroupId: created.accountGroupId,
-                })
-            )
-
-            if (created.accountStatus === "active" && !created.activatedAt) {
-                created.activatedAt = created.createdAt
-                created.statusChangedAt = created.createdAt
-            }
-
-            data.accounts.push(created)
-            ensureAllProviderBucketsForAccount(data, created.id, created)
-            syncAccountTradingMetaFromImports(data, created.id)
-            enforceAccountLifecycleRules(data.accounts)
-            return normalizeAccount(findAccount(data.accounts, created.id))
         }
 
-        const preparedInput = { ...(input || {}) }
-
-        if (Object.prototype.hasOwnProperty.call(preparedInput, "accountStatus")) {
-            preparedInput.accountStatus = resolveEvalStatusForRules(
-                data.accounts,
-                existing,
-                preparedInput.accountStatus
-            )
-        }
-
-        applyAccountUpdates(existing, preparedInput)
+        applyAccountUpdates(existing, input)
         ensureAllProviderBucketsForAccount(data, existing.id, existing)
         syncAccountTradingMetaFromImports(data, existing.id)
         enforceAccountLifecycleRules(data.accounts)
@@ -2968,17 +3319,8 @@ export function upsertDetectedAccount(input = {}) {
 export function updateAccount(accountId, updates = {}) {
     return updateData((data) => {
         const account = ensureAccount(data.accounts, accountId)
-        const preparedUpdates = { ...(updates || {}) }
 
-        if (Object.prototype.hasOwnProperty.call(preparedUpdates, "accountStatus")) {
-            preparedUpdates.accountStatus = resolveEvalStatusForRules(
-                data.accounts,
-                account,
-                preparedUpdates.accountStatus
-            )
-        }
-
-        applyAccountUpdates(account, preparedUpdates)
+        applyAccountUpdates(account, updates)
         ensureAllProviderBucketsForAccount(data, account.id, account)
         syncAccountTradingMetaFromImports(data, account.id)
         enforceAccountLifecycleRules(data.accounts)
@@ -3087,7 +3429,6 @@ export function setAccountPhase(accountId, nextPhase) {
         account.accountPhase = phase
         account.phaseChangedAt = entry.createdAt
         pushHistory(account, entry)
-
         enforceAccountLifecycleRules(data.accounts)
 
         return normalizeAccount(account)
@@ -3097,7 +3438,7 @@ export function setAccountPhase(accountId, nextPhase) {
 export function setAccountStatus(accountId, nextStatus) {
     return updateData((data) => {
         const account = ensureAccount(data.accounts, accountId)
-        const status = resolveEvalStatusForRules(data.accounts, account, nextStatus)
+        const status = normalizeAccountStatus(nextStatus)
 
         if (account.accountStatus === status) {
             return normalizeAccount(account)
@@ -3675,6 +4016,7 @@ export function saveParsedCsvImport(accountId, type, value = {}, provider = "tra
             (normalizedProvider === "tradovate" ? data.csvImportsByAccount?.[id] : null) ||
             {}
         )
+
         current[key] = cloneCsvImportEntry(key, value)
 
         if (key === "cashHistory") {
@@ -3691,6 +4033,7 @@ export function saveParsedCsvImport(accountId, type, value = {}, provider = "tra
             current?.orders?.importedAt ||
             bucket.lastSyncAt
         )
+
         bucket.source = {
             ...bucket.source,
             accountId: cleanString(
@@ -3755,6 +4098,7 @@ export function clearParsedCsvImport(accountId, type, provider = "tradovate") {
             (normalizedProvider === "tradovate" ? data.csvImportsByAccount?.[id] : null) ||
             {}
         )
+
         current[key] = createEmptyCsvImport(key)
 
         if (key === "cashHistory") {
@@ -4004,6 +4348,8 @@ export function saveProviderSyncSnapshot(accountId, snapshot = {}, providerOverr
             ...bucket.source,
         }
 
+        copyLifecycleFields(account, snapshot)
+
         if (provider === "atas") {
             account.atasAccountId = cleanString(
                 meta.providerAccountId || account.atasAccountId
@@ -4035,20 +4381,6 @@ export function saveProviderSyncSnapshot(accountId, snapshot = {}, providerOverr
             if (meta.tradingAccountName) {
                 account.tradingAccountName = meta.tradingAccountName
             }
-        }
-
-        if (
-            Object.prototype.hasOwnProperty.call(snapshot, "tradingAccountId") &&
-            cleanString(snapshot.tradingAccountId)
-        ) {
-            account.tradingAccountId = cleanString(snapshot.tradingAccountId)
-        }
-
-        if (
-            Object.prototype.hasOwnProperty.call(snapshot, "tradingAccountName") &&
-            cleanString(snapshot.tradingAccountName)
-        ) {
-            account.tradingAccountName = cleanString(snapshot.tradingAccountName)
         }
 
         const currentDailyState = normalizeDailyState(
@@ -4163,12 +4495,16 @@ export function saveProviderSyncSnapshot(accountId, snapshot = {}, providerOverr
 
         account.updatedAt = nowIso()
 
+        Object.assign(account, normalizeAccount(account))
+
         ensureAllProviderBucketsForAccount(data, id, account)
 
         if (provider === "tradovate") {
             syncAccountTradingMetaFromImports(data, id)
             syncLegacySectionsFromTradovateBucket(data, id)
         }
+
+        enforceAccountLifecycleRules(data.accounts)
     })
 
     return getLiveAccountSnapshot(id)
@@ -4181,6 +4517,7 @@ export function getLiveAccountSnapshot(accountId) {
     const activeProvider = getAccountDataProvider(account)
     const providerBucket = getProviderBucketFromData(data, id, activeProvider, account)
     const dailyState = normalizeDailyState(data.dailyStateByAccount?.[id] || {})
+
     const orders = Array.isArray(providerBucket?.orders) ? providerBucket.orders : []
     const positions = Array.isArray(data.positionsByAccount?.[id])
         ? data.positionsByAccount[id]
@@ -4219,6 +4556,68 @@ export function getLiveAccountSnapshot(accountId) {
     const normalizedAccount = account ? normalizeAccount(account) : null
     const slotState = buildDerivedSlotState(normalizedAccount, dailyState)
 
+    const accountSize = normalizeAccountSize(
+        normalizedAccount?.accountSize,
+        startingBalance || currentBalance
+    )
+
+    const accountPhase = cleanString(normalizedAccount?.accountPhase || "eval")
+    const accountStatus = cleanString(normalizedAccount?.accountStatus || "open")
+    const accessStartDate = cleanString(normalizedAccount?.accessStartDate)
+    const accessEndDate = cleanString(normalizedAccount?.accessEndDate)
+
+    const profitTarget = getEvalProfitTargetBySize(accountSize)
+
+    const targetBalance =
+        accountPhase === "eval" && accountSize > 0 && profitTarget > 0
+            ? accountSize + profitTarget
+            : 0
+
+    const targetReached =
+        accountPhase === "eval" &&
+        targetBalance > 0 &&
+        currentBalance >= targetBalance
+
+    const todayDate = normalizeDateOnly(new Date().toISOString())
+    const accessExpired =
+        accountPhase === "eval" &&
+        accessEndDate &&
+        todayDate &&
+        todayDate > accessEndDate
+
+    let computedRuleStatus = "active"
+    let computedRuleStatusLabel = "Aktiv"
+
+    if (accountStatus === "passed") {
+        computedRuleStatus = "passed"
+        computedRuleStatusLabel = "Bestanden"
+    } else if (accountStatus === "failed") {
+        computedRuleStatus = "failed"
+        computedRuleStatusLabel = "Nicht bestanden"
+    } else if (accountStatus === "archived") {
+        computedRuleStatus = "archived"
+        computedRuleStatusLabel = "Archiviert"
+    } else if (targetReached) {
+        computedRuleStatus = "target_reached"
+        computedRuleStatusLabel = "Bestanden möglich"
+    } else if (accessExpired) {
+        computedRuleStatus = "expired"
+        computedRuleStatusLabel = "Zeit abgelaufen"
+    }
+
+    const visibility = normalizedAccount
+        ? buildDashboardVisibilityMeta(
+            normalizedAccount,
+            data.accounts,
+            data.dailyStateByAccount || {}
+        )
+        : {
+            visible: false,
+            showMacherBadge: false,
+            linkedPaAccountId: "",
+            reason: "missing_account",
+        }
+
     return {
         accountId: id,
         id,
@@ -4235,19 +4634,48 @@ export function getLiveAccountSnapshot(accountId) {
         dataProviderAccountId: cleanString(normalizedAccount?.dataProviderAccountId),
         dataProviderAccountName: cleanString(normalizedAccount?.dataProviderAccountName),
         lastSyncAt: cleanString(normalizedAccount?.lastSyncAt),
+
         productType: cleanString(normalizedAccount?.productType || "eod"),
-        accountPhase: cleanString(normalizedAccount?.accountPhase || "eval"),
-        accountStatus: cleanString(normalizedAccount?.accountStatus || "open"),
+        accountPhase,
+        accountStatus,
+
+        computedRuleStatus,
+        computedRuleStatusLabel,
+        targetBalance,
+        targetReached,
+        accessExpired,
+
+        evalStartDate: cleanString(normalizedAccount?.evalStartDate),
+        accessStartDate,
+        accessEndDate,
+        paActivationDeadlineDate: cleanString(normalizedAccount?.paActivationDeadlineDate),
+
+        createdAt: cleanString(normalizedAccount?.createdAt),
+        updatedAt: cleanString(normalizedAccount?.updatedAt),
+        statusChangedAt: cleanString(normalizedAccount?.statusChangedAt),
+        phaseChangedAt: cleanString(normalizedAccount?.phaseChangedAt),
+        activatedAt: cleanString(normalizedAccount?.activatedAt),
+        passedAt: cleanString(normalizedAccount?.passedAt),
+        failedAt: cleanString(normalizedAccount?.failedAt),
+        archivedAt: cleanString(normalizedAccount?.archivedAt),
+
         accountGroupId: cleanString(normalizedAccount?.accountGroupId),
+        linkedEvalAccountId: cleanString(normalizedAccount?.linkedEvalAccountId),
+        linkedPaAccountIds: unique(normalizedAccount?.linkedPaAccountIds),
         slotState,
-        accountSize: normalizeAccountSize(
-            normalizedAccount?.accountSize,
-            startingBalance || currentBalance
-        ),
+
+        dashboardVisibility: visibility,
+        showMacherBadge: visibility.showMacherBadge,
+        macherBadgeTitle: "Macher Modus",
+        macherBadgeText: "Bleib diszipliniert",
+        macherBadgeIcon: "🏆",
+
+        accountSize,
         startingBalance,
         currentBalance,
         balance: currentBalance,
         netLiquidity: currentBalance,
+
         dailyPnL: toNumber(dailyState.dailyPnL, 0),
         realizedPnL: toNumber(dailyState.realizedPnL, 0),
         unrealizedPnL: toNumber(dailyState.unrealizedPnL, 0),
@@ -4261,6 +4689,7 @@ export function getLiveAccountSnapshot(accountId) {
         isLocked: toBoolean(dailyState.isLocked),
         drawdownLimit: toNumber(dailyState.drawdownLimit, 0),
         maxDailyLoss: toNumber(dailyState.maxDailyLoss, 0),
+
         openPositionCount,
         openOrderCount,
         positions,
@@ -4278,7 +4707,7 @@ export function saveLiveAccountSnapshot(accountId, snapshot = {}) {
         return getLiveAccountSnapshot("")
     }
 
-    const account = getAccountById(id)
+    const account = findAccount(readData().accounts, id)
     const provider = normalizeDataProvider(
         snapshot.dataProvider || getAccountDataProvider(account)
     )

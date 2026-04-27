@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from "react";
-import { getAccountById } from "../utils/storage";
+import React, { useEffect, useMemo, useState } from "react";
+import { getAccountById, getLiveAccountSnapshot } from "../utils/storage";
 import {
     getRulesForAccount,
     resolveCurrentMaxContracts,
@@ -28,6 +28,7 @@ const COLORS = {
 };
 
 const CHECKLIST_STORAGE_KEY = "future-dashboard-ifvg-checklist-v1";
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const TRADE_CRITERIA = [
     { key: "tradeInBias", label: "Trade im Bias" },
@@ -51,9 +52,17 @@ const TARGETS = [
 
 const TOTAL_CHECKLIST_POINTS = TRADE_CRITERIA.length + 1;
 
-function toNumber(value) {
+const KNOWN_LIFECYCLE_DATES = {
+    APEX42513409: {
+        evalStartDate: "2026-04-04",
+        accessStartDate: "2026-04-04",
+        accessEndDate: "2026-05-03",
+    },
+};
+
+function toNumber(value, fallback = 0) {
     const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : 0;
+    return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function cleanString(value) {
@@ -64,12 +73,105 @@ function cleanString(value) {
     return String(value).trim();
 }
 
+function normalizeApexKey(value) {
+    return cleanString(value)
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "");
+}
+
+function normalizeDateOnly(value) {
+    const text = cleanString(value);
+
+    if (!text) {
+        return "";
+    }
+
+    if (/^\d{4}-\d{2}-\d{2}/.test(text)) {
+        return text.slice(0, 10);
+    }
+
+    const date = new Date(text);
+
+    if (Number.isNaN(date.getTime())) {
+        return "";
+    }
+
+    return date.toISOString().slice(0, 10);
+}
+
+function pickDateOnly(...values) {
+    for (const value of values) {
+        const date = normalizeDateOnly(value);
+
+        if (date) {
+            return date;
+        }
+    }
+
+    return "";
+}
+
+function getTodayDateOnly() {
+    return new Date().toISOString().slice(0, 10);
+}
+
+function dateOnlyToUtcMs(value) {
+    const normalized = normalizeDateOnly(value);
+
+    if (!normalized) {
+        return NaN;
+    }
+
+    return new Date(`${normalized}T00:00:00.000Z`).getTime();
+}
+
+function addCalendarDaysInclusive(startDate, totalDays) {
+    const normalizedStartDate = normalizeDateOnly(startDate);
+    const numericDays = Number(totalDays);
+
+    if (!normalizedStartDate || !Number.isFinite(numericDays) || numericDays <= 0) {
+        return "";
+    }
+
+    const date = new Date(`${normalizedStartDate}T00:00:00.000Z`);
+    date.setUTCDate(date.getUTCDate() + Math.max(0, Math.floor(numericDays) - 1));
+
+    return date.toISOString().slice(0, 10);
+}
+
+function diffCalendarDaysInclusive(startDate, endDate) {
+    const startMs = dateOnlyToUtcMs(startDate);
+    const endMs = dateOnlyToUtcMs(endDate);
+
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+        return null;
+    }
+
+    return Math.floor((endMs - startMs) / DAY_MS) + 1;
+}
+
+function clampNumber(value, min, max) {
+    const numeric = Number(value);
+
+    if (!Number.isFinite(numeric)) {
+        return min;
+    }
+
+    return Math.min(max, Math.max(min, numeric));
+}
+
 function formatMoney(value) {
     if (value === null || value === undefined) {
         return "-";
     }
 
-    return `${Number(value).toLocaleString("de-DE", {
+    const numeric = Number(value);
+
+    if (!Number.isFinite(numeric)) {
+        return "-";
+    }
+
+    return `${numeric.toLocaleString("de-DE", {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
     })} $`;
@@ -81,6 +183,26 @@ function formatDays(value) {
     }
 
     return `${value} Tage`;
+}
+
+function formatDateOnlyDisplay(value) {
+    const normalized = normalizeDateOnly(value);
+
+    if (!normalized) {
+        return "-";
+    }
+
+    const date = new Date(`${normalized}T00:00:00.000Z`);
+
+    if (Number.isNaN(date.getTime())) {
+        return "-";
+    }
+
+    return new Intl.DateTimeFormat("de-CH", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+    }).format(date);
 }
 
 function formatRuleValue(ruleValue) {
@@ -142,7 +264,6 @@ function getValueStyle(value, dynamic = false) {
         minWidth: 0,
     };
 }
-
 function translateNoteToGerman(note) {
     if (!note) {
         return "-";
@@ -216,6 +337,30 @@ function getSourceLabel(url, index) {
 
     if (normalized.includes("pa-activation-process-deadline-explained")) {
         return "PA Aktivierung Frist";
+    }
+
+    if (normalized.includes("intraday-trailing-drawdown-evaluations")) {
+        return "Intraday Evaluations";
+    }
+
+    if (normalized.includes("performance-accounts")) {
+        return "Performance Accounts";
+    }
+
+    if (normalized.includes("payout")) {
+        return "Payouts";
+    }
+
+    if (normalized.includes("daily-loss-limit")) {
+        return "Daily Loss Limit";
+    }
+
+    if (normalized.includes("scaling")) {
+        return "Scaling";
+    }
+
+    if (normalized.includes("hedging")) {
+        return "Hedging Regel";
     }
 
     return `Quelle ${index + 1}`;
@@ -387,6 +532,329 @@ function getChecklistTone(score) {
     };
 }
 
+function getKnownLifecycleDateOverrides(account = {}) {
+    const candidates = [
+        account?.id,
+        account?.displayName,
+        account?.tradingAccountId,
+        account?.tradingAccountName,
+        account?.tradovateAccountId,
+        account?.tradovateAccountName,
+        account?.atasAccountId,
+        account?.atasAccountName,
+        account?.dataProviderAccountId,
+        account?.dataProviderAccountName,
+        account?.accountId,
+        account?.accountName,
+        account?.name,
+        account?.label,
+        account?.source?.accountId,
+        account?.source?.accountName,
+    ];
+
+    for (const candidate of candidates) {
+        const key = normalizeApexKey(candidate);
+
+        if (key && KNOWN_LIFECYCLE_DATES[key]) {
+            return KNOWN_LIFECYCLE_DATES[key];
+        }
+    }
+
+    return {};
+}
+
+function resolveLifecycleMeta(account, rules, currentBalance) {
+    if (!account || !rules) {
+        return {
+            show: false,
+            statusLabel: "-",
+            statusColor: COLORS.label,
+            accessStartDate: "",
+            accessEndDate: "",
+            daysTotal: null,
+            daysElapsed: null,
+            daysRemaining: null,
+            progressPercent: 0,
+            targetBalance: null,
+            targetReached: false,
+            paActivationDeadlineDate: "",
+            paActivationDaysRemaining: null,
+            cards: [],
+            notes: [],
+        };
+    }
+
+    const overrides = getKnownLifecycleDateOverrides(account);
+    const accountStatus = cleanString(account.accountStatus || "open").toLowerCase();
+    const isEval = rules.accountPhase === "eval";
+    const isPa = rules.accountPhase === "pa";
+
+    const accessStartDate = pickDateOnly(
+        account.accessStartDate,
+        account.evalStartDate,
+        overrides.accessStartDate,
+        overrides.evalStartDate,
+        isEval ? account.createdAt : ""
+    );
+
+    const accessEndDate = pickDateOnly(
+        account.accessEndDate,
+        overrides.accessEndDate,
+        isEval && accessStartDate
+            ? addCalendarDaysInclusive(accessStartDate, rules.accessPeriodDays || 30)
+            : ""
+    );
+
+    const passedAt = pickDateOnly(
+        account.passedAt,
+        account.passDate,
+        account.evaluationPassedAt
+    );
+
+    const paActivationDeadlineDate = pickDateOnly(
+        account.paActivationDeadlineDate,
+        overrides.paActivationDeadlineDate,
+        isEval && passedAt
+            ? addCalendarDaysInclusive(passedAt, rules.paActivationDeadlineDays || 7)
+            : ""
+    );
+
+    const today = getTodayDateOnly();
+    const daysTotal = isEval && accessStartDate && accessEndDate
+        ? diffCalendarDaysInclusive(accessStartDate, accessEndDate)
+        : null;
+
+    const rawDaysRemaining = isEval && accessEndDate
+        ? diffCalendarDaysInclusive(today, accessEndDate)
+        : null;
+
+    const daysRemaining = rawDaysRemaining === null || daysTotal === null
+        ? null
+        : clampNumber(rawDaysRemaining, 0, daysTotal);
+
+    const daysElapsed = daysTotal !== null && daysRemaining !== null
+        ? clampNumber(daysTotal - daysRemaining, 0, daysTotal)
+        : null;
+
+    const progressPercent = daysTotal && daysElapsed !== null
+        ? Math.round((daysElapsed / daysTotal) * 100)
+        : 0;
+            const profitTarget = rules.profitTarget?.kind === "fixed"
+        ? toNumber(rules.profitTarget.value, 0)
+        : 0;
+
+    const accountSize = toNumber(rules.accountSize, toNumber(account.accountSize, 0));
+
+    const fallbackTargetBalance = isEval && profitTarget > 0
+        ? accountSize + profitTarget
+        : null;
+
+    const targetBalance = toNumber(account.targetBalance, 0) > 0
+        ? toNumber(account.targetBalance, 0)
+        : fallbackTargetBalance;
+
+    const numericCurrentBalance = Number.isFinite(Number(currentBalance))
+        ? Number(currentBalance)
+        : null;
+
+    const targetReached =
+        typeof account.targetReached === "boolean"
+            ? account.targetReached
+            : (
+                targetBalance !== null &&
+                numericCurrentBalance !== null &&
+                numericCurrentBalance >= targetBalance
+            );
+
+    const computedRuleStatus = cleanString(account.computedRuleStatus).toLowerCase();
+    const computedRuleStatusLabel = cleanString(account.computedRuleStatusLabel);
+
+    let statusLabel = "Aktiv";
+    let statusColor = COLORS.cyan;
+
+    if (computedRuleStatusLabel) {
+        statusLabel = computedRuleStatusLabel;
+    }
+
+    if (computedRuleStatus === "passed" || computedRuleStatus === "target_reached") {
+        statusColor = COLORS.green;
+    } else if (computedRuleStatus === "failed" || computedRuleStatus === "expired") {
+        statusColor = COLORS.red;
+    } else if (computedRuleStatus === "archived") {
+        statusColor = COLORS.label;
+    } else if (accountStatus === "passed") {
+        statusLabel = "Bestanden";
+        statusColor = COLORS.green;
+    } else if (accountStatus === "failed") {
+        statusLabel = "Nicht bestanden";
+        statusColor = COLORS.red;
+    } else if (accountStatus === "archived") {
+        statusLabel = "Archiviert";
+        statusColor = COLORS.label;
+    } else if (isEval && targetReached) {
+        statusLabel = "Bestanden möglich";
+        statusColor = COLORS.green;
+    } else if (isEval && daysRemaining === 0 && !targetReached) {
+        statusLabel = "Zeit abgelaufen";
+        statusColor = COLORS.red;
+    } else if (isPa && accountStatus === "active") {
+        statusLabel = "PA aktiv";
+        statusColor = COLORS.green;
+    }
+
+    const paActivationRawDaysRemaining = paActivationDeadlineDate
+        ? diffCalendarDaysInclusive(today, paActivationDeadlineDate)
+        : null;
+
+    const paActivationDaysRemaining = paActivationRawDaysRemaining === null
+        ? null
+        : Math.max(0, paActivationRawDaysRemaining);
+
+    const cards = [];
+
+    if (isEval) {
+        cards.push(
+            {
+                label: "Status automatisch",
+                value: statusLabel,
+                color: statusColor,
+            },
+            {
+                label: "Start",
+                value: formatDateOnlyDisplay(accessStartDate),
+                color: COLORS.neutral,
+            },
+            {
+                label: "Ende",
+                value: formatDateOnlyDisplay(accessEndDate),
+                color: daysRemaining === 0 && !targetReached ? COLORS.red : COLORS.cyan,
+            },
+            {
+                label: "Resttage",
+                value: daysRemaining === null ? "-" : formatDays(daysRemaining),
+                color:
+                    daysRemaining === null
+                        ? COLORS.label
+                        : daysRemaining <= 3
+                            ? COLORS.orange
+                            : COLORS.green,
+            },
+            {
+                label: "Tage gesamt",
+                value: daysTotal === null ? "-" : formatDays(daysTotal),
+                color: COLORS.neutral,
+            },
+            {
+                label: "Zeit Fortschritt",
+                value: `${progressPercent}%`,
+                color:
+                    progressPercent >= 90 && !targetReached
+                        ? COLORS.orange
+                        : COLORS.cyan,
+            }
+        );
+
+        if (targetBalance !== null) {
+            cards.push(
+                {
+                    label: "Ziel Balance",
+                    value: formatMoney(targetBalance),
+                    color: COLORS.green,
+                },
+                {
+                    label: "Aktuelle Balance",
+                    value: numericCurrentBalance === null ? "-" : formatMoney(numericCurrentBalance),
+                    color: targetReached ? COLORS.green : COLORS.neutral,
+                }
+            );
+        }
+
+        if (paActivationDeadlineDate) {
+            cards.push({
+                label: "PA Aktivierung bis",
+                value: formatDateOnlyDisplay(paActivationDeadlineDate),
+                color: COLORS.yellow,
+            });
+
+            cards.push({
+                label: "Aktivierung Rest",
+                value: paActivationDaysRemaining === null ? "-" : formatDays(paActivationDaysRemaining),
+                color:
+                    paActivationDaysRemaining === null
+                        ? COLORS.label
+                        : paActivationDaysRemaining <= 2
+                            ? COLORS.orange
+                            : COLORS.green,
+            });
+        }
+    }
+
+    if (isPa) {
+        cards.push(
+            {
+                label: "Status automatisch",
+                value: statusLabel,
+                color: statusColor,
+            },
+            {
+                label: "PA aktiviert",
+                value: formatDateOnlyDisplay(account.activatedAt || account.createdAt),
+                color: COLORS.green,
+            },
+            {
+                label: "Inaktivität",
+                value: rules.inactivityRule
+                    ? `${rules.inactivityRule.requiredNetProfitDay} $ in ${rules.inactivityRule.windowCalendarDays} Tagen`
+                    : "-",
+                color: COLORS.yellow,
+            },
+            {
+                label: "Aktuelle Balance",
+                value: numericCurrentBalance === null ? "-" : formatMoney(numericCurrentBalance),
+                color: COLORS.neutral,
+            }
+        );
+    }
+
+    const notes = [];
+
+    if (isEval && accessStartDate && accessEndDate) {
+        notes.push(
+            `APEX zählt 30 Kalendertage. Dieses Konto läuft von ${formatDateOnlyDisplay(accessStartDate)} bis ${formatDateOnlyDisplay(accessEndDate)}.`
+        );
+    }
+
+    if (isEval && targetReached && accountStatus !== "passed") {
+        notes.push("Profit Target ist erreicht. Der Account sollte beim nächsten Sync als bestanden erkannt werden.");
+    }
+
+    if (isEval && daysRemaining === 0 && !targetReached && accountStatus !== "failed") {
+        notes.push("Zeitfenster ist abgelaufen. Ohne erreichtes Profit Target ist die Evaluation nicht bestanden.");
+    }
+
+    if (isPa) {
+        notes.push("PA Regeln gelten ab Aktivierung. Payout und Inaktivität werden im PA Block angezeigt.");
+    }
+
+    return {
+        show: isEval || isPa,
+        statusLabel,
+        statusColor,
+        accessStartDate,
+        accessEndDate,
+        daysTotal,
+        daysElapsed,
+        daysRemaining,
+        progressPercent,
+        targetBalance,
+        targetReached,
+        paActivationDeadlineDate,
+        paActivationDaysRemaining,
+        cards,
+        notes,
+    };
+}
+
 function ChecklistItem({ label, checked, onToggle }) {
     return (
         <button type="button" onClick={onToggle} style={styles.checkItemButton}>
@@ -428,12 +896,79 @@ function ChecklistItem({ label, checked, onToggle }) {
         </button>
     );
 }
-
 function MiniCard({ label, value, color }) {
     return (
         <div style={styles.miniCard}>
             <div style={styles.miniCardLabel}>{label}</div>
             <div style={{ ...styles.miniCardValue, color: color || COLORS.neutral }}>{value}</div>
+        </div>
+    );
+}
+
+function LifecyclePanel({ lifecycleMeta }) {
+    if (!lifecycleMeta?.show) {
+        return null;
+    }
+
+    return (
+        <div style={styles.lifecyclePanel}>
+            <div style={styles.lifecycleHeader}>
+                <div>
+                    <div style={styles.lifecycleTitle}>Account Zeitraum</div>
+                    <div style={styles.lifecycleSubTitle}>
+                        Automatische Auswertung von Start, Ende, Resttagen und Status.
+                    </div>
+                </div>
+
+                <div
+                    style={{
+                        ...styles.lifecycleStatusBadge,
+                        color: lifecycleMeta.statusColor,
+                        borderColor: lifecycleMeta.statusColor,
+                    }}
+                >
+                    {lifecycleMeta.statusLabel}
+                </div>
+            </div>
+
+            {lifecycleMeta.daysTotal ? (
+                <div style={styles.lifecycleProgressWrap}>
+                    <div style={styles.lifecycleProgressTrack}>
+                        <div
+                            style={{
+                                ...styles.lifecycleProgressBar,
+                                width: `${lifecycleMeta.progressPercent}%`,
+                                background: lifecycleMeta.statusColor,
+                            }}
+                        />
+                    </div>
+
+                    <div style={styles.lifecycleProgressText}>
+                        {lifecycleMeta.daysElapsed} von {lifecycleMeta.daysTotal} Kalendertagen verbraucht
+                    </div>
+                </div>
+            ) : null}
+
+            <div style={styles.miniGrid}>
+                {lifecycleMeta.cards.map((card) => (
+                    <MiniCard
+                        key={`${card.label}-${card.value}`}
+                        label={card.label}
+                        value={card.value}
+                        color={card.color}
+                    />
+                ))}
+            </div>
+
+            {Array.isArray(lifecycleMeta.notes) && lifecycleMeta.notes.length > 0 ? (
+                <div style={styles.lifecycleNotes}>
+                    {lifecycleMeta.notes.map((note, index) => (
+                        <div key={`${note}-${index}`} style={styles.lifecycleNote}>
+                            {note}
+                        </div>
+                    ))}
+                </div>
+            ) : null}
         </div>
     );
 }
@@ -455,7 +990,60 @@ export default function RulesPanel(props) {
         null;
 
     const storedAccount = resolvedAccountId ? getAccountById(resolvedAccountId) : null;
-    const account = directAccount || storedAccount || null;
+
+    const liveSnapshot = useMemo(() => {
+        if (!resolvedAccountId) {
+            return null;
+        }
+
+        return getLiveAccountSnapshot(resolvedAccountId) || null;
+    }, [resolvedAccountId]);
+
+    const account = useMemo(() => {
+        const baseAccount = directAccount || storedAccount || null;
+
+        if (!baseAccount) {
+            return null;
+        }
+
+        if (!liveSnapshot) {
+            return baseAccount;
+        }
+
+        return {
+            ...baseAccount,
+            productType: liveSnapshot.productType || baseAccount.productType,
+            accountPhase: liveSnapshot.accountPhase || baseAccount.accountPhase,
+            accountStatus: liveSnapshot.accountStatus || baseAccount.accountStatus,
+            accountSize: toNumber(liveSnapshot.accountSize, toNumber(baseAccount.accountSize, 0)),
+            startingBalance: toNumber(liveSnapshot.startingBalance, toNumber(baseAccount.startingBalance, 0)),
+            currentBalance: toNumber(liveSnapshot.currentBalance, toNumber(baseAccount.currentBalance, 0)),
+            evalStartDate: liveSnapshot.evalStartDate || baseAccount.evalStartDate,
+            accessStartDate: liveSnapshot.accessStartDate || baseAccount.accessStartDate,
+            accessEndDate: liveSnapshot.accessEndDate || baseAccount.accessEndDate,
+            paActivationDeadlineDate:
+                liveSnapshot.paActivationDeadlineDate ||
+                baseAccount.paActivationDeadlineDate,
+            passedAt: liveSnapshot.passedAt || baseAccount.passedAt,
+            activatedAt: liveSnapshot.activatedAt || baseAccount.activatedAt,
+            failedAt: liveSnapshot.failedAt || baseAccount.failedAt,
+            archivedAt: liveSnapshot.archivedAt || baseAccount.archivedAt,
+            computedRuleStatus:
+                liveSnapshot.computedRuleStatus || baseAccount.computedRuleStatus,
+            computedRuleStatusLabel:
+                liveSnapshot.computedRuleStatusLabel || baseAccount.computedRuleStatusLabel,
+            targetBalance:
+                liveSnapshot.targetBalance ?? baseAccount.targetBalance,
+            targetReached:
+                liveSnapshot.targetReached ?? baseAccount.targetReached,
+            accessExpired:
+                liveSnapshot.accessExpired ?? baseAccount.accessExpired,
+            dataProviderAccountId:
+                liveSnapshot.dataProviderAccountId || baseAccount.dataProviderAccountId,
+            dataProviderAccountName:
+                liveSnapshot.dataProviderAccountName || baseAccount.dataProviderAccountName,
+        };
+    }, [directAccount, storedAccount, liveSnapshot]);
 
     const [checklistState, setChecklistState] = useState(() =>
         getChecklistForAccount(resolvedAccountId)
@@ -516,8 +1104,10 @@ export default function RulesPanel(props) {
         );
     }
 
-    const currentBalance =
-        typeof account.currentBalance === "number" ? account.currentBalance : null;
+    const currentBalanceValue = toNumber(account.currentBalance, NaN);
+    const currentBalance = Number.isFinite(currentBalanceValue)
+        ? currentBalanceValue
+        : null;
 
     const resolvedMaxContracts =
         currentBalance !== null
@@ -531,6 +1121,7 @@ export default function RulesPanel(props) {
 
     const resolvedPaTier = snapshot?.paTier ?? null;
     const resolvedDrawdownFloor = snapshot?.drawdownFloor ?? null;
+    const lifecycleMeta = resolveLifecycleMeta(account, rules, currentBalance);
 
     return (
         <div style={styles.wrapper}>
@@ -658,6 +1249,8 @@ export default function RulesPanel(props) {
 
             <div style={styles.notice}>{RULES_UI_UPDATE_NOTICE}</div>
 
+            <LifecyclePanel lifecycleMeta={lifecycleMeta} />
+
             <div style={styles.grid}>
                 <div style={styles.item}>
                     <div style={styles.label}>Profit Target</div>
@@ -720,9 +1313,44 @@ export default function RulesPanel(props) {
                 </div>
 
                 <div style={styles.item}>
+                    <div style={styles.label}>Access Start</div>
+                    <div style={getValueStyle(0)}>
+                        {formatDateOnlyDisplay(lifecycleMeta.accessStartDate)}
+                    </div>
+                </div>
+
+                <div style={styles.item}>
+                    <div style={styles.label}>Access Ende</div>
+                    <div style={getValueStyle(0)}>
+                        {formatDateOnlyDisplay(lifecycleMeta.accessEndDate)}
+                    </div>
+                </div>
+
+                <div style={styles.item}>
+                    <div style={styles.label}>Resttage</div>
+                    <div
+                        style={{
+                            ...getValueStyle(0),
+                            color:
+                                lifecycleMeta.daysRemaining === 0
+                                    ? COLORS.red
+                                    : lifecycleMeta.daysRemaining <= 3
+                                        ? COLORS.orange
+                                        : COLORS.green,
+                        }}
+                    >
+                        {lifecycleMeta.daysRemaining === null
+                            ? "-"
+                            : formatDays(lifecycleMeta.daysRemaining)}
+                    </div>
+                </div>
+
+                <div style={styles.item}>
                     <div style={styles.label}>PA Activation Deadline</div>
                     <div style={getValueStyle(0)}>
-                        {formatDays(rules.paActivationDeadlineDays)}
+                        {lifecycleMeta.paActivationDeadlineDate
+                            ? formatDateOnlyDisplay(lifecycleMeta.paActivationDeadlineDate)
+                            : formatDays(rules.paActivationDeadlineDays)}
                     </div>
                 </div>
 
@@ -881,7 +1509,6 @@ export default function RulesPanel(props) {
         </div>
     );
 }
-
 const styles = {
     wrapper: {
         width: "100%",
@@ -960,6 +1587,78 @@ const styles = {
         marginTop: 8,
         fontSize: 13,
         fontWeight: 700,
+    },
+    lifecyclePanel: {
+        border: `1px solid ${COLORS.borderStrong}`,
+        borderRadius: 18,
+        padding: 16,
+        marginBottom: 18,
+        background: "rgba(34, 211, 238, 0.05)",
+    },
+    lifecycleHeader: {
+        display: "flex",
+        justifyContent: "space-between",
+        gap: 12,
+        alignItems: "flex-start",
+        flexWrap: "wrap",
+        marginBottom: 14,
+    },
+    lifecycleTitle: {
+        fontSize: 18,
+        fontWeight: 800,
+        color: COLORS.neutral,
+        lineHeight: 1.2,
+    },
+    lifecycleSubTitle: {
+        fontSize: 13,
+        color: COLORS.label,
+        marginTop: 6,
+        lineHeight: 1.4,
+    },
+    lifecycleStatusBadge: {
+        border: `1px solid ${COLORS.borderStrong}`,
+        borderRadius: 999,
+        padding: "10px 14px",
+        fontSize: 13,
+        fontWeight: 900,
+        background: "rgba(0,0,0,0.18)",
+        whiteSpace: "nowrap",
+    },
+    lifecycleProgressWrap: {
+        marginBottom: 16,
+    },
+    lifecycleProgressTrack: {
+        width: "100%",
+        height: 12,
+        borderRadius: 999,
+        background: "rgba(255, 255, 255, 0.06)",
+        overflow: "hidden",
+        border: `1px solid ${COLORS.border}`,
+    },
+    lifecycleProgressBar: {
+        height: "100%",
+        borderRadius: 999,
+        transition: "width 180ms ease",
+    },
+    lifecycleProgressText: {
+        marginTop: 8,
+        fontSize: 13,
+        color: COLORS.label,
+        fontWeight: 700,
+    },
+    lifecycleNotes: {
+        display: "grid",
+        gap: 8,
+        marginTop: 2,
+    },
+    lifecycleNote: {
+        border: `1px solid ${COLORS.border}`,
+        borderRadius: 12,
+        background: "rgba(255,255,255,0.03)",
+        padding: 12,
+        color: COLORS.neutral,
+        fontSize: 13,
+        lineHeight: 1.45,
     },
     miniGrid: {
         display: "grid",
